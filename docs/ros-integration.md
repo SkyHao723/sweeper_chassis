@@ -12,7 +12,19 @@
 ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py
 ```
 
-这一条会把四部分全带起来：
+或者用 `tools/chassis_bringup.sh`（推荐，它会等到确认 `/odom` 真的有数据）：
+
+```bash
+./chassis_bringup.sh start     # 启动并等到 /odom 出数据 (最多 40 秒)
+./chassis_bringup.sh stop      # 停掉全部相关进程
+./chassis_bringup.sh restart
+./chassis_bringup.sh status    # 节点 / 串口占用 / /odom 有没有数据
+```
+
+**为什么值得用脚本**：这套栈有几个"看起来像挂了其实没挂、看着没挂其实挂了"的坑
+（见第 6 节），脚本把这些都兜住了。
+
+这一条 launch 会把四部分全带起来：
 
 | 组成 | 作用 |
 |---|---|
