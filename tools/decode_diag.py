@@ -87,8 +87,11 @@ IMU_STATUS = {
     3: "总线死",
     4: "无应答",
     5: "读出错",
-    6: "陀螺仪恒0",     # 加速度正常但角速度 6 字节全为 0, 不是"静止"能解释的
 }
+# 注: 6 = "陀螺仪恒0" 已经删掉 —— 那个判定是错的。这颗 YbImu 在检测到静止时
+# 本来就把角速度输出归零(实测: 静止 478 帧全零, 转动 321 帧都有数据),
+# 所以"三轴全零"是正常现象, 不是故障。判断陀螺仪死活要看下面 gyro= 那几个数
+# 在转动时变不变。
 
 # 判定"没劲"的阈值
 RPM_CMD_EPS = 5      # 目标转速绝对值超过它就认为"命令要求这个轮子转"
@@ -99,6 +102,9 @@ RPM_ACT_EPS = 3      # 实际转速低于它就认为"没转起来"
 #   一开始按 ×100 解读, 结果所有电流都少算了 10 倍, 差点把"电机在使劲"误判成"没给力"。
 CUR_EPS = 10         # = 1.0A。低于它认为驱动器没在使劲。
 
+# 协议规定的陀螺仪换算系数(±500dps 量程): rad/s = 原始值 * 0.00026644
+GYRO_RATIO = 0.00026644
+
 
 def i16(b, i):
     return struct.unpack(">h", bytes(b[i:i + 2]))[0]
@@ -108,6 +114,18 @@ def tel_battery_mv(frame):
     """24 字节主遥测帧 [20-21] = 电池电压 mV。
     带载时的电压比静态值有意义得多 —— 一加速就塌下去说明电池/线路撑不住。"""
     return struct.unpack(">H", bytes(frame[20:22]))[0]
+
+
+def tel_gyro_raw(frame):
+    """24 字节主遥测帧 [14-15][16-17][18-19] = 陀螺仪三轴原始值。
+    单位是协议规定的 ±500dps 量程原始值: rad/s = 原始值 * 0.00026644。
+
+    ★ 为什么要把这三个数显出来: 陀螺仪"恒为 0"有两种可能 ——
+      (a) 器件坏了
+      (b) 它在静止时本来就输出零, 是我们的 gyro_all_zero 判定在误报
+      分不清就可能在修一个根本没坏的东西。**转动一下板子看这三个数变不变**
+      是一秒就能定性的测试。"""
+    return (i16(frame, 14), i16(frame, 16), i16(frame, 18))
 
 
 def build_cmd(vx, wz):
@@ -220,11 +238,7 @@ class Diag(object):
         """返回 [(key, 描述), ...]; 没问题就返回空列表。
         key 用来做"连续出现多久"的统计, 见 ProblemTracker。"""
         out = []
-        if self.imu_st == 6:
-            out.append(("imugyro",
-                        "IMU 陀螺仪恒为 0（加速度正常）—— 体检: %s"
-                        % self.probe_text()))
-        elif self.imu_st != 0:
+        if self.imu_st != 0:
             out.append(("imuother",
                         "IMU 读取异常: %s（体检: %s）"
                         % (IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st),
@@ -248,21 +262,26 @@ class Diag(object):
                                 % (tag, tgt, act, cur / 10.0)))
         return out
 
-    def line(self, bat_mv=0):
+    def line(self, bat_mv=0, gyro=None):
         bat = (" bat=%.1fV" % (bat_mv / 1000.0)) if bat_mv else ""
         imu = IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st)
         if self.imu_st != 0:
             imu += "[%s]" % self.probe_text()
+        g = ""
+        if gyro:
+            g = " gyro=(%+d,%+d,%+d)=%.3f,%.3f,%.3frad/s" % (
+                gyro[0], gyro[1], gyro[2],
+                gyro[0] * GYRO_RATIO, gyro[1] * GYRO_RATIO, gyro[2] * GYRO_RATIO)
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s"
                 % (self.seq, self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2),
-                   self.can_err, self.bad, self.ovf, self.relay, imu, bat))
+                   self.can_err, self.bad, self.ovf, self.relay, imu, bat, g))
 
 
 class ProblemTracker(object):
@@ -389,6 +408,7 @@ def main():
     seen_seq = None
     tracker = ProblemTracker()
     bat_mv = 0
+    gyro_raw = None
 
     try:
         for kind, frame in iter_frames(stream):
@@ -400,6 +420,7 @@ def main():
                 continue
             if kind == "tel":
                 bat_mv = tel_battery_mv(frame)
+                gyro_raw = tel_gyro_raw(frame)
                 continue
             if kind != "diag":
                 continue
@@ -416,7 +437,7 @@ def main():
                 continue
 
             last_diag = d
-            print(d.line(bat_mv))
+            print(d.line(bat_mv, gyro_raw))
             for p in probs:
                 print("    !! " + p)
             if dropped:

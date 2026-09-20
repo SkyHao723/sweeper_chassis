@@ -864,32 +864,26 @@ static void IMU_Tick(void)
 
     err = YbImu_ReadMotion(accel, gyro);
 
-    /* YBIMU_ST_GYRO_ZERO 表示加速度读到了但陀螺仪恒为 0 —— 加速度还是能用的,
-       所以不算完全失败。
-       ★ 这里故意用 else 而不是提前 return: 体检是最后那段慢操作, 提前 return
-         会让它在"陀螺仪恒 0"这种最该体检的情况下被跳过(踩过)。 */
-    if ((err == YBIMU_ST_OK) || (err == YBIMU_ST_GYRO_ZERO))
+    if (err == YBIMU_ST_OK)
     {
         imu_accel_g[0] = accel[0];
         imu_accel_g[1] = accel[1];
         imu_accel_g[2] = accel[2];
+        imu_gyro[0] = gyro[0];
+        imu_gyro[1] = gyro[1];
+        imu_gyro[2] = gyro[2];
 
-        if (err == YBIMU_ST_OK)
+        /* 静止时模块会把角速度输出归零, 那是正常行为, 不是故障。
+           所以"读数是否为零"判断不了陀螺仪死活 —— 这里改成记录
+           "自开机以来有没有读到过非零角速度": 车动过之后它还是 0,
+           才说明陀螺仪真有问题。诊断帧的 bit3 报的就是这个。 */
+        if ((gyro[0] != 0.0f) || (gyro[1] != 0.0f) || (gyro[2] != 0.0f))
         {
-            imu_gyro[0] = gyro[0];
-            imu_gyro[1] = gyro[1];
-            imu_gyro[2] = gyro[2];
-        }
-        else
-        {
-            imu_gyro[0] = 0.0f;
-            imu_gyro[1] = 0.0f;
-            imu_gyro[2] = 0.0f;
+            imu_gyro_ok = 1;
         }
 
         imu_ok = 1;
-        imu_gyro_ok = (uint8_t)(err == YBIMU_ST_OK);
-        imu_status = err;
+        imu_status = YBIMU_ST_OK;
         imu_found_addr = YBIMU_I2C_ADDR;
     }
     else

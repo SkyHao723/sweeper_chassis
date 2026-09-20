@@ -324,12 +324,24 @@ uint8_t YbImu_ReadVersion(uint8_t out[3])
     return YbImu_ReadRegs(YBIMU_REG_VERSION, out, 3);
 }
 
-/* 返回 YBIMU_ST_OK 或 YBIMU_ST_GYRO_ZERO(加速度能读但角速度恒 0) */
+/* 读一次运动数据: 加速度 + 角速度。
+ *
+ * ★ 关于"角速度恒为 0" —— 曾经这里是这么写的: 如果 6 个字节全为 0 就返回
+ *   YBIMU_ST_GYRO_ZERO 报上去当故障。**那个判定是错的, 已删除。**
+ *
+ *   错误的来源: 头文件里写了句"真实陀螺仪静止时也有噪声", 那是拍脑袋的
+ *   假设, 没有任何依据。实测(转动板子对比静止):
+ *     静止 478 帧 -> 三轴全部精确为 0
+ *     转动 321 帧 -> 三轴都有真实数据, 量程内满幅
+ *   这颗模块的固件**就是会在检测到静止时把角速度输出归零**。
+ *   所以"三轴全零"是正常的, 不是坏了 —— 我们为这个假故障白折腾了好几轮。
+ *
+ *   单看某一瞬间本来就分不出"器件坏了"和"现在正好静止"; 要判断陀螺仪
+ *   死活只能靠"动一下看数值变不变"。所以这个瞬时判定从来没有意义。 */
 uint8_t YbImu_ReadMotion(float accel_g[3], float gyro_rad_s[3])
 {
     uint8_t raw[6];
     uint8_t err;
-    uint8_t gyro_all_zero;
 
     /* ★ 分两次读, 不要合并成一次 12 字节 —— 见 YbImu.h 里的说明 */
     err = YbImu_ReadRegs(YBIMU_REG_ACCEL, raw, 6);
@@ -350,7 +362,8 @@ uint8_t YbImu_ReadMotion(float accel_g[3], float gyro_rad_s[3])
     err = YbImu_ReadRegs(YBIMU_REG_GYRO, raw, 6);
     if (err != YBIMU_ST_OK) return err;
 
-    /* 角速度: 满量程 ±2000dps, 原始值 -> rad/s */
+    /* 角速度: 满量程 ±2000dps, 原始值 -> rad/s。
+       静止时这里会得到 0, 那是模块的行为, 直接原样上报。 */
     {
         const float ratio = (2000.0f / 32767.0f) * (3.14159265f / 180.0f);
         gyro_rad_s[0] = (float)RD_I16_LE(&raw[0]) * ratio;
@@ -358,10 +371,5 @@ uint8_t YbImu_ReadMotion(float accel_g[3], float gyro_rad_s[3])
         gyro_rad_s[2] = (float)RD_I16_LE(&raw[4]) * ratio;
     }
 
-    /* 三个轴一起恒为 0 不正常 —— 真实陀螺仪静止时也有噪声。
-       报上去让上位机看得见, 不要静悄悄地给个 0。 */
-    gyro_all_zero = (uint8_t)((raw[0] == 0) && (raw[1] == 0) &&
-                              (raw[2] == 0) && (raw[3] == 0) &&
-                              (raw[4] == 0) && (raw[5] == 0));
-    return gyro_all_zero ? YBIMU_ST_GYRO_ZERO : YBIMU_ST_OK;
+    return YBIMU_ST_OK;
 }
