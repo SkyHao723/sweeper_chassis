@@ -862,27 +862,12 @@ static void IMU_Tick(void)
     float gyro[3];
     uint8_t err;
 
-    /* 寄存器体检 (1Hz)。★ 必须放在最前面 —— 下面 YBIMU_ST_GYRO_ZERO 那条
-       分支会提前 return, 而"陀螺仪恒 0"恰恰是最需要体检的情况。 */
-    if ((g_tick_ms - imu_probe_ms) >= IMU_DIAG_PERIOD_MS)
-    {
-        YbImu_Probe_t pr;
-
-        imu_probe_ms = g_tick_ms;
-        YbImu_Probe(&pr);
-        imu_probe_flags = (uint8_t)((pr.ver_ok   ? 0x01 : 0) |
-                                    (pr.gyro_ok  ? 0x02 : 0) |
-                                    (pr.mag_ok   ? 0x04 : 0) |
-                                    (pr.quat_ok  ? 0x08 : 0) |
-                                    (pr.euler_ok ? 0x10 : 0));
-        imu_ver_major = pr.ver[0];
-        imu_euler_yaw_crad = (int16_t)(pr.euler_yaw * 100.0f);   /* rad -> 0.01rad */
-    }
-
     err = YbImu_ReadMotion(accel, gyro);
 
     /* YBIMU_ST_GYRO_ZERO 表示加速度读到了但陀螺仪恒为 0 —— 加速度还是能用的,
-       所以不算完全失败。 */
+       所以不算完全失败。
+       ★ 这里故意用 else 而不是提前 return: 体检是最后那段慢操作, 提前 return
+         会让它在"陀螺仪恒 0"这种最该体检的情况下被跳过(踩过)。 */
     if ((err == YBIMU_ST_OK) || (err == YBIMU_ST_GYRO_ZERO))
     {
         imu_accel_g[0] = accel[0];
@@ -906,29 +891,47 @@ static void IMU_Tick(void)
         imu_gyro_ok = (uint8_t)(err == YBIMU_ST_OK);
         imu_status = err;
         imu_found_addr = YBIMU_I2C_ADDR;
-        return;
+    }
+    else
+    {
+        imu_ok = 0;
+        imu_gyro_ok = 0;
+        imu_status = err;
+
+        /* 失败了才诊断, 而且不要每次都跑(扫描很慢) */
+        if ((g_tick_ms - imu_diag_ms) >= IMU_DIAG_PERIOD_MS)
+        {
+            uint8_t bus = YbImu_BusCheck();
+            imu_diag_ms = g_tick_ms;
+
+            if (bus != YBIMU_ST_OK)
+            {
+                imu_status = bus;               /* 总线本身就不对 */
+                imu_found_addr = 0;
+            }
+            else
+            {
+                imu_found_addr = YbImu_Scan();  /* 总线是好的, 那就是地址/器件问题 */
+                imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
+            }
+        }
     }
 
-    imu_ok = 0;
-    imu_gyro_ok = 0;
-    imu_status = err;
-
-    /* 失败了才诊断, 而且不要每次都跑(扫描很慢) */
-    if ((g_tick_ms - imu_diag_ms) >= IMU_DIAG_PERIOD_MS)
+    /* 寄存器体检 (1Hz), 放最后 —— 它读得最长(0x16 是 16 字节), 万一出问题
+       也不该影响上面那次关键的运动数据读取。 */
+    if ((g_tick_ms - imu_probe_ms) >= IMU_DIAG_PERIOD_MS)
     {
-        uint8_t bus = YbImu_BusCheck();
-        imu_diag_ms = g_tick_ms;
+        YbImu_Probe_t pr;
 
-        if (bus != YBIMU_ST_OK)
-        {
-            imu_status = bus;               /* 总线本身就不对 */
-            imu_found_addr = 0;
-        }
-        else
-        {
-            imu_found_addr = YbImu_Scan();  /* 总线是好的, 那就是地址/器件问题 */
-            imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
-        }
+        imu_probe_ms = g_tick_ms;
+        YbImu_Probe(&pr);
+        imu_probe_flags = (uint8_t)((pr.ver_ok   ? 0x01 : 0) |
+                                    (pr.gyro_ok  ? 0x02 : 0) |
+                                    (pr.mag_ok   ? 0x04 : 0) |
+                                    (pr.quat_ok  ? 0x08 : 0) |
+                                    (pr.euler_ok ? 0x10 : 0));
+        imu_ver_major = pr.ver[0];
+        imu_euler_yaw_crad = (int16_t)(pr.euler_yaw * 100.0f);   /* rad -> 0.01rad */
     }
 }
 

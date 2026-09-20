@@ -88,6 +88,40 @@ static void I2c_Stop(void)
     I2c_Delay();
 }
 
+/* I2C 总线恢复。
+ *
+ * 从机如果在一次事务中途被打断(比如主机读了一半就不读了、或者错误路径上
+ * 忘了发 STOP), 它可能一直在等下一个时钟, 把 SDA 拉着不放。这时候后续
+ * 所有起始条件都会失败, 整个总线卡死, 直到给从机断电。
+ *
+ * 标准救法: 主机额外补 9 个 SCL 脉冲, 让从机把剩下的位吐完并释放 SDA,
+ * 再补一个 STOP。空闲时 SDA 已经是高的就直接返回, 不花时间。
+ *
+ * ★ 这个是踩出来的: 给 IMU 加寄存器体检、开始读 0x16/0x26 这种长块之后,
+ *   陀螺仪的诊断码从"陀螺仪恒 0"变成了"总线死", 而且永不恢复 ——
+ *   就是因为 `YbImu_ReadRegs` 的两条错误分支 return 前没有 I2c_Stop()。
+ */
+static void I2c_BusRecover(void)
+{
+    uint8_t i;
+
+    SDA_REL();
+    SCL_REL();
+    I2c_Delay();
+
+    if (SDA_IS_HIGH()) return;          /* 没被拉死, 不用救 */
+
+    for (i = 0; i < 9; i++)
+    {
+        SCL_LOW();
+        I2c_Delay();
+        SCL_REL();
+        I2c_Delay();
+        if (SDA_IS_HIGH()) break;       /* 从机松手了 */
+    }
+    I2c_Stop();
+}
+
 /* 返回 1 = 从机应答 */
 static uint8_t I2c_WriteByte(uint8_t value)
 {
@@ -152,10 +186,14 @@ uint8_t YbImu_ReadRegs(uint8_t reg, uint8_t *buf, uint8_t len)
 
     if (!pins_ready) I2c_PinsInit();
 
+    /* 上一轮如果被卡住, 先救回来再发起始条件 */
+    I2c_BusRecover();
+
     /* 第一段: 写寄存器地址 */
     err = I2c_Start();
     if (err)
     {
+        I2c_Stop();                     /* ★ 出错也必须释放总线 */
         return (err == 2) ? YBIMU_ST_BUS_DEAD : YBIMU_ST_SCL_LOW;
     }
     if (!I2c_WriteByte((uint8_t)(YBIMU_I2C_ADDR << 1))) { I2c_Stop(); return YBIMU_ST_NO_ACK; }
@@ -165,14 +203,14 @@ uint8_t YbImu_ReadRegs(uint8_t reg, uint8_t *buf, uint8_t len)
     if (use_restart)
     {
         err = I2c_Start();
-        if (err) return YBIMU_ST_BUS_DEAD;
+        if (err) { I2c_Stop(); return YBIMU_ST_BUS_DEAD; }   /* ★ 补 STOP */
     }
     else
     {
         I2c_Stop();
         I2c_Delay();
         err = I2c_Start();
-        if (err) return YBIMU_ST_BUS_DEAD;
+        if (err) { I2c_Stop(); return YBIMU_ST_BUS_DEAD; }   /* ★ 补 STOP */
     }
 
     if (!I2c_WriteByte((uint8_t)((YBIMU_I2C_ADDR << 1) | 1))) { I2c_Stop(); return YBIMU_ST_READ_ERR; }
