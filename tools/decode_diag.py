@@ -43,13 +43,18 @@
 import argparse
 import struct
 import sys
+import threading
 import time
 
+CMD_SIZE = 11
+CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
 TEL_HEAD = 0x7B
 DIAG_HEAD = 0x7E
 TEL_SIZE = 24
 DIAG_SIZE = 32
+SEND_HZ = 20          # 和 STM32 的 CAN_PERIOD_MS 对齐, 上位机一般也是这个量级
+STOP_BURST = 15       # 退出前连发几帧零速, 保证车真的停下
 
 # 故障码表: docs/foc-driver-protocol-v1.2.pdf 第 11 页
 FAULTS = {
@@ -88,6 +93,61 @@ CUR_EPS = 30         # 电流 0.30 A (单位是 A*100)
 
 def i16(b, i):
     return struct.unpack(">h", bytes(b[i:i + 2]))[0]
+
+
+def build_cmd(vx, wz):
+    """构造 11 字节速度命令帧, 格式见 docs/chassis-serial-protocol.md。
+    和 STM32 的 Cmd_Verify() 对齐: BCC = XOR(f[0..8]), 放在 f[9], f[10]=0x7D。
+    单位是 mm/s 和 mrad/s, 所以要 ×1000。"""
+    vxi = max(-32768, min(32767, int(round(vx * 1000.0))))
+    wzi = max(-32768, min(32767, int(round(wz * 1000.0))))
+    f = bytearray(CMD_SIZE)
+    f[0] = CMD_HEAD
+    f[1] = 0                       # AutoRecharge, 正常走车 = 0
+    f[2] = 0                       # SecurityPLY,  正常走车 = 0
+    struct.pack_into(">h", f, 3, vxi)
+    struct.pack_into(">h", f, 5, 0)     # vy, 差速车用不到
+    struct.pack_into(">h", f, 7, wzi)
+    bcc = 0
+    for x in f[:CMD_SIZE - 2]:
+        bcc ^= x
+    f[CMD_SIZE - 2] = bcc
+    f[CMD_SIZE - 1] = CMD_TAIL
+    return bytes(f)
+
+
+class Sender(threading.Thread):
+    """后台线程: 按 SEND_HZ 持续发同一条速度命令。
+    必须持续发 —— STM32 有 800ms 看门狗, 停发就自动刹车。"""
+
+    def __init__(self, port, vx, wz):
+        threading.Thread.__init__(self, daemon=True)
+        self.port = port
+        self.vx = vx
+        self.wz = wz
+        self.done = threading.Event()
+        self.error = None
+
+    def run(self):
+        period = 1.0 / SEND_HZ
+        while not self.done.is_set():
+            try:
+                self.port.write(build_cmd(self.vx, self.wz))
+            except Exception as exc:            # 串口掉了之类
+                self.error = exc
+                return
+            self.done.wait(period)
+
+    def halt(self):
+        """停发, 然后连发一串零速把车按住。"""
+        self.done.set()
+        self.join(timeout=1.0)
+        for _ in range(STOP_BURST):
+            try:
+                self.port.write(build_cmd(0.0, 0.0))
+            except Exception:
+                return
+            time.sleep(0.02)
 
 
 def fault_name(code):
@@ -216,9 +276,25 @@ def main():
                     help="只在发现问题时输出")
     ap.add_argument("--seconds", type=float, default=0,
                     help="跑这么久就退出 (0 = 一直跑)")
+    ap.add_argument("--drive", nargs=2, type=float, metavar=("VX", "WZ"),
+                    help="边看边下发速度命令 (m/s 与 rad/s), 20Hz 持续发。"
+                         "台架测试用: 否则只能下令或看数据二选一, 因为"
+                         "串口是独占的。退出时自动连发零速停车。")
     args = ap.parse_args()
 
     stream, dump = open_stream(args)
+
+    sender = None
+    if args.drive:
+        if args.file:
+            sys.exit("--drive 需要真实串口, 不能和 -f 一起用")
+        if not hasattr(stream, "write"):
+            sys.exit("--drive 需要真实串口 (当前读的是文件)")
+        sender = Sender(stream, args.drive[0], args.drive[1])
+        sender.start()
+        print("# 正在下发 vx=%.3f m/s  wz=%.3f rad/s  (Ctrl-C 停止)"
+              % (args.drive[0], args.drive[1]))
+
     t0 = time.time()
     last_diag = None
     dropped = 0
@@ -254,11 +330,17 @@ def main():
                 print("    (累计丢帧 %d — 链路不稳, 数值要打折看)" % dropped)
             sys.stdout.flush()
 
+            if sender and sender.error:
+                print("!! 下发失败: %s" % sender.error)
+                break
             if args.seconds and (time.time() - t0) > args.seconds:
                 break
     except KeyboardInterrupt:
         pass
     finally:
+        if sender:
+            sender.halt()           # 无论如何都要把车按住再退出
+            print("# 已发零速停车", file=sys.stderr)
         if last_diag is None:
             print("没有收到任何诊断帧。检查:\n"
                   "  - 底盘节点是不是还占着串口 (占着就收不到数据)\n"

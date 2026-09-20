@@ -691,6 +691,21 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     target_vx = ClampF((float)vx_mm / 1000.0f, -MAX_LIN_SPEED, MAX_LIN_SPEED);
     target_wz = ClampF((float)wz_mrad / 1000.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
 
+    /* ★ 电机继电器必须有人自动管。
+       继电器帧(f[1]=0x05)是本工程自定义的扩展, 厂商 ROS 节点不认识、永远
+       不会发 —— 如果只靠上位机显式合闸, 换成 RK3588 当上位机之后电机永远
+       没有电, 而 STM32 照样会发 CAN 转速命令, 现象是"目标转速有、实际为 0、
+       电流≈0", 和"驱动器没给力"在诊断上完全分不出来。
+       所以策略改成: 只要收到有效命令就自动合上电机继电器, 断链时由看门狗
+       自动断开(见 main 里的 Relay_Set(0)) —— 不需要上位机配合, 车也不会在
+       断链后自己复活。
+
+       ★ 水泵**不**自动合闸: 误抽水的代价太大, 只能由上位机显式发 0x05 帧。 */
+    if ((relay_state & 0x01) == 0)
+    {
+        Relay_Set((uint8_t)(relay_state | 0x01));
+    }
+
     last_cmd_ms = g_tick_ms;
     ever_linked = 1;
     failsafe_latched = 0;
