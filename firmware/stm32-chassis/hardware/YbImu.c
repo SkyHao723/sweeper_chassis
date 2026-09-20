@@ -227,6 +227,63 @@ uint8_t YbImu_Scan(void)
     return 0;
 }
 
+/*=========================== 寄存器体检 ===========================
+ * 每个功能块单独读一遍, 光看"有没有非零字节"就够判断它活没活。
+ * 只在诊断周期(1Hz)调用, 多花几毫秒无所谓。
+ *=================================================================*/
+static uint8_t AnyNonZero(const uint8_t *p, uint8_t n)
+{
+    uint8_t i;
+    for (i = 0; i < n; i++)
+    {
+        if (p[i] != 0) return 1;
+    }
+    return 0;
+}
+
+/* 模块的 float 是小端 IEEE754。Cortex-M3 本身就是小端, 所以直接把
+   4 个字节按小端拼成 uint32 再按位转成 float (不用指针强转, 免得踩对齐)。 */
+static float RdFloatLE(const uint8_t *p)
+{
+    union { uint32_t u; float f; } cv;
+
+    cv.u = ((uint32_t)p[0])       | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return cv.f;
+}
+
+void YbImu_Probe(YbImu_Probe_t *out)
+{
+    uint8_t buf[16];
+    uint8_t err;
+
+    out->ver[0] = out->ver[1] = out->ver[2] = 0;
+    out->ver_ok = out->gyro_ok = out->mag_ok = 0;
+    out->quat_ok = out->euler_ok = 0;
+    out->euler_yaw = 0.0f;
+
+    if (YbImu_ReadRegs(YBIMU_REG_VERSION, out->ver, 3) == YBIMU_ST_OK)
+    {
+        out->ver_ok = 1;
+    }
+
+    err = YbImu_ReadRegs(YBIMU_REG_GYRO, buf, 6);
+    if (err == YBIMU_ST_OK) out->gyro_ok = AnyNonZero(buf, 6);
+
+    err = YbImu_ReadRegs(YBIMU_REG_MAG, buf, 6);
+    if (err == YBIMU_ST_OK) out->mag_ok = AnyNonZero(buf, 6);
+
+    err = YbImu_ReadRegs(YBIMU_REG_QUAT, buf, 16);
+    if (err == YBIMU_ST_OK) out->quat_ok = AnyNonZero(buf, 16);
+
+    err = YbImu_ReadRegs(YBIMU_REG_EULER, buf, 12);
+    if (err == YBIMU_ST_OK)
+    {
+        out->euler_ok = AnyNonZero(buf, 12);
+        out->euler_yaw = RdFloatLE(&buf[8]);    /* float×3: roll, pitch, yaw */
+    }
+}
+
 /*=========================== 对外接口 =============================*/
 uint8_t YbImu_ReadVersion(uint8_t out[3])
 {

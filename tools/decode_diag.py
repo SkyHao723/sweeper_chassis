@@ -37,7 +37,11 @@
     [24]    UART 有效命令           [25]   UART 溢出
     [26]    继电器 bit0电机 bit1水泵  [27]  IMU 诊断码
     [28]    IMU I2C 地址            [29]   帧序号
-    [30]    BCC                     [31]   0x7D
+    [30]    IMU 寄存器体检标志位: bit0 版本 bit1 陀螺仪 bit2 磁力计
+                                bit3 四元数 bit4 欧拉角
+    [31]    IMU 版本号(主)
+    [32-33] IMU 内部融合的偏航角 int16 0.01rad
+    [34]    BCC                     [35]   0x7D
 """
 
 import argparse
@@ -52,7 +56,7 @@ CMD_TAIL = 0x7D
 TEL_HEAD = 0x7B
 DIAG_HEAD = 0x7E
 TEL_SIZE = 24
-DIAG_SIZE = 32
+DIAG_SIZE = 36
 SEND_HZ = 20          # 和 STM32 的 CAN_PERIOD_MS 对齐, 上位机一般也是这个量级
 STOP_BURST = 15       # 退出前连发几帧零速, 保证车真的停下
 
@@ -174,7 +178,8 @@ def mode_name(code):
 class Diag(object):
     __slots__ = ("flags", "vx", "wz", "wl", "wr", "tl", "tr",
                  "c1", "c2", "f1", "f2", "m1", "m2", "can_err",
-                 "bad", "ok", "ovf", "relay", "imu_st", "imu_addr", "seq")
+                 "bad", "ok", "ovf", "relay", "imu_st", "imu_addr", "seq",
+                 "probe", "imu_ver", "euler_yaw")
 
     def __init__(self, b):
         self.flags = b[1]
@@ -188,11 +193,35 @@ class Diag(object):
         self.ovf, self.relay = b[25], b[26]
         self.imu_st, self.imu_addr = b[27], b[28]
         self.seq = b[29]
+        self.probe = b[30]          # 各功能块活没活
+        self.imu_ver = b[31]
+        self.euler_yaw = i16(b, 32) / 100.0    # rad
+
+    def probe_text(self):
+        """把 IMU 体检标志位翻成人话 —— 陀螺仪恒 0 时靠它定位问题。"""
+        if self.probe == 0:
+            return "没做体检"
+        names = ((0x01, "版本"), (0x02, "陀螺"), (0x04, "磁力"),
+                 (0x08, "四元数"), (0x10, "欧拉"))
+        alive = [n for bit, n in names if self.probe & bit]
+        dead = [n for bit, n in names if not (self.probe & bit)]
+        return "活:%s 死:%s ver=%d yaw=%.3f" % (
+            "/".join(alive) or "-", "/".join(dead) or "-",
+            self.imu_ver, self.euler_yaw)
 
     def problems(self):
         """返回 [(key, 描述), ...]; 没问题就返回空列表。
         key 用来做"连续出现多久"的统计, 见 ProblemTracker。"""
         out = []
+        if self.imu_st == 6:
+            out.append(("imugyro",
+                        "IMU 陀螺仪恒为 0（加速度正常）—— 体检: %s"
+                        % self.probe_text()))
+        elif self.imu_st != 0:
+            out.append(("imuother",
+                        "IMU 读取异常: %s（体检: %s）"
+                        % (IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st),
+                           self.probe_text())))
         for tag, tgt, act, cur, flt in (
                 ("1号", self.tl, self.wl, self.c1, self.f1),
                 ("2号", self.tr, self.wr, self.c2, self.f2)):
@@ -214,6 +243,9 @@ class Diag(object):
 
     def line(self, bat_mv=0):
         bat = (" bat=%.1fV" % (bat_mv / 1000.0)) if bat_mv else ""
+        imu = IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st)
+        if self.imu_st != 0:
+            imu += "[%s]" % self.probe_text()
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
@@ -223,8 +255,7 @@ class Diag(object):
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2),
-                   self.can_err, self.bad, self.ovf, self.relay,
-                   IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st), bat))
+                   self.can_err, self.bad, self.ovf, self.relay, imu, bat))
 
 
 class ProblemTracker(object):

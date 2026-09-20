@@ -50,7 +50,7 @@
  *   [22]   BCC = XOR([0..21])
  *   [23]   0x7D
  *
- * 【扩展诊断帧 32 字节  STM32 -> 上位机】  (本工程自定义, 头 0x7E)
+ * 【扩展诊断帧 36 字节  STM32 -> 上位机】  (本工程自定义, 头 0x7E)
  *   厂商 ROS 节点不认识这一帧。它靠"上一字节是帧尾 0x7D、本字节是 0x7B"
  *   才入帧, 而本帧永远夹在两个完整 24 字节帧之间发出, 所以它会被完整跳过、
  *   并在下一个 0x7B 处正常重新同步 —— 不需要厂商那边做任何改动。
@@ -75,10 +75,19 @@
  *   [25]    UART 溢出计数
  *   [26]    继电器状态  bit0 电机 bit1 水泵
  *   [27]    IMU 诊断码  0=正常 1=SCL拉不高 2=SDA拉不高 3=总线死 4=无应答 5=读出错
+ *                      6=加速度正常但角速度恒为 0
  *   [28]    IMU 扫描到的 I2C 地址 (0 = 没扫到)
  *   [29]    帧序号(自增), 上位机据此发现丢帧
- *   [30]    BCC = XOR([0..29])
- *   [31]    0x7D
+ *   [30]    IMU 寄存器体检标志位: bit0 版本号 bit1 陀螺仪 bit2 磁力计
+ *                               bit3 四元数 bit4 欧拉角  (1 = 该块读到非零数据)
+ *   [31]    IMU 版本号(主版本)
+ *   [32-33] IMU 内部融合的偏航角, int16, 单位 0.01 rad
+ *   [34]    BCC = XOR([0..33])
+ *   [35]    0x7D
+ *
+ *   [30..33] 是陀螺仪恒 0 时用来定位问题的: 只要 [30] 里除了 bit1 以外还有
+ *   别的位置 1, 就说明模块其它功能块是活的, 问题只在陀螺仪这一块;
+ *   同时 [32-33] 的偏航角还能当角速度的替代来源(对时间求导)。
  *
  *   为什么把驱动器的电流/故障码单独报出来: 目标转速和实际转速对不上时,
  *   看电流就能分清是"驱动器根本没给力"(电流≈0, 多半是故障或没使能)还是
@@ -194,7 +203,7 @@
 #define TEL_FRAME_SIZE     24
 #define TEL_HEAD           0x7B
 #define TEL_TAIL           0x7D
-#define DIAG_FRAME_SIZE    32
+#define DIAG_FRAME_SIZE    36
 #define DIAG_HEAD          0x7E
 #define DIAG_TAIL          0x7D
 
@@ -285,6 +294,13 @@ static uint8_t  imu_gyro_ok;         /* 1 = 陀螺仪有效(不是恒 0) */
 static uint8_t  imu_status;          /* YBIMU_ST_* 失败原因 */
 static uint8_t  imu_found_addr;      /* 扫描到的器件地址, 0 = 没扫到 */
 static uint32_t imu_diag_ms;         /* 上次诊断的时刻 */
+
+/* IMU 寄存器体检结果 (1Hz 刷一次)。
+   陀螺仪恒 0 时靠它区分"只有陀螺仪坏"还是"整个模块只剩加速度可用"。 */
+static uint8_t  imu_probe_flags;     /* bit0 版本 bit1 陀螺 bit2 磁力 bit3 四元数 bit4 欧拉 */
+static uint8_t  imu_ver_major;
+static int16_t  imu_euler_yaw_crad;  /* 模块自己融合的偏航角, 单位 0.01rad */
+static uint32_t imu_probe_ms;        /* 上次寄存器体检的时刻 */
 
 /* 继电器 */
 static uint8_t  relay_state;                       /* bit0 电机 bit1 水泵 */
@@ -846,6 +862,23 @@ static void IMU_Tick(void)
     float gyro[3];
     uint8_t err;
 
+    /* 寄存器体检 (1Hz)。★ 必须放在最前面 —— 下面 YBIMU_ST_GYRO_ZERO 那条
+       分支会提前 return, 而"陀螺仪恒 0"恰恰是最需要体检的情况。 */
+    if ((g_tick_ms - imu_probe_ms) >= IMU_DIAG_PERIOD_MS)
+    {
+        YbImu_Probe_t pr;
+
+        imu_probe_ms = g_tick_ms;
+        YbImu_Probe(&pr);
+        imu_probe_flags = (uint8_t)((pr.ver_ok   ? 0x01 : 0) |
+                                    (pr.gyro_ok  ? 0x02 : 0) |
+                                    (pr.mag_ok   ? 0x04 : 0) |
+                                    (pr.quat_ok  ? 0x08 : 0) |
+                                    (pr.euler_ok ? 0x10 : 0));
+        imu_ver_major = pr.ver[0];
+        imu_euler_yaw_crad = (int16_t)(pr.euler_yaw * 100.0f);   /* rad -> 0.01rad */
+    }
+
     err = YbImu_ReadMotion(accel, gyro);
 
     /* YBIMU_ST_GYRO_ZERO 表示加速度读到了但陀螺仪恒为 0 —— 加速度还是能用的,
@@ -1009,7 +1042,10 @@ static void Send_DiagFrame(uart_port_t *p)
     f[27] = imu_status;                  /* YBIMU_ST_* */
     f[28] = imu_found_addr;              /* 0 = 没扫到 */
     f[29] = seq++;                       /* 帧序号, 上位机据此发现丢帧 */
-    /* f[30] = BCC, f[31] = 0x7D 下面填 */
+    f[30] = imu_probe_flags;             /* 各功能块活没活 */
+    f[31] = imu_ver_major;               /* 模块版本号 */
+    PutI16(&f[32], imu_euler_yaw_crad);  /* 模块自己融合的偏航角 0.01rad */
+    /* f[34] = BCC, f[35] = 0x7D 下面填 */
 
     for (i = 0; i < DIAG_FRAME_SIZE - 2; i++) bcc ^= f[i];
     f[DIAG_FRAME_SIZE - 2] = bcc;

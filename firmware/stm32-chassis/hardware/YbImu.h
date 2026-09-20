@@ -26,6 +26,9 @@
 #define YBIMU_REG_VERSION   0x01
 #define YBIMU_REG_ACCEL     0x04    /* 6 字节 int16×3, 单位 g,     满量程 ±16g  */
 #define YBIMU_REG_GYRO      0x0A    /* 6 字节 int16×3, 单位 rad/s, 满量程 ±2000dps */
+#define YBIMU_REG_MAG       0x10    /* 6 字节 int16×3, 单位 uT,    满量程 ±800uT */
+#define YBIMU_REG_QUAT      0x16    /* 16 字节 float×4 (w,x,y,z) */
+#define YBIMU_REG_EULER     0x26    /* 12 字节 float×3 (roll,pitch,yaw), 单位 rad */
 
 /* ★ 加速度和角速度必须**分两次读**, 不能一次读 12 字节。
  *   虽然 0x04+6 == 0x0A 地址是连续的, 但模块的地址指针不跨功能块自增:
@@ -43,6 +46,30 @@
 
 /* 返回 0 = 成功, 非 0 = 失败 */
 uint8_t YbImu_ReadMotion(float accel_g[3], float gyro_rad_s[3]);
+
+/*------------------------- 寄存器体检 ---------------------------
+ * 把每个功能块都读一遍, 看哪些有非零数据。
+ *
+ * 用途: 角速度恒为 0 时, 只靠 0x0A 一个寄存器分不清是
+ *   (a) 只有陀螺仪这一块坏了, 模块其它部分还活着
+ *   (b) 整个模块只剩加速度能用(比如进了某种受限模式)
+ * 两种情况的修法完全不同, 所以必须能区分。
+ *
+ * 顺带把模块内部融合出来的偏航角读回来 —— 万一原始陀螺仪真读不出来,
+ * 这个还能当角速度的替代来源(对时间求导)。
+ *----------------------------------------------------------------*/
+typedef struct
+{
+    uint8_t ver[3];       /* 0x01 版本号 */
+    uint8_t ver_ok;       /* 版本号读到了 */
+    uint8_t gyro_ok;      /* 0x0A 读到非零 */
+    uint8_t mag_ok;       /* 0x10 读到非零 */
+    uint8_t quat_ok;      /* 0x16 读到非零 */
+    uint8_t euler_ok;     /* 0x26 读到非零 */
+    float   euler_yaw;    /* 0x26 的偏航角 rad (仅 euler_ok 时有效) */
+} YbImu_Probe_t;
+
+void YbImu_Probe(YbImu_Probe_t *out);
 
 /*----------------------------- 诊断 -----------------------------*/
 uint8_t YbImu_BusCheck(void);   /* 返回 YBIMU_ST_* : 只看总线空闲电平和起始条件 */
