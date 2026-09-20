@@ -1,0 +1,10 @@
+# 二进制文件, 禁止任何行尾/编码转换
+*.pdf   binary
+*.axf   binary
+*.hex   binary
+*.bin   binary
+*.elf   binary
+*.apk   binary
+
+# 默认按文本处理并自动识别
+* text=auto
