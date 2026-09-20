@@ -198,16 +198,23 @@ class Diag(object):
         self.euler_yaw = i16(b, 32) / 100.0    # rad
 
     def probe_text(self):
-        """把 IMU 体检标志位翻成人话 —— 陀螺仪恒 0 时靠它定位问题。"""
+        """把 IMU 体检标志位翻成人话 —— 陀螺仪恒 0 时靠它定位问题。
+
+        ★ 只列**真的去读过**的功能块。四元数(0x16)和欧拉角(0x26)目前故意
+          不读(读 16/12 字节的长块会把模块卡成"总线死", 见 YbImu.c), 所以
+          绝不能把它们报成"死" —— 那是没测, 不是坏。分不清这两者会把人
+          带偏。"""
         if self.probe == 0:
             return "没做体检"
-        names = ((0x01, "版本"), (0x02, "陀螺"), (0x04, "磁力"),
-                 (0x08, "四元数"), (0x10, "欧拉"))
+        names = ((0x01, "版本"), (0x02, "陀螺"), (0x04, "磁力"))
         alive = [n for bit, n in names if self.probe & bit]
         dead = [n for bit, n in names if not (self.probe & bit)]
-        return "活:%s 死:%s ver=%d yaw=%.3f" % (
+        extra = ""
+        if self.probe & 0x18:
+            extra = " 四元数/欧拉也有数据"
+        return "活:%s 死:%s ver=%d%s" % (
             "/".join(alive) or "-", "/".join(dead) or "-",
-            self.imu_ver, self.euler_yaw)
+            self.imu_ver, extra)
 
     def problems(self):
         """返回 [(key, 描述), ...]; 没问题就返回空列表。
