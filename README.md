@@ -29,10 +29,12 @@ sweeper_chassis/
 ├── README.md                             本文件
 ├── docs/
 │   ├── wiring.md                         完整接线总表（先看这个）
+│   ├── ros-integration.md                接入 ROS 2 的状态/启动/还缺什么
 │   ├── chassis-serial-protocol.md        底盘串口协议说明（Wheeltec 那套）
 │   └── foc-driver-protocol-v1.2.pdf      FOC 驱动器通讯协议原始文档
 ├── tools/
-│   └── decode_diag.py                    解码扩展诊断帧（查"轮子有没有劲"）
+│   ├── decode_diag.py                    解码扩展诊断帧（查"轮子有没有劲"）
+│   └── chassis_check.py                  底盘验收（命令值 vs /odom 实测）
 └── firmware/
     └── stm32-chassis/                    STM32 底盘控制器（Keil MDK）
         ├── stm32-chassis.uvprojx         ← 唯一的工程
@@ -189,6 +191,10 @@ python3 tools/decode_diag.py -p /dev/wheeltec_controller --drive 0 -0.30 --secon
 ---
 
 ## RK3588 侧的准备
+
+> **完整说明见 [`docs/ros-integration.md`](docs/ros-integration.md)** —— 启动命令、
+> 验证过的状态、车型配置、传感器安装位置怎么改、还缺什么，都在那里。
+> 这里只留最关键的一条。
 
 底盘通过 **CH340 (`1a86:7523`)** 接 RK3588 的 USB。厂家的 udev 规则只认
 CP2102 (`10c4:ea60`) 和 CH343 (`1a86:55d4`)，**不认普通 CH340**，
