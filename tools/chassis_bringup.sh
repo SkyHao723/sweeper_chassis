@@ -33,6 +33,7 @@ if [ -z "${ROS_DISTRO:-}" ]; then
 fi
 
 stop_all() {
+    # 先按模式杀
     pkill -9 -f turn_on_wheeltec_robot  2>/dev/null
     pkill -9 -f wheeltec_robot_node     2>/dev/null
     pkill -9 -f ekf_node                2>/dev/null
@@ -40,6 +41,23 @@ stop_all() {
     pkill -9 -f robot_state_publisher   2>/dev/null
     pkill -9 -f joint_state_publisher   2>/dev/null
     sleep 3
+
+    # ★ 再按 PID 兜一遍并**验证**。
+    #   踩过的坑: 只 pkill 一次, 结果用户自己起的那份 launch 活了下来,
+    #   于是两个 launch 抢同一个串口 —— 节点开始崩溃循环, 日志刷屏,
+    #   现象是"车动一下就停", 查了很久才发现是两份进程在打架。
+    local left
+    for _ in 1 2 3; do
+        left=$(pgrep -f 'turn_on_wheeltec_robot|wheeltec_robot_node|ekf_node|static_transform_publisher|robot_state_publisher|joint_state_publisher' | tr '\n' ' ')
+        [ -z "$left" ] && break
+        kill -9 $left 2>/dev/null
+        sleep 2
+    done
+
+    if [ -n "$(pgrep -f 'wheeltec_robot_node' 2>/dev/null)" ]; then
+        echo "!! 还有残留进程没杀掉:"
+        pgrep -af 'wheeltec_robot_node|turn_on_wheeltec_robot'
+    fi
 }
 
 # /odom 有没有真的在出数据。**直接订阅, 不走 ros2 daemon** ——
