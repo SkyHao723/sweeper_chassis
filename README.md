@@ -31,9 +31,10 @@ sweeper_chassis/
 │   └── foc-driver-protocol-v1.2.pdf      FOC 驱动器通讯协议原始文档
 └── firmware/
     ├── stm32-chassis/                    STM32 底盘控制器（Keil MDK）
-    │   ├── stm32-chassis.uvprojx
+    │   ├── stm32-chassis-rk3588.uvprojx  ← 生产版：只接 RK3588
+    │   ├── stm32-chassis.uvprojx         ← 调试版：双串口 + ESP32
     │   ├── user/                         main.c / 中断 / 库配置
-    │   ├── hardware/                     外设驱动
+    │   ├── hardware/                     外设驱动（YbImu / OLED）
     │   ├── sys/                          Delay
     │   ├── lib/  start/  RTE/            ST 标准外设库 / CMSIS
     │   └── DebugConfig/
@@ -41,6 +42,33 @@ sweeper_chassis/
         ├── esp32-web-host.ino
         └── README.md
 ```
+
+---
+
+## 两个 STM32 版本（**源码只有一份**）
+
+两个 `.uvprojx` 打开的是**同一套源码**，区别只有一个预处理器宏
+`CHASSIS_RK3588_ONLY`（写在各工程的 `C/C++ → Define` 里）：
+
+| | `stm32-chassis-rk3588.uvprojx` | `stm32-chassis.uvprojx` |
+|---|---|---|
+| 用途 | **生产**：以后就用这个 | **调试**：现在用 ESP32 网页遥控 |
+| 上位机 | 只有 RK3588（USART1 / PA9-PA10）| RK3588（主）+ ESP32（从，USART2 / PA2-PA3）|
+| USART2 | **完全不初始化**，PA2/PA3 空着 | 初始化，跑命令和遥测 |
+| 控制权仲裁 | 无（只有一个上位机）| 有（主口优先，500ms 超时释放）|
+| 本地 EKF | **编译掉** | 跑（网页要画轨迹）|
+| `0x7E` 位姿帧 | **不发** | 发给 ESP32 |
+| 遥测流量 | 24 字节 / 50ms | 84 字节 / 50ms |
+| Code 大小 | **9536 B** | 14376 B |
+
+**为什么不做成两份源码**：修 bug 只修一处，不会出现"改了一份忘了另一份"。
+从使用角度看和两份没区别 —— Keil 里打开哪个就烧哪个，产出两个独立的 `.axf`。
+
+**改动差异的地方**都在 `main.c` 里用 `#if CHASSIS_RK3588_ONLY` / `#if EKF_ON_STM32`
+圈出来了，搜这两个宏就能看到全貌。
+
+> ⚠️ 两个版本**都还用同一套协议**（`docs/chassis-serial-protocol.md`），
+> 也都有看门狗（800ms 收不到命令自动刹车 + 断继电器）。生产版并不"更不安全"。
 
 ---
 
@@ -71,8 +99,17 @@ sweeper_chassis/
 
 ### 编译烧录 STM32
 
-Keil MDK 打开 `firmware/stm32-chassis/stm32-chassis.uvprojx`，用 **ST-Link (SWD)** 烧录。
-SWD 占用 PA13/PA14，和串口不冲突。
+Keil MDK 里**打开哪个 `.uvprojx` 就是哪个版本**：
+
+```
+firmware/stm32-chassis/stm32-chassis-rk3588.uvprojx    ← 生产版（只接 RK3588）
+firmware/stm32-chassis/stm32-chassis.uvprojx           ← 调试版（接 ESP32）
+```
+
+用 **ST-Link (SWD)** 烧录。SWD 占用 PA13/PA14，和串口不冲突。
+
+两个工程输出到不同的目录（`Objects-rk3588/` 和 `Objects/`），**互不干扰**，
+可以随时来回烧，不会出现增量编译串味。
 
 ### 编译烧录 ESP32
 
@@ -107,9 +144,9 @@ static const char *WIFI_PASSWORD = "...";
 
 ---
 
-## 双串口与控制权
+## 双串口与控制权（仅调试版）
 
-STM32 有两个串口跑**同一套协议**：
+调试版里 STM32 有两个串口跑**同一套协议**：
 
 | 口 | 引脚 | 接谁 | 角色 |
 |---|---|---|---|
@@ -121,6 +158,27 @@ STM32 有两个串口跑**同一套协议**：
 
 网页上的「控制方」会显示当前谁在开车。
 
+生产版只有一个上位机，这套仲裁整个编译掉了。
+
+---
+
+## RK3588 侧的准备
+
+底盘通过 **CH340 (`1a86:7523`)** 接 RK3588 的 USB。厂家的 udev 规则只认
+CP2102 (`10c4:ea60`) 和 CH343 (`1a86:55d4`)，**不认普通 CH340**，
+所以要自己加一条（已经加在车上那台 RK3588 上了）：
+
+```udev
+# /etc/udev/rules.d/wheeltec_controller_ch340.rules
+KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
+  MODE:="0777", GROUP:="dialout", SYMLINK+="wheeltec_controller"
+```
+
+普通 CH340 **没有唯一序列号**（`ID_SERIAL=1a86_USB_Serial`），只能按 VID:PID 匹配。
+以后要是加第二个 CH340，改成用 `KERNELS=="3-1.2"` 指定 USB 物理口。
+
+生效后 `/dev/wheeltec_controller -> ttyUSB*`，厂商的 launch 文件不用改。
+
 ---
 
 ## 安全机制
@@ -129,7 +187,7 @@ STM32 有两个串口跑**同一套协议**：
 |---|---|
 | 网页松手 | 立即发零速度 |
 | ESP32 空闲心跳 | 400ms 没收到遥控请求就补发零速度（手机锁屏、关页面都算） |
-| STM32 看门狗 | 控制方 800ms 不发命令 → 刹车 + 断开继电器 |
+| STM32 看门狗 | 上位机 800ms 不发命令 → 刹车 + 断开继电器（**两个版本都有**）|
 | 上电 | 先发零速度、继电器全断，车不会自己跑 |
 | 急停按钮 | 刹车 + 断开两个继电器 |
 
@@ -141,3 +199,13 @@ STM32 有两个串口跑**同一套协议**：
 - **STM32F1 的 USART 没有 RX FIFO**，收包必须用中断 + 环形缓冲，轮询一定会丢字节
 - **CAN 收发器和 STM32 之间选对电平**，PA11/PA12 不是 5V 容忍
 - **Blue Pill 的 PA11/PA12 同时连着 USB 座**，用 CAN 时别插那种会短接 D+/D- 的充电器
+- **不要用「位置模式锁位」实现待机时锁死轮子**（重要，已踩）。做法是先刹停、
+  再切 `MODE_POSITION`、然后每个周期死守驱动器回码里的位置。它在台架上表现很好
+  （推一下会弹回原位），但**实车上直接失控**：驱动器被切出速度模式后，靠一路
+  陈旧的绝对位置目标维持，多出「模式切换」和「位置目标」两个变量。
+  现已删除，停车路径是**无状态**的——每个控制周期重发同一条帧，不记忆、不切换。
+  想调待机手感只改 `main.c` 里的 `STOP_CTRL` 一个宏（`CTRL_BRAKE` 动态制动 /
+  `CTRL_DISABLE` 自由滑行 / `CTRL_ENABLE`+0）。实测 `CTRL_BRAKE` 在低速时制动力
+  很弱，慢慢推仍能推动——这是这台驱动器的固有特性，用锁位去换它的代价不值得。
+- **原地转向时两个轮子反向转是正常的**，不是故障。左轮 `vx - wz·b/2`、右轮
+  `vx + wz·b/2`，原地转（`vx=0`）时两轮等速反向。看到「内轮倒转」别急着断电。

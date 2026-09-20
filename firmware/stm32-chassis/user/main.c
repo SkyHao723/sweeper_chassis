@@ -88,7 +88,20 @@
 #define MOTOR1_INVERT          0    /* 某个轮子转向相反时改成 1 */
 #define MOTOR2_INVERT          1    /* 实测2号电机正方向是反的 */
 
-#define STOP_CTRL   CTRL_BRAKE      /* 停车用刹车; 想滑行改成 CTRL_DISABLE */
+/*---------------------- 待机时的电机状态 ----------------------------
+ *   没有命令(或收到零速度)时、以及断链看门狗触发时, 一律发 STOP_CTRL。
+ *   想换待机手感只改这一个宏:
+ *     CTRL_BRAKE (03)   动态制动, 相线短接。转速越低制动力越小 -> 慢慢推很轻
+ *     CTRL_DISABLE(02)  完全松开, 轮子自由滑行
+ *     CTRL_ENABLE(01)+0 速度环有静区: 不推时误差0、输出0 -> 慢慢推也不出力
+ *
+ *   历史教训: 这里曾经做过"位置模式锁位"(先刹停 -> 切 MODE_POSITION ->
+ *   死守驱动器回码里的 m1_pos/m2_pos)。它会把驱动器切出速度模式, 再靠一路
+ *   陈旧的绝对位置目标维持, 平白多出"模式切换"和"位置目标"两个变量 ——
+ *   实测在车上出现了失控。已删除。
+ *   现在的停车路径是**无状态**的: 每个控制周期重发同一条帧, 不记忆、不切换。
+ *-----------------------------------------------------------------*/
+#define STOP_CTRL           CTRL_BRAKE
 
 /*---------------------- 双串口 / 控制权 ----------------------------
  *   PORT_MAIN (USART1, PA9/PA10) -> CH340 / RK3588   主口, 可以抢占
@@ -103,14 +116,35 @@
 #define OWNER_TIMEOUT_MS    500
 #define LINK_TIMEOUT_MS     800
 
+/*======================= 构建模式 (两个 Keil 工程共用这份源码) ==========
+ *   CHASSIS_RK3588_ONLY = 1   生产版
+ *       只认主口 USART1(PA9/PA10, 接 RK3588)的命令, 和 ESP32 完全脱钩:
+ *         - 根本不初始化 USART2, PA2/PA3 空着
+ *         - 不做控制权仲裁 (只有一个上位机, 没有仲裁的必要)
+ *         - 不跑本地卡尔曼, 不发 0x7E 扩展帧 (EKF 在上位机 RK3588 上做)
+ *       省下来的时间: 遥测从 84 字节降到 24 字节, 每 50ms 少阻塞约 5ms,
+ *       控制周期更紧; 也少 36 字节扩展帧去干扰厂商驱动。
+ *
+ *   CHASSIS_RK3588_ONLY = 0   调试版
+ *       双串口 + 控制权仲裁 + 本地 EKF + 0x7E 位姿帧, 配合 ESP32 网页遥控。
+ *
+ * 两个 .uvprojx 各定义一个, 源码只有一份 —— 修 bug 只修一处。
+ *=====================================================================*/
+#ifndef CHASSIS_RK3588_ONLY
+#define CHASSIS_RK3588_ONLY 0
+#endif
+
 /*---------------------- 本地卡尔曼(可选) ---------------------------
- *   EKF_ON_STM32 = 1 : STM32 自己积分位姿 + 卡尔曼滤波, 发 0x7E 位姿帧。
- *                      调试阶段用 ESP32 网页看轨迹时需要这个。
- *   EKF_ON_STM32 = 0 : EKF 在上位机(RK3588)做, STM32 只按协议报车体速度。
- *                      接上 RK3588 之后改成 0, 省 CPU 也省串口带宽。
+ *   生产版强制关闭: EKF 在 RK3588 上做, STM32 只负责按协议报车体速度。
+ *   调试版打开: 网页能画轨迹。
  *-----------------------------------------------------------------*/
+#if CHASSIS_RK3588_ONLY
+#define EKF_ON_STM32        0
+#define ODOM_FRAME_TO_MAIN  0
+#else
 #define EKF_ON_STM32        1
-#define ODOM_FRAME_TO_MAIN  0   /* 位姿帧是本工程扩展, 厂商驱动不认识, 默认只发调试口。ESP32 还没挪到 PA2/PA3 时改成 1 */
+#define ODOM_FRAME_TO_MAIN  0   /* 位姿帧是本工程扩展, 厂商驱动不认识, 默认只发调试口 */
+#endif
 
 /*---------------------- GPIO 继电器 (外设开关) ----------------------
  *   PB0 -> 电机继电器 IN     PB1 -> 水泵继电器 IN
@@ -148,6 +182,7 @@
 #define MOTOR1_REPORT_ID   (MOTOR1_CAN_ID + 3UL)   /* 定时上报帧 */
 
 #define MODE_SPEED         0x05
+#define MODE_POSITION      0x06
 #define CTRL_ENABLE        0x01
 #define CTRL_DISABLE       0x02
 #define CTRL_BRAKE         0x03
@@ -221,10 +256,13 @@ typedef struct
 
 static uart_port_t ports[PORT_COUNT];
 
-/* 控制权: 谁最近发了"非零"命令谁说了算; 主口可以抢占 */
+/* 控制权: 谁最近发了"非零"命令谁说了算; 主口可以抢占。
+   生产版只有一个上位机, 不需要仲裁, 这套状态整个编译掉。 */
+#if !CHASSIS_RK3588_ONLY
 static uint8_t  ctrl_owner;         /* 0xFF = 无 */
-static uint32_t ctrl_owner_ms;
+static uint32_t ctrl_owner_ms;      /* 控制权最后一次刷新的时刻 */
 #define OWNER_NONE  0xFF
+#endif
 
 /* 目标 / 状态 */
 static float    target_vx;          /* m/s */
@@ -232,8 +270,11 @@ static float    target_wz;          /* rad/s */
 static uint8_t  ever_linked;
 static uint8_t  failsafe_latched;
 
+/* 物理轮速目标 —— 只用于调试版的 0x7E 帧, 生产版没有地方上报 */
+#if EKF_ON_STM32
 static int16_t  target_left_rpm;
 static int16_t  target_right_rpm;
+#endif
 
 static uint32_t last_cmd_ms;
 static uint32_t last_can_ms;
@@ -256,11 +297,16 @@ static float    body_vx, body_wz;                  /* 轮速正解出的车体�
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
 static float    imu_gyro[3];         /* 单位 rad/s */
+
+/* IMU 的诊断状态只在调试版有意义(结果通过 0x7E 帧上报给网页)。
+   生产版没人看, 就不采集了 —— 顺便省掉读失败时的 I2C 地址扫描。 */
+#if EKF_ON_STM32
 static uint8_t  imu_ok;              /* 1 = 加速度有效 */
 static uint8_t  imu_gyro_ok;         /* 1 = 陀螺仪有效(不是恒 0) */
 static uint8_t  imu_status;          /* YBIMU_ST_* 失败原因 */
 static uint8_t  imu_found_addr;      /* 扫描到的器件地址, 0 = 没扫到 */
 static uint32_t imu_diag_ms;         /* 上次诊断的时刻 */
+#endif
 
 /* 继电器 */
 static uint8_t  relay_state;                       /* bit0 电机 bit1 水泵 */
@@ -385,13 +431,13 @@ static void CAN1_SendRaw(uint32_t id, uint8_t dlc, const uint8_t *data)
     }
 }
 
-/* 给一台电机发"速度模式 + 控制字 + 目标转速" */
-static void CAN1_SendMotor(uint32_t id, uint8_t ctrl, int16_t rpm)
+/* 给一台电机发指令: 模式 + 控制字 + 设定值(转速 RPM 或位置 度) */
+static void CAN1_SendMotorCmd(uint32_t id, uint8_t mode, uint8_t ctrl, int16_t value)
 {
     uint8_t data[8];
-    uint16_t raw = (uint16_t)rpm;
+    uint16_t raw = (uint16_t)value;
 
-    data[0] = MODE_SPEED;
+    data[0] = mode;
     data[1] = ctrl;
     data[2] = (uint8_t)(raw >> 8);
     data[3] = (uint8_t)raw;
@@ -401,6 +447,9 @@ static void CAN1_SendMotor(uint32_t id, uint8_t ctrl, int16_t rpm)
     data[7] = 0;
     CAN1_SendRaw(id, 8, data);
 }
+
+#define CAN1_SendSpeed(id, rpm)  CAN1_SendMotorCmd((id), MODE_SPEED, CTRL_ENABLE, (rpm))
+#define CAN1_SendStop(id)        CAN1_SendMotorCmd((id), MODE_SPEED, STOP_CTRL,   0)
 
 static void CAN1_Poll(void)
 {
@@ -412,7 +461,9 @@ static void CAN1_Poll(void)
         CAN_Receive(CAN1, CAN_FIFO0, &rx);
         id = (rx.IDE == CAN_Id_Extended) ? rx.ExtId : rx.StdId;
 
-        /* 控制帧回码 ...E601: DATA1=故障码, DATA2/3=实际转速 */
+        /* 控制帧回码 ...E601:
+             DATA1=故障码  DATA2/3=实际转速
+             (DATA6/7 是当前位置(度), 现在没人用, 需要时再解析) */
         if ((id == MOTOR1_REPLY_ID) && (rx.DLC >= 4))
         {
             m1_fault = rx.Data[1];
@@ -529,7 +580,9 @@ static void USART1_Init(void)
     ports[PORT_MAIN].usart = USART1;
 }
 
-/* USART2: PA2(TX) / PA3(RX)  ->  调试用 ESP32 */
+/* USART2: PA2(TX) / PA3(RX)  ->  调试用 ESP32
+   生产版整块编译掉: PA2/PA3 空着, 和 ESP32 彻底脱钩。 */
+#if !CHASSIS_RK3588_ONLY
 static void USART2_Init(void)
 {
     NVIC_InitTypeDef nvic;
@@ -547,6 +600,7 @@ static void USART2_Init(void)
     ports[PORT_AUX].id = PORT_AUX;
     ports[PORT_AUX].usart = USART2;
 }
+#endif
 
 static void PutI16(uint8_t *p, int16_t v)
 {
@@ -560,6 +614,7 @@ static void PutU16(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)v;
 }
 
+#if EKF_ON_STM32
 static void PutI32(uint8_t *p, int32_t v)
 {
     uint32_t u = (uint32_t)v;
@@ -568,6 +623,7 @@ static void PutI32(uint8_t *p, int32_t v)
     p[2] = (uint8_t)(u >> 8);
     p[3] = (uint8_t)u;
 }
+#endif
 
 /*========================= GPIO 继电器 ============================
  * 两路推挽输出。RELAY_ACTIVE_LOW 决定"开"到底是高电平还是低电平。
@@ -686,6 +742,15 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     nonzero = (uint8_t)((vx_mm != 0) || (wz_mrad != 0));
     if (ports[port_id].ok_count != 0xFF) ports[port_id].ok_count++;
 
+#if CHASSIS_RK3588_ONLY
+    /* 生产版: 只有 RK3588 一个上位机, 不需要仲裁。
+       理论上从口根本不会被初始化, 这里再挡一道, 免得以后手滑接上 ESP32。 */
+    (void)nonzero;
+    if (port_id != PORT_MAIN)
+    {
+        return;
+    }
+#else
     /* ---- 抢占 / 续期 ---- */
     if (nonzero)
     {
@@ -711,6 +776,7 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     {
         return;
     }
+#endif
 
     target_vx = ClampF((float)vx_mm / 1000.0f, -MAX_LIN_SPEED, MAX_LIN_SPEED);
     target_wz = ClampF((float)wz_mrad / 1000.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
@@ -821,18 +887,25 @@ static void Drive_Apply(void)
     if (MOTOR1_INVERT) m1 = (int16_t)(-m1);
     if (MOTOR2_INVERT) m2 = (int16_t)(-m2);
 
+#if EKF_ON_STM32
     target_left_rpm = (int16_t)rpm_l;      /* 上报给上位机的是物理轮速目标, */
     target_right_rpm = (int16_t)rpm_r;     /* 不是电机命令, 免得左右概念混淆 */
+#endif
 
-    if ((m1 == 0) && (m2 == 0))
+    /*===================== 走 / 停 两态 =====================
+     * 停车就是一条 STOP_CTRL 帧, 每个控制周期重发。
+     * 不切模式、不记忆状态、不引用位置 —— 出问题只可能出在电机或接线,
+     * 不可能出在这几行逻辑上。这是上一版"位置锁位"失控后刻意保留的简单。
+     *=======================================================*/
+    if ((m1 != 0) || (m2 != 0))
     {
-        CAN1_SendMotor(MOTOR1_CAN_ID, STOP_CTRL, 0);
-        CAN1_SendMotor(MOTOR2_CAN_ID, STOP_CTRL, 0);
+        CAN1_SendSpeed(MOTOR1_CAN_ID, m1);
+        CAN1_SendSpeed(MOTOR2_CAN_ID, m2);
     }
     else
     {
-        CAN1_SendMotor(MOTOR1_CAN_ID, CTRL_ENABLE, m1);
-        CAN1_SendMotor(MOTOR2_CAN_ID, CTRL_ENABLE, m2);
+        CAN1_SendStop(MOTOR1_CAN_ID);
+        CAN1_SendStop(MOTOR2_CAN_ID);
     }
 }
 
@@ -849,7 +922,10 @@ static void Drive_Apply(void)
  *  预测:  用当前 v, wz 推位姿
  *  观测1: 轮速计算出的 (v, wz)          —— 一直有
  *  观测2: 陀螺仪 Z 轴角速度 gz = wz + bgz —— 接了 IMU 才有
+ *
+ *  生产版 (CHASSIS_RK3588_ONLY=1) 整块编译掉: EKF 在上位机 RK3588 上做。
  *==================================================================*/
+#if EKF_ON_STM32
 #define EKF_N 6
 
 static float ekf_x[EKF_N];
@@ -1089,14 +1165,18 @@ static uint8_t IMU_ReadGyroZ(float *gz)
     return 1;
 }
 
+#endif /* EKF_ON_STM32 */
+
 /*======================= IMU (YbImu) ==============================
- * 按 ODOM_PERIOD_MS 采一次。读失败不清零 —— 保留上一次的值, 同时把 imu_ok
- * 置 0, 上位机看 imu_ok 就知道这次的数据可不可信。
+ * 按 ODOM_PERIOD_MS 采一次。读失败不清零 —— 保留上一次的值。
  *
- * 读失败时最多每秒做一次诊断(查总线空闲电平 + 扫地址), 结果通过遥测帧
- * 报给上位机 —— 否则"读取失败"这四个字什么信息都没有, 没法修。
+ * 调试版还会记录一串诊断状态, 读失败时最多每秒做一次总线检查 + 地址扫描,
+ * 结果通过 0x7E 帧报给网页 —— 否则"读取失败"这四个字什么信息都没有。
+ * 生产版没有地方上报这些东西, 整块编译掉, 顺便省掉扫描的开销。
  *=================================================================*/
+#if EKF_ON_STM32
 #define IMU_DIAG_PERIOD_MS  1000
+#endif
 
 static void IMU_Tick(void)
 {
@@ -1107,33 +1187,36 @@ static void IMU_Tick(void)
     err = YbImu_ReadMotion(accel, gyro);
 
     /* YBIMU_ST_GYRO_ZERO 表示加速度读到了但陀螺仪恒为 0 —— 加速度还是能用的,
-       所以不算完全失败, 但要如实报上去。 */
+       所以不算完全失败。 */
     if ((err == YBIMU_ST_OK) || (err == YBIMU_ST_GYRO_ZERO))
     {
         imu_accel_g[0] = accel[0];
         imu_accel_g[1] = accel[1];
         imu_accel_g[2] = accel[2];
-        imu_ok = 1;
-        imu_status = err;
-        imu_found_addr = YBIMU_I2C_ADDR;
 
         if (err == YBIMU_ST_OK)
         {
             imu_gyro[0] = gyro[0];
             imu_gyro[1] = gyro[1];
             imu_gyro[2] = gyro[2];
-            imu_gyro_ok = 1;
         }
         else
         {
             imu_gyro[0] = 0.0f;
             imu_gyro[1] = 0.0f;
             imu_gyro[2] = 0.0f;
-            imu_gyro_ok = 0;
         }
+
+#if EKF_ON_STM32
+        imu_ok = 1;
+        imu_gyro_ok = (uint8_t)(err == YBIMU_ST_OK);
+        imu_status = err;
+        imu_found_addr = YBIMU_I2C_ADDR;
+#endif
         return;
     }
 
+#if EKF_ON_STM32
     imu_ok = 0;
     imu_gyro_ok = 0;
     imu_status = err;
@@ -1155,6 +1238,7 @@ static void IMU_Tick(void)
             imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
         }
     }
+#endif
 }
 
 /* 物理量 -> 协议规定的 ±2g / ±500dps 原始值, 带限幅(超量程夹住而不是回绕) */
@@ -1233,6 +1317,9 @@ static void Send_MainTelemetry(uart_port_t *p)
     for (i = 0; i < TEL_FRAME_SIZE; i++) Port_SendByte(p, f[i]);
 }
 
+/* 位姿扩展帧 (0x7E) —— 本工程自定义, 厂商驱动不认识。
+   生产版编译掉: EKF 在上位机做, 不需要这个帧。 */
+#if EKF_ON_STM32
 static void Send_OdomFrame(uart_port_t *p)
 {
     uint8_t f[ODOM_FRAME_SIZE];
@@ -1275,6 +1362,7 @@ static void Send_OdomFrame(uart_port_t *p)
 
     for (i = 0; i < ODOM_FRAME_SIZE; i++) Port_SendByte(p, f[i]);
 }
+#endif /* EKF_ON_STM32 */
 
 /*============================== main ===============================*/
 int main(void)
@@ -1282,18 +1370,23 @@ int main(void)
     Tick_Init();
     CAN1_Init();
     USART1_Init();          /* PA9/PA10 -> CH340 / RK3588 */
-    USART2_Init();          /* PA2/PA3  -> ESP32 */
+#if !CHASSIS_RK3588_ONLY
+    USART2_Init();          /* PA2/PA3  -> ESP32 (仅调试版) */
+#endif
     Relay_Init();
 #if EKF_ON_STM32
     Ekf_Init();
 #endif
+#if !CHASSIS_RK3588_ONLY
     ctrl_owner = OWNER_NONE;
+#endif
     Delay_ms(200);
 
     target_vx = 0.0f;
     target_wz = 0.0f;
-    CAN1_SendMotor(MOTOR1_CAN_ID, STOP_CTRL, 0);
-    CAN1_SendMotor(MOTOR2_CAN_ID, STOP_CTRL, 0);
+    /* 上电先刹住, 等上位机发命令 */
+    CAN1_SendStop(MOTOR1_CAN_ID);
+    CAN1_SendStop(MOTOR2_CAN_ID);
 
     last_can_ms = g_tick_ms;
     last_odom_ms = g_tick_ms;
@@ -1303,19 +1396,23 @@ int main(void)
     while (1)
     {
         Port_ProcessCommands(&ports[PORT_MAIN]);
+#if !CHASSIS_RK3588_ONLY
         Port_ProcessCommands(&ports[PORT_AUX]);
+#endif
         CAN1_Poll();
 
+#if !CHASSIS_RK3588_ONLY
         /* 控制权超时 -> 释放, 让另一个口能接管 */
         if ((ctrl_owner != OWNER_NONE) &&
             ((g_tick_ms - ctrl_owner_ms) > OWNER_TIMEOUT_MS))
         {
             ctrl_owner = OWNER_NONE;
         }
+#endif
 
-        /* 看门狗: 当前控制方停发就自动停车。
-           注意只认控制方的帧 —— 否则从口的心跳会把看门狗一直喂着,
-           主口掉线了车也不会停。 */
+        /* 看门狗: 上位机停发就自动停车。
+           调试版里只认"当前控制方"的帧 —— 否则从口的心跳会把看门狗一直喂着,
+           主口掉线了车也不会停。生产版只有一个上位机, 直接认它就是。 */
         if ((failsafe_latched == 0) &&
             (ever_linked) &&
             ((g_tick_ms - last_cmd_ms) > LINK_TIMEOUT_MS))
@@ -1323,13 +1420,15 @@ int main(void)
             target_vx = 0.0f;
             target_wz = 0.0f;
             failsafe_latched = 1;
+#if !CHASSIS_RK3588_ONLY
             ctrl_owner = OWNER_NONE;
+#endif
 #if RELAY_OFF_ON_LINK_LOSS
             Relay_Set(0);       /* 断线了顺便把电机/水泵继电器也断开 */
 #endif
         }
 
-        /* 轮速采样 + (可选)卡尔曼 */
+        /* 轮速采样 + IMU + (可选)卡尔曼 */
         if ((g_tick_ms - last_odom_ms) >= ODOM_PERIOD_MS)
         {
             last_odom_ms = g_tick_ms;
@@ -1343,13 +1442,15 @@ int main(void)
             Drive_Apply();
         }
 
-        /* 上报: 标准 24 字节帧两个口都发 */
+        /* 上报标准 24 字节帧 */
         if ((g_tick_ms - last_tel_ms) >= TELEMETRY_PERIOD_MS)
         {
             last_tel_ms = g_tick_ms;
 
             Send_MainTelemetry(&ports[PORT_MAIN]);
+#if !CHASSIS_RK3588_ONLY
             Send_MainTelemetry(&ports[PORT_AUX]);
+#endif
 
 #if EKF_ON_STM32
             /* 位姿帧是本工程扩展, 厂商驱动不认识, 默认只发给调试口 */
