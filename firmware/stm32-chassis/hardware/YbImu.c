@@ -279,20 +279,9 @@ static uint8_t AnyNonZero(const uint8_t *p, uint8_t n)
     return 0;
 }
 
-/* 模块的 float 是小端 IEEE754。Cortex-M3 本身就是小端, 所以直接把
-   4 个字节按小端拼成 uint32 再按位转成 float (不用指针强转, 免得踩对齐)。 */
-static float RdFloatLE(const uint8_t *p)
-{
-    union { uint32_t u; float f; } cv;
-
-    cv.u = ((uint32_t)p[0])       | ((uint32_t)p[1] << 8) |
-           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-    return cv.f;
-}
-
 void YbImu_Probe(YbImu_Probe_t *out)
 {
-    uint8_t buf[16];
+    uint8_t buf[6];
     uint8_t err;
 
     out->ver[0] = out->ver[1] = out->ver[2] = 0;
@@ -311,15 +300,22 @@ void YbImu_Probe(YbImu_Probe_t *out)
     err = YbImu_ReadRegs(YBIMU_REG_MAG, buf, 6);
     if (err == YBIMU_ST_OK) out->mag_ok = AnyNonZero(buf, 6);
 
-    err = YbImu_ReadRegs(YBIMU_REG_QUAT, buf, 16);
-    if (err == YBIMU_ST_OK) out->quat_ok = AnyNonZero(buf, 16);
-
-    err = YbImu_ReadRegs(YBIMU_REG_EULER, buf, 12);
-    if (err == YBIMU_ST_OK)
-    {
-        out->euler_ok = AnyNonZero(buf, 12);
-        out->euler_yaw = RdFloatLE(&buf[8]);    /* float×3: roll, pitch, yaw */
-    }
+    /* ★ 这里**故意不读** 0x16(四元数, 16 字节)和 0x26(欧拉角, 12 字节)。
+     *
+     * 加了这两个长块读之后, IMU 诊断码从"陀螺仪恒 0"变成了"总线死"
+     * (YBIMU_ST_BUS_DEAD, 起始条件拉不起来), 而且一直不恢复 —— 连加速度
+     * 都读不到了, 比不做体检还糟。时间点和"开始读长块"完全吻合。
+     *
+     * 所以先只读 3/6/6 字节这些短块: 一样能回答关键问题
+     *   "只有陀螺仪坏"  -> 版本/磁力活, 陀螺死
+     *   "模块只剩基本模式" -> 只有版本活
+     * 代价是拿不到欧拉角那个备选角速度来源, 但**不能为了诊断把器件搞死**。
+     *
+     * 真要再试长块, 必须先确认 0x16/0x26 在这颗模块上确实存在 ——
+     * 头文件那份寄存器表可能来自另一个批次的 YbImu。
+     */
+    out->quat_ok = 0;
+    out->euler_ok = 0;
 }
 
 /*=========================== 对外接口 =============================*/
