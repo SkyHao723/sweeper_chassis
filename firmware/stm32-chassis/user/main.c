@@ -1,6 +1,7 @@
 #include "stm32f10x.h"
 #include "stm32f10x_can.h"
 #include "Delay.h"
+#include "YbImu.h"
 #include <math.h>
 
 /*==========================================================================
@@ -70,8 +71,10 @@
  *   [29]   UART 溢出计数
  *   [30]   继电器状态  bit0 电机 bit1 水泵
  *   [31]   当前控制方  0=无 1=主口(CH340/RK3588) 2=从口(ESP32)
- *   [32]   BCC = XOR([0..31])
- *   [33]   0x7D
+ *   [32]   IMU 诊断码  0=正常 1=SCL拉不高 2=SDA拉不高 3=总线死 4=无应答 5=读出错
+ *   [33]   IMU 扫描到的 I2C 地址 (0 = 没扫到)
+ *   [34]   BCC = XOR([0..33])
+ *   [35]   0x7D
  *========================================================================*/
 
 /*========================= 想改的地方 =========================*/
@@ -155,7 +158,7 @@
 #define TEL_FRAME_SIZE     24
 #define TEL_HEAD           0x7B
 #define TEL_TAIL           0x7D
-#define ODOM_FRAME_SIZE    34
+#define ODOM_FRAME_SIZE    36
 #define ODOM_HEAD          0x7E
 #define ODOM_TAIL          0x7D
 
@@ -165,9 +168,23 @@
 
 /*-------------------------- 周期 --------------------------------*/
 #define CAN_PERIOD_MS      20       /* 向电机重复发送的周期 */
-#define ODOM_PERIOD_MS     20       /* 里程计/卡尔曼周期 (50Hz) */
+#define ODOM_PERIOD_MS     20       /* 轮速采样/(可选)卡尔曼周期 (50Hz) */
 #define TELEMETRY_PERIOD_MS 50      /* 上报周期 (20Hz) */
 #define RPM_STALE_MS       200      /* 驱动器这么久没回码就认为转速无效 */
+
+/*-------------------------- IMU --------------------------------*/
+/* IMU 读一次大概 1~3ms(位翻转 I2C), 和轮速一起按 ODOM_PERIOD_MS 采样。
+ *
+ * ★ 协议要求上报的 IMU 原始值必须是 ±2g / ±500dps 量程下的值, 因为上位机
+ *   是用固定系数换算的(MD 5.1 节):
+ *       加速度: 原始值 / 1671.84    = m/s²
+ *       陀螺仪: 原始值 * 0.00026644 = rad/s
+ *   而 YbImu 的原始量程是 ±16g / ±2000dps, 所以这里必须换算 + 限幅。
+ *   换错量程不会报错, 只会让上位机的数据全错。
+ */
+#define IMU_ACCEL_G_TO_RAW  (9.80665f * 1671.84f)   /* g      -> ±2g   原始值 */
+#define IMU_GYRO_TO_RAW     (1.0f / 0.00026644f)    /* rad/s  -> ±500dps 原始值 */
+#define IMU_GYRO_Z_SIGN     1       /* 陀螺 Z 方向和车体逆时针不一致时改成 -1 */
 
 /*=================== 卡尔曼滤波参数 (调试时可改) ===================*/
 #define EKF_SIGMA_V        0.05f    /* 轮速测量噪声 m/s */
@@ -235,6 +252,15 @@ static volatile uint16_t battery_mv;
 /* 轮速计 */
 static int16_t  wheel_left_rpm, wheel_right_rpm;   /* 已按接线校准的物理轮速 */
 static float    body_vx, body_wz;                  /* 轮速正解出的车体速度 */
+
+/* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
+static float    imu_accel_g[3];      /* 单位 g */
+static float    imu_gyro[3];         /* 单位 rad/s */
+static uint8_t  imu_ok;              /* 1 = 加速度有效 */
+static uint8_t  imu_gyro_ok;         /* 1 = 陀螺仪有效(不是恒 0) */
+static uint8_t  imu_status;          /* YBIMU_ST_* 失败原因 */
+static uint8_t  imu_found_addr;      /* 扫描到的器件地址, 0 = 没扫到 */
+static uint32_t imu_diag_ms;         /* 上次诊断的时刻 */
 
 /* 继电器 */
 static uint8_t  relay_state;                       /* bit0 电机 bit1 水泵 */
@@ -636,6 +662,23 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
         return;
     }
 
+    /* ---- 协议里的其它功能帧: 本工程没实现, 必须忽略 ----
+     * 这些帧和速度帧同为 11 字节、同头同尾, 靠 f[1]/f[2] 区分
+     * (docs/chassis-serial-protocol.md 第 6 节):
+     *     f[1]=0x04             灯带       f[2]=EN, f[3..5]=RGB
+     *     f[1]=1, f[2]=0xA0/0xA1 回充开关
+     *     f[1]=0, f[2]=0xB0/0xB1 底盘安全防护
+     * ★ 绝对不能当速度帧解析 —— 那样 f[3..8] 会被误读成 vx/wz, 车会乱窜。
+     *   正常速度帧的 f[1] 只可能是 AutoRecharge(0/1), 所以 f[1]>1 一律不是速度帧。
+     */
+    if ((f[1] > 1) ||
+        ((f[1] == 1) && ((f[2] == 0xA0) || (f[2] == 0xA1))) ||
+        ((f[1] == 0) && ((f[2] == 0xB0) || (f[2] == 0xB1))))
+    {
+        if (ports[port_id].ok_count != 0xFF) ports[port_id].ok_count++;
+        return;
+    }
+
     /* ---- 速度帧 ---- */
     /* f[1]=AutoRecharge  f[2]=SecurityPLY  f[5..6]=vy (差速车忽略) */
     vx_mm = (int16_t)(((uint16_t)f[3] << 8) | f[4]);
@@ -1026,27 +1069,118 @@ static void Ekf_UpdateGyro(float gz)
     Ekf_Symmetrize();
 }
 
-/*======================= IMU 接口(预留) ============================
- * 买回来的 IMU 装上之后, 只要在这个函数里读一次陀螺仪 Z 轴角速度
- * (单位 rad/s, 逆时针为正) 填进 *gz 并返回 1 就行。
+/*======================= IMU 陀螺仪接口 (给本地 EKF 用) =============
+ * 本地卡尔曼只要陀螺仪 Z 轴角速度(rad/s, 逆时针为正)。
+ * 这里返回缓存值, 真正去读 I2C 的是 IMU_Tick()。
  *
- * 例: MPU6050 / ICM42688 挂在 I2C 上:
- *     int16_t raw = IMU_ReadReg16(GYRO_ZOUT_H);
- *     *gz = raw / 65.5f * 0.0174533f;     // ±500dps 量程 -> rad/s
- *     return 1;
+ * ★ 车体逆时针为正, 但 IMU 装反了/坐标系不同的话符号可能相反 ——
+ *   症状是轮速和陀螺仪互相打架, 航向估计反而更差。这时候改
+ *   IMU_GYRO_Z_SIGN 为 -1。
  *
- * 返回 0 时 EKF 会自动跳过陀螺仪那一步, 只用轮速计, 一切照常工作。
+ * 返回 0 表示这次没有可信的陀螺仪数据, EKF 会自动跳过这一步。
  *=================================================================*/
 static uint8_t IMU_ReadGyroZ(float *gz)
 {
-    (void)gz;
-    return 0;
+    if (!imu_gyro_ok)
+    {
+        return 0;
+    }
+    *gz = imu_gyro[2] * (float)IMU_GYRO_Z_SIGN;
+    return 1;
 }
 
-/*========================= 轮速采样 + (可选)滤波 ===================*/
+/*======================= IMU (YbImu) ==============================
+ * 按 ODOM_PERIOD_MS 采一次。读失败不清零 —— 保留上一次的值, 同时把 imu_ok
+ * 置 0, 上位机看 imu_ok 就知道这次的数据可不可信。
+ *
+ * 读失败时最多每秒做一次诊断(查总线空闲电平 + 扫地址), 结果通过遥测帧
+ * 报给上位机 —— 否则"读取失败"这四个字什么信息都没有, 没法修。
+ *=================================================================*/
+#define IMU_DIAG_PERIOD_MS  1000
+
+static void IMU_Tick(void)
+{
+    float accel[3];
+    float gyro[3];
+    uint8_t err;
+
+    err = YbImu_ReadMotion(accel, gyro);
+
+    /* YBIMU_ST_GYRO_ZERO 表示加速度读到了但陀螺仪恒为 0 —— 加速度还是能用的,
+       所以不算完全失败, 但要如实报上去。 */
+    if ((err == YBIMU_ST_OK) || (err == YBIMU_ST_GYRO_ZERO))
+    {
+        imu_accel_g[0] = accel[0];
+        imu_accel_g[1] = accel[1];
+        imu_accel_g[2] = accel[2];
+        imu_ok = 1;
+        imu_status = err;
+        imu_found_addr = YBIMU_I2C_ADDR;
+
+        if (err == YBIMU_ST_OK)
+        {
+            imu_gyro[0] = gyro[0];
+            imu_gyro[1] = gyro[1];
+            imu_gyro[2] = gyro[2];
+            imu_gyro_ok = 1;
+        }
+        else
+        {
+            imu_gyro[0] = 0.0f;
+            imu_gyro[1] = 0.0f;
+            imu_gyro[2] = 0.0f;
+            imu_gyro_ok = 0;
+        }
+        return;
+    }
+
+    imu_ok = 0;
+    imu_gyro_ok = 0;
+    imu_status = err;
+
+    /* 失败了才诊断, 而且不要每次都跑(扫描很慢) */
+    if ((g_tick_ms - imu_diag_ms) >= IMU_DIAG_PERIOD_MS)
+    {
+        uint8_t bus = YbImu_BusCheck();
+        imu_diag_ms = g_tick_ms;
+
+        if (bus != YBIMU_ST_OK)
+        {
+            imu_status = bus;               /* 总线本身就不对 */
+            imu_found_addr = 0;
+        }
+        else
+        {
+            imu_found_addr = YbImu_Scan();  /* 总线是好的, 那就是地址/器件问题 */
+            imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
+        }
+    }
+}
+
+/* 物理量 -> 协议规定的 ±2g / ±500dps 原始值, 带限幅(超量程夹住而不是回绕) */
+static int16_t IMU_AccelToRaw(float accel_g)
+{
+    float v = accel_g * IMU_ACCEL_G_TO_RAW;
+
+    if (v >  32767.0f) v =  32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    return (int16_t)v;
+}
+
+static int16_t IMU_GyroToRaw(float gyro_rad_s)
+{
+    float v = gyro_rad_s * IMU_GYRO_TO_RAW;
+
+    if (v >  32767.0f) v =  32767.0f;
+    if (v < -32768.0f) v = -32768.0f;
+    return (int16_t)v;
+}
+
+/*======================= 轮速采样 + (可选)滤波 ===================*/
 static void Odom_Tick(void)
 {
     Wheel_Update();
+    IMU_Tick();     /* 位翻转 I2C 读 IMU, 大约 1~3ms */
 
 #if EKF_ON_STM32
     {
@@ -1080,13 +1214,17 @@ static void Send_MainTelemetry(uart_port_t *p)
     PutI16(&f[2], vx_mm);
     PutI16(&f[4], vy_mm);
     PutI16(&f[6], wz_mrad);
-    /* IMU 六轴: 还没装, 先发 0, 接上以后在这里填原始值 */
-    PutI16(&f[8],  0);   /* ax */
-    PutI16(&f[10], 0);   /* ay */
-    PutI16(&f[12], 0);   /* az */
-    PutI16(&f[14], 0);   /* gx */
-    PutI16(&f[16], 0);   /* gy */
-    PutI16(&f[18], 0);   /* gz */
+    /* IMU 六轴原始值。
+       ★ 必须是 ±2g / ±500dps 量程下的值 —— 上位机是按固定系数换算的
+         (MD 5.1 节): 加速度 /1671.84 = m/s², 角速度 ×0.00026644 = rad/s。
+         YbImu 本身是 ±16g / ±2000dps, 已经在 IMU_AccelToRaw/GyroToRaw 里换算了。
+       读失败时保留上一次的值(不清零), 上位机看 flags 的 bit3 判断是否可信。 */
+    PutI16(&f[8],  IMU_AccelToRaw(imu_accel_g[0]));   /* ax */
+    PutI16(&f[10], IMU_AccelToRaw(imu_accel_g[1]));   /* ay */
+    PutI16(&f[12], IMU_AccelToRaw(imu_accel_g[2]));   /* az */
+    PutI16(&f[14], IMU_GyroToRaw(imu_gyro[0]));       /* gx */
+    PutI16(&f[16], IMU_GyroToRaw(imu_gyro[1]));       /* gy */
+    PutI16(&f[18], IMU_GyroToRaw(imu_gyro[2]));       /* gz */
     PutU16(&f[20], battery_mv);
     for (i = 0; i < TEL_FRAME_SIZE - 2; i++) bcc ^= f[i];
     f[TEL_FRAME_SIZE - 2] = bcc;
@@ -1108,6 +1246,7 @@ static void Send_OdomFrame(uart_port_t *p)
     if (ekf_ready)          flags |= 0x01;
     if (failsafe_latched)   flags |= 0x02;
     if (ever_linked)        flags |= 0x04;
+    if (imu_ok)             flags |= 0x08;      /* IMU 最近一次读取成功 */
 
     f[0] = ODOM_HEAD;
     f[1] = flags;
@@ -1128,6 +1267,8 @@ static void Send_OdomFrame(uart_port_t *p)
     f[29] = (uint8_t)(ports[PORT_MAIN].overflow + ports[PORT_AUX].overflow);
     f[30] = relay_state;                       /* bit0 电机 bit1 水泵 */
     f[31] = (ctrl_owner == OWNER_NONE) ? 0 : (uint8_t)(ctrl_owner + 1);
+    f[32] = imu_status;                        /* YBIMU_ST_* 诊断结果 */
+    f[33] = imu_found_addr;                    /* 扫描到的 I2C 器件地址, 0 = 没扫到 */
     for (i = 0; i < ODOM_FRAME_SIZE - 2; i++) bcc ^= f[i];
     f[ODOM_FRAME_SIZE - 2] = bcc;
     f[ODOM_FRAME_SIZE - 1] = ODOM_TAIL;

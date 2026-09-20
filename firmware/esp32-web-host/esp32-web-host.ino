@@ -54,7 +54,7 @@ static const int OLED_SCL_PIN = 9;
 
 #define CMD_FRAME_SIZE  11
 #define TEL_FRAME_SIZE  24
-#define ODOM_FRAME_SIZE 34
+#define ODOM_FRAME_SIZE 36
 #define HEAD_CMD_TEL    0x7B
 #define HEAD_ODOM       0x7E
 #define FRAME_TAIL      0x7D
@@ -63,6 +63,11 @@ static const int OLED_SCL_PIN = 9;
 
 #define RAD2DEG 57.29578f
 #define DEG2RAD 0.01745329f
+
+/* IMU 换算系数 —— 直接来自 docs/chassis-serial-protocol.md 5.1 节。
+   前提是 STM32 上 IMU 初始化量程必须是 ±2g 和 ±500dps。 */
+#define ACCEL_RATIO  1671.84f     /* 原始值 / 1671.84  = m/s^2 */
+#define GYRO_RATIO   0.00026644f  /* 原始值 * 0.00026644 = rad/s */
 
 HardwareSerial STM32Serial(2);
 WebServer server(80);
@@ -140,9 +145,21 @@ struct Telemetry {
   float vx = 0, vy = 0, wz = 0;
   uint16_t batteryMv = 0;
 
-  /* 里程计帧 */
+  /* 主遥测里的 IMU (协议规定量程 ±2g / ±500dps) */
+  int16_t imuRaw[6] = {0};           /* ax ay az gx gy gz 原始值 */
+  float ax = 0, ay = 0, az = 0;      /* m/s^2 */
+  float gx = 0, gy = 0, gz = 0;      /* rad/s */
+
+  /* 本机(模拟 RK3588)从车体速度积分出的位姿 —— MD 5.2 节那套 */
+  float odoX = 0, odoY = 0, odoPsi = 0;
+  bool haveMain = false;
+  uint32_t lastMainMs = 0;
+  uint32_t mainFrames = 0;
+
+  /* 里程计帧 (STM32 自己算的位姿, 留着做对照) */
   bool everLinked = false;
   bool failsafe = false;
+  bool imuOk = false;                /* STM32 那边 IMU 最近一次读取是否成功 */
   float x = 0, y = 0, heading = 0;
   float fVx = 0, fWz = 0;
   int16_t wheelL = 0, wheelR = 0, targetL = 0, targetR = 0;
@@ -150,6 +167,8 @@ struct Telemetry {
   uint8_t canErr = 0, badCmd = 0, cmdCount = 0, rxOverflow = 0;
   uint8_t relay = 0;                 /* bit0 电机继电器 bit1 水泵继电器 */
   uint8_t owner = 0;                 /* 当前控制方: 0=无 1=主口(CH340/RK3588) 2=从口(本ESP32) */
+  uint8_t imuStatus = 0;             /* STM32 的 IMU 诊断码 */
+  uint8_t imuAddr = 0;               /* STM32 扫到的 I2C 器件地址 */
 };
 
 Telemetry telemetry;
@@ -214,18 +233,54 @@ void sendRelayCommand(uint8_t mask) {
 
 /*========================= 遥测解析 =========================*/
 static void parseMainFrame(const uint8_t *b) {
+  uint32_t now = millis();
+
   telemetry.stopFlag = b[1] != 0;
   telemetry.vx = rdI16(&b[2]) / 1000.0f;
   telemetry.vy = rdI16(&b[4]) / 1000.0f;
   telemetry.wz = rdI16(&b[6]) / 1000.0f;
+
+  /* IMU 六轴 (偏移 8..19), 按协议系数换算成物理量 */
+  for (uint8_t i = 0; i < 6; i++) telemetry.imuRaw[i] = rdI16(&b[8 + i * 2]);
+  telemetry.ax = telemetry.imuRaw[0] / ACCEL_RATIO;
+  telemetry.ay = telemetry.imuRaw[1] / ACCEL_RATIO;
+  telemetry.az = telemetry.imuRaw[2] / ACCEL_RATIO;
+  telemetry.gx = telemetry.imuRaw[3] * GYRO_RATIO;
+  telemetry.gy = telemetry.imuRaw[4] * GYRO_RATIO;
+  telemetry.gz = telemetry.imuRaw[5] * GYRO_RATIO;
+
   telemetry.batteryMv = rdU16(&b[20]);
+
+  /*================= 模拟 RK3588: 自己积分里程计 =================
+   * 公式照抄 MD 5.2 节, 注意用的是**更新前的航向** (欧拉积分):
+   *     x += (vx*cosψ − vy*sinψ) * dt
+   *     y += (vx*sinψ + vy*cosψ) * dt
+   *     ψ += wz * dt
+   * dt 是相邻两帧成功解析的时间差。
+   *=============================================================*/
+  if (telemetry.haveMain) {
+    float dt = (now - telemetry.lastMainMs) / 1000.0f;
+    if (dt > 0.0f && dt < 0.5f) {          /* 断流/重连导致的跳变丢掉不算 */
+      float psi = telemetry.odoPsi;
+      telemetry.odoX += (telemetry.vx * cosf(psi) - telemetry.vy * sinf(psi)) * dt;
+      telemetry.odoY += (telemetry.vx * sinf(psi) + telemetry.vy * cosf(psi)) * dt;
+      telemetry.odoPsi += telemetry.wz * dt;
+      if (telemetry.odoPsi >  PI) telemetry.odoPsi -= 2.0f * PI;
+      if (telemetry.odoPsi < -PI) telemetry.odoPsi += 2.0f * PI;
+    }
+  }
+  telemetry.haveMain = true;
+  telemetry.lastMainMs = now;
+  telemetry.mainFrames++;
+
   telemetry.valid = true;
-  telemetry.lastOk = millis();
+  telemetry.lastOk = now;
 }
 
 static void parseOdomFrame(const uint8_t *b) {
   telemetry.everLinked = (b[1] & 0x04) != 0;
   telemetry.failsafe = (b[1] & 0x02) != 0;
+  telemetry.imuOk = (b[1] & 0x08) != 0;
   telemetry.x = rdI32(&b[2]) / 1000.0f;
   telemetry.y = rdI32(&b[6]) / 1000.0f;
   telemetry.heading = rdI16(&b[10]) * 0.01f * DEG2RAD;
@@ -243,6 +298,8 @@ static void parseOdomFrame(const uint8_t *b) {
   telemetry.rxOverflow = b[29];
   telemetry.relay = b[30] & 0x03;
   telemetry.owner = b[31];
+  telemetry.imuStatus = b[32];
+  telemetry.imuAddr = b[33];
   telemetry.valid = true;
   telemetry.lastOk = millis();
 }
@@ -251,17 +308,27 @@ void pollTelemetry() {
   static uint8_t buf[ODOM_FRAME_SIZE];
   static uint8_t len = 0;
   static uint8_t need = 0;
+  static uint8_t prev = 0;
 
   while (STM32Serial.available()) {
     uint8_t b = (uint8_t)STM32Serial.read();
 
     if (need == 0) {
-      if (b == HEAD_CMD_TEL)      { buf[0] = b; len = 1; need = TEL_FRAME_SIZE; }
-      else if (b == HEAD_ODOM)    { buf[0] = b; len = 1; need = ODOM_FRAME_SIZE; }
+      /* 拼帧同步规则照抄 MD 第 5 节:
+       *   "上一字节是某帧帧尾、本字节是另一帧帧头时开始计数。
+       *    主遥测在上一字节为 0x7D 或回充帧尾 0x7F、本字节为 0x7B 时入帧。"
+       * ★ 这里故意和厂商驱动保持一致。如果用更宽松的规则(见到帧头就入帧),
+       *   ESP32 能跑但 RK3588 可能跑不了 —— 那样这次调试就白做了。
+       */
+      uint8_t afterTail = (prev == FRAME_TAIL) || (prev == 0x7F);
+      if (afterTail && (b == HEAD_CMD_TEL))   { buf[0] = b; len = 1; need = TEL_FRAME_SIZE; }
+      else if (afterTail && (b == HEAD_ODOM)) { buf[0] = b; len = 1; need = ODOM_FRAME_SIZE; }
+      prev = b;
       continue;
     }
 
     buf[len++] = b;
+    prev = b;
     if (len < need) continue;
 
     uint8_t n = need;
@@ -330,17 +397,35 @@ h1{font-size:19px;margin:0 0 3px}.sub{font-size:12px;color:#8fa3bf;margin-bottom
 </section>
 
 <section class="card">
-<div class="hdr">轨迹（车轮里程计 + 卡尔曼）<button id="clr">清空显示</button></div>
+<div class="hdr">轨迹（ESP32 本机积分，模拟 RK3588）<button id="clr">清空显示</button></div>
 <canvas id="cv" class="cv"></canvas>
+<div class="note">只用车体速度 (vx,vy,wz) 按 MD 5.2 节积分，不依赖 STM32 的位姿帧 —— 这样才等于在上位机上跑。</div>
 </section>
 
 <section class="card grid">
+<div style="grid-column:1/-1;background:none;padding:0 0 6px;color:#a8bdd8">① 轮速计 → 车体速度（24 字节帧 偏移 2..7）</div>
+<div><span>vx</span><b id="pvx">--</b></div><div><span>vy</span><b id="pvy">--</b></div>
+<div><span>wz</span><b id="pwz">--</b></div><div><span>积分里程</span><b id="pdist">--</b></div>
 <div><span>X</span><b id="px">--</b></div><div><span>Y</span><b id="py">--</b></div>
-<div><span>航向</span><b id="ph">--</b></div><div><span>里程</span><b id="pd">--</b></div>
-<div><span>滤波 vx</span><b id="pv">--</b></div><div><span>滤波 wz</span><b id="pw">--</b></div>
-<div><span>左轮 实测/目标</span><b id="pw1">--</b></div><div><span>右轮 实测/目标</span><b id="pw2">--</b></div>
-<div><span>1号故障</span><b id="f1">--</b></div><div><span>2号故障</span><b id="f2">--</b></div>
-<div><span>电压</span><b id="bat">--</b></div><div><span>有效命令</span><b id="cmd">--</b></div><div><span>控制方</span><b id="own">--</b></div>
+<div><span>航向 ψ</span><b id="ph">--</b></div><div><span>主遥测帧数</span><b id="pmf">--</b></div>
+</section>
+
+<section class="card grid">
+<div style="grid-column:1/-1;background:none;padding:0 0 6px;color:#a8bdd8">② IMU（24 字节帧 偏移 8..19，协议量程 ±2g / ±500dps）<b id="pimu" style="float:right">--</b></div>
+<div><span>ax</span><b id="pax">--</b></div><div><span>ay</span><b id="pay">--</b></div>
+<div><span>az</span><b id="paz">--</b></div><div><span>gx</span><b id="pgx">--</b></div>
+<div><span>gy</span><b id="pgy">--</b></div><div><span>gz</span><b id="pgz">--</b></div>
+<div style="grid-column:1/-1"><span>原始值</span><b id="praw">--</b></div>
+<div style="grid-column:1/-1"><span>读取失败原因</span><b id="pdia">--</b></div>
+<div style="grid-column:1/-1"><span>I2C 扫描结果</span><b id="padr">--</b></div>
+</section>
+
+<section class="card grid">
+<div style="grid-column:1/-1;background:none;padding:0 0 6px;color:#a8bdd8">③ 底盘诊断（STM32 扩展帧 0x7E）</div>
+<div><span>STM32位姿</span><b id="pstm">--</b></div><div><span>左轮 实测/目标</span><b id="pw1">--</b></div>
+<div><span>右轮 实测/目标</span><b id="pw2">--</b></div><div><span>1号故障</span><b id="f1">--</b></div>
+<div><span>2号故障</span><b id="f2">--</b></div><div><span>电压</span><b id="bat">--</b></div>
+<div><span>有效命令</span><b id="cmd">--</b></div><div><span>控制方</span><b id="own">--</b></div>
 <div><span>坏帧</span><b id="bad">--</b></div><div><span>CAN 错误</span><b id="cerr">--</b></div>
 <div><span>串口溢出</span><b id="ovf">--</b></div><div><span>状态</span><b id="fs">--</b></div>
 </section>
@@ -446,12 +531,36 @@ async function refresh(){
     var online=s.valid&&s.age_ms<600;
     document.getElementById('dot').className='dot'+(online?' on':'');
     put('link',!s.valid?'STM32 无数据':(online?'STM32 在线':'STM32 离线'));
-    put('px',s.valid?s.x.toFixed(2)+' m':'--');
-    put('py',s.valid?s.y.toFixed(2)+' m':'--');
-    put('ph',s.valid?(s.heading*57.29578).toFixed(1)+' °':'--');
-    put('pd',s.valid?Math.hypot(s.x,s.y).toFixed(2)+' m':'--');
-    put('pv',s.valid?s.fvx.toFixed(2)+' m/s':'--');
-    put('pw',s.valid?s.fwz.toFixed(2)+' rad/s':'--');
+
+    /* ① 轮速计 -> 车体速度 -> 本机积分出的位姿 */
+    put('pvx',s.valid?s.vx.toFixed(3)+' m/s':'--');
+    put('pvy',s.valid?s.vy.toFixed(3)+' m/s':'--');
+    put('pwz',s.valid?s.wz.toFixed(3)+' rad/s':'--');
+    put('px',s.valid?s.odo_x.toFixed(3)+' m':'--');
+    put('py',s.valid?s.odo_y.toFixed(3)+' m':'--');
+    put('ph',s.valid?(s.odo_psi*57.29578).toFixed(1)+' °':'--');
+    put('pdist',s.valid?Math.hypot(s.odo_x,s.odo_y).toFixed(3)+' m':'--');
+    put('pmf',s.valid?s.main_frames:'--');
+
+    /* ② IMU */
+    var ip=s.imu_phys||[0,0,0,0,0,0];
+    var ST={0:'正常',1:'SCL 拉不高（缺上拉/没接/短路到地）',
+            2:'SDA 拉不高（缺上拉/没接/短路到地）',
+            3:'总线被拉死',4:'地址 0x23 没有应答',5:'地址应答了但读数据出错',
+            6:'陀螺仪恒为 0（加速度正常）'};
+    put('pimu',s.valid?(s.imu_ok?(s.imu_status?'部分异常':'读取正常'):'读取失败'):'--');
+    put('pdia',s.valid?(s.imu_status?(ST[s.imu_status]||('未知 '+s.imu_status)):'—'):'--');
+    put('padr',s.valid?(s.imu_addr?('0x'+s.imu_addr.toString(16).toUpperCase()):'没扫到任何器件'):'--');
+    put('pax',s.valid?ip[0].toFixed(3)+' m/s²':'--');
+    put('pay',s.valid?ip[1].toFixed(3)+' m/s²':'--');
+    put('paz',s.valid?ip[2].toFixed(3)+' m/s²':'--');
+    put('pgx',s.valid?ip[3].toFixed(4)+' rad/s':'--');
+    put('pgy',s.valid?ip[4].toFixed(4)+' rad/s':'--');
+    put('pgz',s.valid?ip[5].toFixed(4)+' rad/s':'--');
+    put('praw',s.valid?(s.imu_raw||[]).join(' / '):'--');
+
+    /* ③ 底盘诊断 */
+    put('pstm',s.valid?(s.x.toFixed(2)+', '+s.y.toFixed(2)+', '+(s.heading*57.29578).toFixed(0)+'°'):'--');
     put('pw1',s.valid?(s.wheel_l+' / '+s.target_l):'--');
     put('pw2',s.valid?(s.wheel_r+' / '+s.target_r):'--');
     put('f1',s.valid?s.fault1:'--');put('f2',s.valid?s.fault2:'--');
@@ -460,7 +569,9 @@ async function refresh(){
     put('cerr',s.valid?s.can_errors:'--');put('ovf',s.valid?s.rx_overflow:'--');
     put('fs',s.valid?(s.failsafe?'看门狗停车':'正常'):'--');
     put('own',s.valid?({0:'无',1:'主口(RK3588)',2:'ESP32'}[s.owner]||'?'):'--');
-    if(s.valid){relayState=s.relay&3;paintRelay();pushPoint(s.x,s.y,s.heading)}
+
+    /* 轨迹画的是本机积分的结果 */
+    if(s.valid){relayState=s.relay&3;paintRelay();pushPoint(s.odo_x,s.odo_y,s.odo_psi)}
     if(active===null){
       if(!s.valid)setState('STM32 无数据');
       else if(s.failsafe)setState('看门狗已停车');
@@ -514,7 +625,18 @@ void handleStatus() {
   j += ",\"y\":" + String(telemetry.y, 3);
   j += ",\"heading\":" + String(telemetry.heading, 4);
   j += ",\"vx\":" + String(telemetry.vx, 3);
+  j += ",\"vy\":" + String(telemetry.vy, 3);
   j += ",\"wz\":" + String(telemetry.wz, 3);
+  j += ",\"odo_x\":" + String(telemetry.odoX, 3);
+  j += ",\"odo_y\":" + String(telemetry.odoY, 3);
+  j += ",\"odo_psi\":" + String(telemetry.odoPsi, 4);
+  j += ",\"main_frames\":" + String(telemetry.mainFrames);
+  j += ",\"imu_raw\":[";
+  for (uint8_t i = 0; i < 6; i++) { if (i) j += ","; j += String(telemetry.imuRaw[i]); }
+  j += "],\"imu_phys\":[";
+  j += String(telemetry.ax, 3) + "," + String(telemetry.ay, 3) + "," + String(telemetry.az, 3) + ",";
+  j += String(telemetry.gx, 4) + "," + String(telemetry.gy, 4) + "," + String(telemetry.gz, 4);
+  j += "]";
   j += ",\"fvx\":" + String(telemetry.fVx, 3);
   j += ",\"fwz\":" + String(telemetry.fWz, 3);
   j += ",\"wheel_l\":" + String(telemetry.wheelL);
@@ -529,6 +651,9 @@ void handleStatus() {
   j += ",\"cmd_count\":" + String(telemetry.cmdCount);
   j += ",\"rx_overflow\":" + String(telemetry.rxOverflow);
   j += ",\"failsafe\":" + String(telemetry.failsafe ? "true" : "false");
+  j += ",\"imu_ok\":" + String(telemetry.imuOk ? "true" : "false");
+  j += ",\"imu_status\":" + String(telemetry.imuStatus);
+  j += ",\"imu_addr\":" + String(telemetry.imuAddr);
   j += ",\"ever_linked\":" + String(telemetry.everLinked ? "true" : "false");
   j += ",\"relay\":" + String(telemetry.relay & 0x03);
   j += ",\"owner\":" + String(telemetry.owner);

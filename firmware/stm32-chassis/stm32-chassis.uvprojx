@@ -454,6 +454,16 @@
               <FileType>5</FileType>
               <FilePath>.\hardware\OLED.h</FilePath>
             </File>
+            <File>
+              <FileName>YbImu.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\hardware\YbImu.c</FilePath>
+            </File>
+            <File>
+              <FileName>YbImu.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\hardware\YbImu.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
