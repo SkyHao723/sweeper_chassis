@@ -30,7 +30,7 @@
     [2-3]   车体 vx   mm/s          [4-5]  车体 wz   mrad/s
     [6-7]   左轮 实际 RPM           [8-9]  右轮 实际 RPM
     [10-11] 左轮 目标 RPM           [12-13] 右轮 目标 RPM
-    [14-15] 1号驱动器 输出电流 A*100   [16-17] 2号驱动器 输出电流 A*100
+    [14-15] 1号驱动器 输出扭矩电流 A*10   [16-17] 2号驱动器 输出扭矩电流 A*10
     [18]    1号驱动器 故障码        [19]   2号驱动器 故障码
     [20]    1号驱动器 模式          [21]   2号驱动器 模式
     [22]    CAN 错误计数            [23]   UART 坏帧
@@ -83,16 +83,27 @@ IMU_STATUS = {
     3: "总线死",
     4: "无应答",
     5: "读出错",
+    6: "陀螺仪恒0",     # 加速度正常但角速度 6 字节全为 0, 不是"静止"能解释的
 }
 
 # 判定"没劲"的阈值
 RPM_CMD_EPS = 5      # 目标转速绝对值超过它就认为"命令要求这个轮子转"
 RPM_ACT_EPS = 3      # 实际转速低于它就认为"没转起来"
-CUR_EPS = 30         # 电流 0.30 A (单位是 A*100)
+# ★ 电流的单位是 A×10, 不是 A×100。
+#   协议原文(第 5 页): "DATA4 当前输出扭矩电流 int16 A ... 放大10 倍，保留1 位小数";
+#   力矩模式命令那边也写着"写入 -100~0~100 对应 -10.0A~0~10.0A", 同样是 ×10。
+#   一开始按 ×100 解读, 结果所有电流都少算了 10 倍, 差点把"电机在使劲"误判成"没给力"。
+CUR_EPS = 10         # = 1.0A。低于它认为驱动器没在使劲。
 
 
 def i16(b, i):
     return struct.unpack(">h", bytes(b[i:i + 2]))[0]
+
+
+def tel_battery_mv(frame):
+    """24 字节主遥测帧 [20-21] = 电池电压 mV。
+    带载时的电压比静态值有意义得多 —— 一加速就塌下去说明电池/线路撑不住。"""
+    return struct.unpack(">H", bytes(frame[20:22]))[0]
 
 
 def build_cmd(vx, wz):
@@ -179,36 +190,75 @@ class Diag(object):
         self.seq = b[29]
 
     def problems(self):
-        """返回这个轮子当前的可疑描述; 没问题就返回 None。"""
+        """返回 [(key, 描述), ...]; 没问题就返回空列表。
+        key 用来做"连续出现多久"的统计, 见 ProblemTracker。"""
         out = []
         for tag, tgt, act, cur, flt in (
                 ("1号", self.tl, self.wl, self.c1, self.f1),
                 ("2号", self.tr, self.wr, self.c2, self.f2)):
             if flt != 0:
-                out.append("%s驱动器报故障: %s" % (tag, fault_name(flt)))
+                out.append(("fault" + tag,
+                            "%s驱动器报故障: %s" % (tag, fault_name(flt))))
             elif abs(tgt) > RPM_CMD_EPS and abs(act) < RPM_ACT_EPS:
                 if abs(cur) < CUR_EPS:
-                    out.append("%s 命令 %+d RPM 但实际 %+d RPM 且电流仅 %.2fA"
-                               " -> 驱动器没给力(查故障码/使能/接线)"
-                               % (tag, tgt, act, cur / 100.0))
+                    out.append(("weak" + tag,
+                                "%s 命令 %+d RPM 但实际 %+d RPM 且电流仅 %.2fA"
+                                " -> 驱动器没给力(查故障码/使能/接线)"
+                                % (tag, tgt, act, cur / 10.0)))
                 else:
-                    out.append("%s 命令 %+d RPM 但实际 %+d RPM 而电流 %.2fA"
-                               " -> 给了力却被堵住/拖住"
-                               % (tag, tgt, act, cur / 100.0))
-        return out or None
+                    out.append(("stall" + tag,
+                                "%s 命令 %+d RPM 但实际 %+d RPM 而电流 %.2fA"
+                                " -> 给了力却被堵住/拖住"
+                                % (tag, tgt, act, cur / 10.0)))
+        return out
 
-    def line(self):
+    def line(self, bat_mv=0):
+        bat = (" bat=%.1fV" % (bat_mv / 1000.0)) if bat_mv else ""
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s"
                 % (self.seq, self.vx, self.wz,
-                   self.tl, self.wl, self.c1 / 100.0,
+                   self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
-                   self.tr, self.wr, self.c2 / 100.0,
+                   self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2),
                    self.can_err, self.bad, self.ovf, self.relay,
-                   IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st)))
+                   IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st), bat))
+
+
+class ProblemTracker(object):
+    """同一个问题要连续出现够久才报。
+
+    为什么需要: 加速斜坡生效期间, 目标转速是慢慢爬上去的, 实际转速必然滞后
+    一两帧, 电流也还没建立 —— 每一帧都符合"命令有、实际 0、电流≈0", 直接报
+    就会在起步和换向时刷屏, 真正的故障反而被淹掉。PERSIST 帧(20Hz 下约 0.5s)
+    之后还成立, 才认为是真问题。
+    """
+
+    PERSIST = 10
+
+    def __init__(self):
+        self.counts = {}
+        self.reported = set()
+
+    def update(self, probs):
+        """传 [(key, 描述)]; 返回这一帧应该真正打印出来的描述列表。"""
+        out = []
+        seen = set()
+        for key, text in probs:
+            seen.add(key)
+            n = self.counts.get(key, 0) + 1
+            self.counts[key] = n
+            if n >= self.PERSIST and key not in self.reported:
+                self.reported.add(key)      # 只报一次, 不刷屏
+                out.append(text)
+        # 条件消失就清零, 下次复发还能再报一次
+        for key in list(self.counts):
+            if key not in seen:
+                del self.counts[key]
+                self.reported.discard(key)
+        return out
 
 
 def iter_frames(stream):
@@ -299,6 +349,8 @@ def main():
     last_diag = None
     dropped = 0
     seen_seq = None
+    tracker = ProblemTracker()
+    bat_mv = 0
 
     try:
         for kind, frame in iter_frames(stream):
@@ -307,6 +359,9 @@ def main():
                 dump.flush()
             if args.raw:
                 print("%-4s %s" % (kind, frame.hex(" ")))
+                continue
+            if kind == "tel":
+                bat_mv = tel_battery_mv(frame)
                 continue
             if kind != "diag":
                 continue
@@ -318,13 +373,13 @@ def main():
                     dropped += gap
             seen_seq = d.seq
 
-            probs = d.problems()
+            probs = tracker.update(d.problems())
             if args.only_problems and not probs:
                 continue
 
             last_diag = d
-            print(d.line())
-            for p in (probs or []):
+            print(d.line(bat_mv))
+            for p in probs:
                 print("    !! " + p)
             if dropped:
                 print("    (累计丢帧 %d — 链路不稳, 数值要打折看)" % dropped)
