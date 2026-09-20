@@ -72,6 +72,67 @@ class ChassisCheck(object):
         z = Twist()
         self.spin_for(STOP_S, z)
 
+    def wait_for_odom(self, timeout_s=15.0):
+        """等 /odom 出现。
+
+        ★ 别只 spin 一两秒就判"收不到" —— CH340 偶尔会掉线让底盘节点崩掉,
+          而 launch 里配了 respawn, 节点 2 秒后会自己回来。正好在那个窗口里
+          启动脚本就会误报"收不到 /odom", 让人以为是自己的问题。
+        """
+        t0 = time.monotonic()
+        nxt = 0.0
+        while self.cur is None and time.monotonic() - t0 < timeout_s:
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+            if time.monotonic() - t0 > nxt:
+                nxt += 3.0
+                print("  等 /odom ... 已等 %.0f 秒 (底盘节点在不在跑? 串口在不在?)"
+                      % (time.monotonic() - t0))
+        return self.cur is not None
+
+    def run_to_distance(self, vx, target_m, timeout_s=40.0):
+        """往前开, 直到 /odom 报的位移达到 target_m 就停。
+
+        用途: 验证里程计刻度。**"里程计报的距离"被脚本钉死在 target_m**,
+        所以偏差全部体现在"车实际停在哪"上:
+            车正好停在 target_m 处  -> 里程计准
+            车停在 target_m/2 处    -> 里程计多报一倍
+            车停在 target_m*2 处    -> 里程计少报一半
+        比"掐时间"或"看见就按 Ctrl-C"精确得多, 而且不需要卷尺。
+        """
+        self.stop()
+        if not self.wait_for_odom():
+            print("!! 等了 15 秒还是收不到 /odom。检查:")
+            print("   ros2 node list | grep wheeltec      # 底盘节点在不在")
+            print("   fuser -v /dev/wheeltec_controller   # 串口被谁占着")
+            print("   ros2 topic echo /odom --once        # 话题有没有数据")
+            return
+        x0, y0, _ = self.cur
+        cmd = Twist()
+        cmd.linear.x = vx
+
+        t0 = time.monotonic()
+        d = 0.0
+        while True:
+            self.pub.publish(cmd)
+            rclpy.spin_once(self.node, timeout_sec=1.0 / PUB_HZ)
+            if self.cur is not None:
+                d = math.hypot(self.cur[0] - x0, self.cur[1] - y0)
+                if d >= target_m:
+                    break
+            if time.monotonic() - t0 > timeout_s:
+                print("!! 超时: 里程计只走到 %.3f m (目标 %.2f m) —— 车根本没动?"
+                      % (d, target_m))
+                break
+
+        self.stop()
+        print("里程计位移 = %.3f m (目标 %.3f m), 用了 %.1f 秒"
+              % (d, target_m, time.monotonic() - t0))
+        print()
+        print("现在看车实际停在哪 (起点到车同一个参照点的直线距离):")
+        print("  正好 %.2f m  ->  里程计准" % target_m)
+        print("  约 %.2f m    ->  里程计多报一倍" % (target_m / 2))
+        print("  约 %.2f m    ->  里程计少报一半" % (target_m * 2))
+
     def run_case(self, name, vx, wz, dur):
         self.stop()
         if self.cur is None:
@@ -187,17 +248,45 @@ def main():
     ap.add_argument("--linear-only", action="store_true")
     ap.add_argument("--turn-only", action="store_true")
     ap.add_argument("--dur", type=float, default=3.0, help="每条测多久(秒)")
+    ap.add_argument("--once", type=float, metavar="VX",
+                    help="只跑一条直线 vx m/s, 用 --dur 指定秒数。"
+                         "专门用来做\"实际距离 vs /odom\"的对比: 拿卷尺量车实际"
+                         "走了多远, 和脚本报的 /odom 位移比 —— 这个比值就是"
+                         "里程计的标定系数, **和控制准不准无关**。")
+    ap.add_argument("--drive-to", type=float, metavar="米",
+                    help="往前开直到 /odom 报的位移达到这个米数就停 —— 用来"
+                         "验证里程计刻度(见 run_to_distance 的说明)。"
+                         "配套 --vx 指定速度, 默认 0.20 m/s。")
+    ap.add_argument("--vx", type=float, default=0.20,
+                    help="--drive-to 用的速度, 默认 0.20 m/s")
     args = ap.parse_args()
 
+    if args.drive_to is not None:
+        rclpy.init()
+        node = rclpy.create_node("chassis_check")
+        chk = ChassisCheck(node)
+        try:
+            chk.spin_for(1.0)
+            chk.run_to_distance(args.vx, args.drive_to)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            chk.stop()
+            node.destroy_node()
+            rclpy.shutdown()
+        return
+
     cases = []
-    if not args.turn_only:
+    if args.once is not None:
+        cases = [("单次 前进 %.2f m/s" % args.once, args.once, 0.0, args.dur)]
+    elif not args.turn_only:
         cases += [
             ("前进 0.15 m/s", 0.15, 0.0, args.dur),
             ("前进 0.30 m/s", 0.30, 0.0, args.dur),
             ("前进 0.50 m/s", 0.50, 0.0, args.dur),
             ("后退 -0.20 m/s", -0.20, 0.0, args.dur),
         ]
-    if not args.linear_only:
+    if args.once is None and not args.linear_only:
         cases += [
             ("原地左转 0.5 r/s", 0.0, 0.5, args.dur),
             ("原地右转 -0.5 r/s", 0.0, -0.5, args.dur),
@@ -208,7 +297,7 @@ def main():
     node = rclpy.create_node("chassis_check")
     chk = ChassisCheck(node)
     try:
-        chk.spin_for(1.0)          # 先收几帧 /odom
+        chk.wait_for_odom()        # 先确保 /odom 有数据(节点可能正在 respawn)
         chk.run(cases)
     except KeyboardInterrupt:
         pass
