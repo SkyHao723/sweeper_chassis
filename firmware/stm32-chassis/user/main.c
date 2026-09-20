@@ -5,21 +5,21 @@
 #include <math.h>
 
 /*==========================================================================
- * 两驱差速小车 —— STM32 底盘板
+ * 两驱差速清扫车 —— STM32 底盘板
  *
- *   USART1  PA9(TX) / PA10(RX)  <->  主上位机 CH340 / RK3588   115200 8N-1
- *   USART2  PA2(TX) / PA3(RX)   <->  调试用 ESP32              115200 8N-1
- *   CAN1    PA12(TX)/ PA11(RX)  -->  两台 FOC 驱动器            500 kbps 扩展帧
+ *   USART1  PA9(TX) / PA10(RX)  <->  上位机 CH340 / RK3588   115200 8N-1
+ *   CAN1    PA12(TX)/ PA11(RX)  -->  两台 FOC 驱动器          500 kbps 扩展帧
+ *   PB10/PB11                   <->  亚博 YbImu (软件 I2C)
+ *   PB0 / PB1                   -->  电机继电器 / 水泵继电器
  *
- * 两个串口跑**同一套协议**，谁最近发了非零命令谁就拿到控制权，
- * 主口(USART1)优先级更高，可以随时抢占。详见下面"控制权仲裁"。
+ * 只有一个上位机(RK3588)。**定位不在本板做**: 卡尔曼滤波在上位机跑,
+ * 本板只出运动学、CAN 下发、看门狗、继电器和状态上报。PA2/PA3 空着。
  *
  * STM32 负责:
  *   1. 解析上位机发来的车体目标速度 (vx, vy, wz)
  *   2. 差速逆解 -> 左右轮目标转速 -> CAN 下发
- *   3. 轮速正解 -> 车体速度, 按协议上报
- *   4. 看门狗: 当前控制方静默 800ms 就自动停车
- *   5. (可选) 本地扩展卡尔曼滤波, 见 EKF_ON_STM32
+ *   3. 轮速正解 + 读 IMU -> 按协议上报
+ *   4. 看门狗: 上位机静默 800ms 就自动停车, 并断开继电器
  *
  * ---------------------------------------------------------------------------
  * 协议沿用 Wheeltec 底盘那套 (见 chassis_serial_control.md)
@@ -34,7 +34,7 @@
  *   [9]    BCC = XOR([0..8])
  *   [10]   0x7D          帧尾
  *
- * 【主遥测帧 24 字节  STM32 -> 上位机】  (完全按协议标准, 两个口都发)
+ * 【主遥测帧 24 字节  STM32 -> 上位机】  (完全按厂商协议标准)
  *   [0]    0x7B
  *   [1]    Flag_Stop
  *   [2-3]  int16 BE 车体 vx   mm/s
@@ -50,31 +50,39 @@
  *   [22]   BCC = XOR([0..21])
  *   [23]   0x7D
  *
- * 【里程计帧 34 字节  STM32 -> 上位机】  (本工程扩展, 头 0x7E)
- *   厂商驱动不认识这一帧, 默认只发给调试口(ESP32), 见 ODOM_FRAME_TO_MAIN。
- *   [0]    0x7E
- *   [1]    flags  bit0 里程计已收敛  bit1 看门狗停车  bit2 曾收到命令
- *   [2-5]  int32 BE x   mm
- *   [6-9]  int32 BE y   mm
- *   [10-11] int16 BE 航向角  单位 0.01 度
- *   [12-13] int16 BE 滤波后 vx   mm/s
- *   [14-15] int16 BE 滤波后 wz   mrad/s
- *   [16-17] int16 BE 左轮物理转速 RPM
- *   [18-19] int16 BE 右轮物理转速 RPM
- *   [20-21] int16 BE 左轮目标 RPM
- *   [22-23] int16 BE 右轮目标 RPM
- *   [24]   1号驱动器故障码
- *   [25]   2号驱动器故障码
- *   [26]   CAN 发送错误计数
- *   [27]   UART 坏帧计数
- *   [28]   UART 有效命令计数
- *   [29]   UART 溢出计数
- *   [30]   继电器状态  bit0 电机 bit1 水泵
- *   [31]   当前控制方  0=无 1=主口(CH340/RK3588) 2=从口(ESP32)
- *   [32]   IMU 诊断码  0=正常 1=SCL拉不高 2=SDA拉不高 3=总线死 4=无应答 5=读出错
- *   [33]   IMU 扫描到的 I2C 地址 (0 = 没扫到)
- *   [34]   BCC = XOR([0..33])
- *   [35]   0x7D
+ * 【扩展诊断帧 32 字节  STM32 -> 上位机】  (本工程自定义, 头 0x7E)
+ *   厂商 ROS 节点不认识这一帧。它靠"上一字节是帧尾 0x7D、本字节是 0x7B"
+ *   才入帧, 而本帧永远夹在两个完整 24 字节帧之间发出, 所以它会被完整跳过、
+ *   并在下一个 0x7B 处正常重新同步 —— 不需要厂商那边做任何改动。
+ *   解析脚本: tools/decode_diag.py
+ *   [0]     0x7E
+ *   [1]     flags  bit0 曾收到命令  bit1 看门狗已停车  bit2 IMU 有效
+ *   [2-3]   int16 BE 车体 vx   mm/s     (轮速正解)
+ *   [4-5]   int16 BE 车体 wz   mrad/s
+ *   [6-7]   int16 BE 左轮 实际转速 RPM
+ *   [8-9]   int16 BE 右轮 实际转速 RPM
+ *   [10-11] int16 BE 左轮 目标转速 RPM
+ *   [12-13] int16 BE 右轮 目标转速 RPM
+ *   [14-15] int16 BE 1号驱动器 输出扭矩电流  A×100
+ *   [16-17] int16 BE 2号驱动器 输出扭矩电流  A×100
+ *   [18]    1号驱动器 故障码   (见 FOC_FAULT_*)
+ *   [19]    2号驱动器 故障码
+ *   [20]    1号驱动器 当前运行模式  (0x05 速度 / 0x06 位置 ...)
+ *   [21]    2号驱动器 当前运行模式
+ *   [22]    CAN 发送错误计数
+ *   [23]    UART 坏帧计数
+ *   [24]    UART 有效命令计数
+ *   [25]    UART 溢出计数
+ *   [26]    继电器状态  bit0 电机 bit1 水泵
+ *   [27]    IMU 诊断码  0=正常 1=SCL拉不高 2=SDA拉不高 3=总线死 4=无应答 5=读出错
+ *   [28]    IMU 扫描到的 I2C 地址 (0 = 没扫到)
+ *   [29]    帧序号(自增), 上位机据此发现丢帧
+ *   [30]    BCC = XOR([0..29])
+ *   [31]    0x7D
+ *
+ *   为什么把驱动器的电流/故障码单独报出来: 目标转速和实际转速对不上时,
+ *   看电流就能分清是"驱动器根本没给力"(电流≈0, 多半是故障或没使能)还是
+ *   "给了力但被堵住/拖住"(电流很大) —— 这是判断轮子没劲唯一的客观依据。
  *========================================================================*/
 
 /*========================= 想改的地方 =========================*/
@@ -103,48 +111,12 @@
  *-----------------------------------------------------------------*/
 #define STOP_CTRL           CTRL_BRAKE
 
-/*---------------------- 双串口 / 控制权 ----------------------------
- *   PORT_MAIN (USART1, PA9/PA10) -> CH340 / RK3588   主口, 可以抢占
- *   PORT_AUX  (USART2, PA2/PA3)  -> 调试用 ESP32     从口, 主口空闲时才能拿
- *
- *   OWNER_TIMEOUT_MS: 控制方多久不发命令就释放控制权(让另一个口能接管)。
- *                     必须比 LINK_TIMEOUT_MS 短, 否则交接时车会先被看门狗刹停。
- *   LINK_TIMEOUT_MS : 当前控制方多久不发命令就自动停车(看门狗)。
+/*---------------------- 串口 / 看门狗 ----------------------------
+ *   只有一个上位机: USART1 (PA9/PA10) -> CH340 / RK3588。
+ *   LINK_TIMEOUT_MS: 上位机这么久不发命令就自动停车(看门狗)。
  *-----------------------------------------------------------------*/
 #define MAIN_BAUD           115200  /* 对齐厂商驱动, 别改 */
-#define AUX_BAUD            115200  /* ESP32 那个口, 想提速可以改 */
-#define OWNER_TIMEOUT_MS    500
 #define LINK_TIMEOUT_MS     800
-
-/*======================= 构建模式 (两个 Keil 工程共用这份源码) ==========
- *   CHASSIS_RK3588_ONLY = 1   生产版
- *       只认主口 USART1(PA9/PA10, 接 RK3588)的命令, 和 ESP32 完全脱钩:
- *         - 根本不初始化 USART2, PA2/PA3 空着
- *         - 不做控制权仲裁 (只有一个上位机, 没有仲裁的必要)
- *         - 不跑本地卡尔曼, 不发 0x7E 扩展帧 (EKF 在上位机 RK3588 上做)
- *       省下来的时间: 遥测从 84 字节降到 24 字节, 每 50ms 少阻塞约 5ms,
- *       控制周期更紧; 也少 36 字节扩展帧去干扰厂商驱动。
- *
- *   CHASSIS_RK3588_ONLY = 0   调试版
- *       双串口 + 控制权仲裁 + 本地 EKF + 0x7E 位姿帧, 配合 ESP32 网页遥控。
- *
- * 两个 .uvprojx 各定义一个, 源码只有一份 —— 修 bug 只修一处。
- *=====================================================================*/
-#ifndef CHASSIS_RK3588_ONLY
-#define CHASSIS_RK3588_ONLY 0
-#endif
-
-/*---------------------- 本地卡尔曼(可选) ---------------------------
- *   生产版强制关闭: EKF 在 RK3588 上做, STM32 只负责按协议报车体速度。
- *   调试版打开: 网页能画轨迹。
- *-----------------------------------------------------------------*/
-#if CHASSIS_RK3588_ONLY
-#define EKF_ON_STM32        0
-#define ODOM_FRAME_TO_MAIN  0
-#else
-#define EKF_ON_STM32        1
-#define ODOM_FRAME_TO_MAIN  0   /* 位姿帧是本工程扩展, 厂商驱动不认识, 默认只发调试口 */
-#endif
 
 /*---------------------- GPIO 继电器 (外设开关) ----------------------
  *   PB0 -> 电机继电器 IN     PB1 -> 水泵继电器 IN
@@ -157,7 +129,7 @@
  *
  *   触发电平(本车实测): 模块是低电平触发，所以下面用 1。
  *     IN 给低 -> 继电器吸合(负载通电)      IN 给高 -> 断开
- *   换模块后如果网页上"开/关"反了，把这个值改成 0 即可。
+ *   换模块后如果"开/关"反了，把这个值改成 0 即可。
  *   模块上如果有 H/L 跳线，拨到 L。
  *
  *   RELAY_OFF_ON_LINK_LOSS: 链路断了(看门狗)自动断开两个继电器。
@@ -187,15 +159,44 @@
 #define CTRL_DISABLE       0x02
 #define CTRL_BRAKE         0x03
 
+/* 故障码 (FOC_CH4-V1.2 第 11 页附表), 回码 DATA1 / 上报帧 DATA2 */
+#define FOC_FAULT_NONE       0
+#define FOC_FAULT_DRIVER     1
+#define FOC_FAULT_OVERCURR   5
+#define FOC_FAULT_OVERVOLT   6
+#define FOC_FAULT_UNDERVOLT  7    /* 24V 电池带 36V 额定电机, 重点怀疑对象 */
+#define FOC_FAULT_OVERTEMP   8
+#define FOC_FAULT_HALL_M2    23
+#define FOC_FAULT_HALL_M1    24
+#define FOC_FAULT_STALL_M2   25
+#define FOC_FAULT_STALL_M1   26
+#define FOC_FAULT_UART       27
+#define FOC_FAULT_RS485      28
+#define FOC_FAULT_CAN        29
+
+/*------------------ 命令帧的加减速斜坡 (DATA4 / DATA5) ------------
+ *  驱动器文档原文: "当前转速为 0rpm, 目标 100rpm, 若设置间隔为 1ms,
+ *  则目标转速值每 1ms 加 1, 直至 100rpm"。
+ *  即 DATA4 的单位是 **ms / 每 1 RPM**, 范围 0~100, 0 = 阶跃(响应最快)。
+ *
+ *  以前固定发 0, 目标转速是瞬间跳变的, 电流冲击最大 —— 起步那一下最容易
+ *  顶到过流保护, 车也窜。给一点加速斜坡既柔和又更不容易触发保护:
+ *      ACCEL_STEP_MS = 3  ->  0 到 100RPM 约 300ms, 0 到 35RPM 约 105ms
+ *  减速保持 0: 要停就立刻停, 别拖泥带水(停车安全优先)。
+ *
+ *  想恢复原行为(纯阶跃)把 ACCEL_STEP_MS 改回 0 即可。 */
+#define ACCEL_STEP_MS      3
+#define DECEL_STEP_MS      0
+
 /*-------------------------- 协议 --------------------------------*/
 #define CMD_FRAME_SIZE     11
 #define CMD_HEAD           0x7B
 #define TEL_FRAME_SIZE     24
 #define TEL_HEAD           0x7B
 #define TEL_TAIL           0x7D
-#define ODOM_FRAME_SIZE    36
-#define ODOM_HEAD          0x7E
-#define ODOM_TAIL          0x7D
+#define DIAG_FRAME_SIZE    32
+#define DIAG_HEAD          0x7E
+#define DIAG_TAIL          0x7D
 
 /* 命令帧里的功能码(f[1]), 沿用协议里"非速度帧靠功能码区分"的做法。
  * 协议已占用: 0x04 灯带 / 0x01 回充开关 / 0x00 安全防护, 0x05 是空的。 */
@@ -221,24 +222,12 @@
 #define IMU_GYRO_TO_RAW     (1.0f / 0.00026644f)    /* rad/s  -> ±500dps 原始值 */
 #define IMU_GYRO_Z_SIGN     1       /* 陀螺 Z 方向和车体逆时针不一致时改成 -1 */
 
-/*=================== 卡尔曼滤波参数 (调试时可改) ===================*/
-#define EKF_SIGMA_V        0.05f    /* 轮速测量噪声 m/s */
-#define EKF_SIGMA_W        0.10f    /* 轮速角速度测量噪声 rad/s */
-#define EKF_SIGMA_GZ       0.01f    /* 陀螺仪测量噪声 rad/s */
-#define EKF_SLIP_DIST      0.03f    /* 每米行驶距离的位置不确定度 */
-#define EKF_SLIP_ANG       0.05f    /* 每弧度转过的航向不确定度 */
-#define EKF_ACCEL_NOISE    0.30f    /* 线加速度随机游走 (m/s^2) */
-#define EKF_ANGACC_NOISE   1.00f    /* 角加速度随机游走 (rad/s^2) */
-#define EKF_BIAS_WALK      0.001f   /* 陀螺零偏随机游走 (rad/s^2) */
-/*=================================================================*/
-
 /*=========================== 全局状态 ==============================*/
 volatile uint32_t g_tick_ms;
 
-/*---------------------- 串口口 (两个口跑同一套协议) -----------------*/
+/*---------------------- 串口口 (就一个) ----------------------------*/
 #define PORT_MAIN   0
-#define PORT_AUX    1
-#define PORT_COUNT  2
+#define PORT_COUNT  1
 
 typedef struct
 {
@@ -256,25 +245,15 @@ typedef struct
 
 static uart_port_t ports[PORT_COUNT];
 
-/* 控制权: 谁最近发了"非零"命令谁说了算; 主口可以抢占。
-   生产版只有一个上位机, 不需要仲裁, 这套状态整个编译掉。 */
-#if !CHASSIS_RK3588_ONLY
-static uint8_t  ctrl_owner;         /* 0xFF = 无 */
-static uint32_t ctrl_owner_ms;      /* 控制权最后一次刷新的时刻 */
-#define OWNER_NONE  0xFF
-#endif
-
 /* 目标 / 状态 */
 static float    target_vx;          /* m/s */
 static float    target_wz;          /* rad/s */
 static uint8_t  ever_linked;
 static uint8_t  failsafe_latched;
 
-/* 物理轮速目标 —— 只用于调试版的 0x7E 帧, 生产版没有地方上报 */
-#if EKF_ON_STM32
+/* 物理轮速目标 —— 上报给上位机, 用来和实际轮速对比(诊断"没劲"的关键) */
 static int16_t  target_left_rpm;
 static int16_t  target_right_rpm;
-#endif
 
 static uint32_t last_cmd_ms;
 static uint32_t last_can_ms;
@@ -284,9 +263,11 @@ static uint32_t last_tel_ms;
 /* 诊断计数 */
 static uint8_t  can_error_count;
 
-/* 驱动器回码 */
-static volatile uint8_t m1_fault, m2_fault;
-static volatile int16_t m1_rpm, m2_rpm;
+/* 驱动器回码 (控制帧 ...E601 的应答, 每个字段来自同一帧, 时间戳共用 m*_rpm_ms) */
+static volatile uint8_t m1_fault, m2_fault;     /* DATA1 故障码, 见 FOC_FAULT_* */
+static volatile uint8_t m1_mode,  m2_mode;      /* DATA0 当前运行模式 0x05/0x06... */
+static volatile int16_t m1_rpm,   m2_rpm;       /* DATA2/3 实际转速 RPM */
+static volatile int16_t m1_cur,   m2_cur;       /* DATA4/5 输出扭矩电流, A x100 */
 static uint32_t m1_rpm_ms, m2_rpm_ms;
 static volatile uint16_t battery_mv;
 
@@ -298,15 +279,12 @@ static float    body_vx, body_wz;                  /* 轮速正解出的车体�
 static float    imu_accel_g[3];      /* 单位 g */
 static float    imu_gyro[3];         /* 单位 rad/s */
 
-/* IMU 的诊断状态只在调试版有意义(结果通过 0x7E 帧上报给网页)。
-   生产版没人看, 就不采集了 —— 顺便省掉读失败时的 I2C 地址扫描。 */
-#if EKF_ON_STM32
+/* IMU 诊断状态 —— 通过诊断帧上报, 方便查 I2C 接线/器件问题 */
 static uint8_t  imu_ok;              /* 1 = 加速度有效 */
 static uint8_t  imu_gyro_ok;         /* 1 = 陀螺仪有效(不是恒 0) */
 static uint8_t  imu_status;          /* YBIMU_ST_* 失败原因 */
 static uint8_t  imu_found_addr;      /* 扫描到的器件地址, 0 = 没扫到 */
 static uint32_t imu_diag_ms;         /* 上次诊断的时刻 */
-#endif
 
 /* 继电器 */
 static uint8_t  relay_state;                       /* bit0 电机 bit1 水泵 */
@@ -441,10 +419,10 @@ static void CAN1_SendMotorCmd(uint32_t id, uint8_t mode, uint8_t ctrl, int16_t v
     data[1] = ctrl;
     data[2] = (uint8_t)(raw >> 8);
     data[3] = (uint8_t)raw;
-    data[4] = 0;
-    data[5] = 0;
-    data[6] = 0;
-    data[7] = 0;
+    data[4] = ACCEL_STEP_MS;    /* 加速间隔 ms/1RPM, 0=阶跃 */
+    data[5] = DECEL_STEP_MS;    /* 减速间隔 ms/1RPM, 0=阶跃 */
+    data[6] = 0;                /* 输入电源低压保护阈值(V), 0=不设(用驱动器默认) */
+    data[7] = 0;                /* 预留 */
     CAN1_SendRaw(id, 8, data);
 }
 
@@ -462,19 +440,32 @@ static void CAN1_Poll(void)
         id = (rx.IDE == CAN_Id_Extended) ? rx.ExtId : rx.StdId;
 
         /* 控制帧回码 ...E601:
-             DATA1=故障码  DATA2/3=实际转速
-             (DATA6/7 是当前位置(度), 现在没人用, 需要时再解析) */
+             DATA0=当前运行模式  DATA1=故障码  DATA2/3=实际转速
+             DATA4/5=当前输出扭矩电流(A x100)  DATA6/7=当前位置(度)
+           DATA4/5 是判断"这个轮子到底出没出力"唯一的客观指标:
+           目标转速不等于实际转速时, 看电流就知道是驱动器没给力(电流≈0)
+           还是给了力但被堵住/拖住了(电流很大)。 */
         if ((id == MOTOR1_REPLY_ID) && (rx.DLC >= 4))
         {
+            m1_mode  = rx.Data[0];
             m1_fault = rx.Data[1];
             m1_rpm = (int16_t)(((uint16_t)rx.Data[2] << 8) | rx.Data[3]);
             m1_rpm_ms = g_tick_ms;
+            if (rx.DLC >= 6)
+            {
+                m1_cur = (int16_t)(((uint16_t)rx.Data[4] << 8) | rx.Data[5]);
+            }
         }
         else if ((id == MOTOR2_REPLY_ID) && (rx.DLC >= 4))
         {
+            m2_mode  = rx.Data[0];
             m2_fault = rx.Data[1];
             m2_rpm = (int16_t)(((uint16_t)rx.Data[2] << 8) | rx.Data[3]);
             m2_rpm_ms = g_tick_ms;
+            if (rx.DLC >= 6)
+            {
+                m2_cur = (int16_t)(((uint16_t)rx.Data[4] << 8) | rx.Data[5]);
+            }
         }
         /* 定时上报帧 ...E603: DATA4/5=电源输入电压(放大10倍) -> mV */
         else if ((id == MOTOR1_REPORT_ID) && (rx.DLC >= 6))
@@ -488,8 +479,8 @@ static void CAN1_Poll(void)
     }
 }
 
-/*======================== 双串口 (两个口同一套协议) =================
- * 每收到一个字节就进中断塞进各自的环形缓冲, 主循环再慢慢组帧。
+/*========================= 串口接收 ===============================
+ * 每收到一个字节就进中断塞进环形缓冲, 主循环再慢慢组帧。
  * 用中断而不是轮询是必须的: STM32F1 的 USART 没有 RX FIFO, 只有一个字节的
  * 数据寄存器, 主循环一卡(比如发遥测)就会 ORE 丢字节。
  *=================================================================*/
@@ -515,11 +506,6 @@ static void Port_Isr(uart_port_t *p)
 void USART1_IRQHandler(void)
 {
     Port_Isr(&ports[PORT_MAIN]);
-}
-
-void USART2_IRQHandler(void)
-{
-    Port_Isr(&ports[PORT_AUX]);
 }
 
 static void Port_SendByte(uart_port_t *p, uint8_t value)
@@ -580,28 +566,6 @@ static void USART1_Init(void)
     ports[PORT_MAIN].usart = USART1;
 }
 
-/* USART2: PA2(TX) / PA3(RX)  ->  调试用 ESP32
-   生产版整块编译掉: PA2/PA3 空着, 和 ESP32 彻底脱钩。 */
-#if !CHASSIS_RK3588_ONLY
-static void USART2_Init(void)
-{
-    NVIC_InitTypeDef nvic;
-
-    RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
-    Usart_InitPins(GPIO_Pin_2, GPIO_Pin_3);
-    Usart_Config(USART2, AUX_BAUD);
-
-    nvic.NVIC_IRQChannel = USART2_IRQn;
-    nvic.NVIC_IRQChannelPreemptionPriority = 0;
-    nvic.NVIC_IRQChannelSubPriority = 1;
-    nvic.NVIC_IRQChannelCmd = ENABLE;
-    NVIC_Init(&nvic);
-
-    ports[PORT_AUX].id = PORT_AUX;
-    ports[PORT_AUX].usart = USART2;
-}
-#endif
-
 static void PutI16(uint8_t *p, int16_t v)
 {
     p[0] = (uint8_t)((uint16_t)v >> 8);
@@ -613,17 +577,6 @@ static void PutU16(uint8_t *p, uint16_t v)
     p[0] = (uint8_t)(v >> 8);
     p[1] = (uint8_t)v;
 }
-
-#if EKF_ON_STM32
-static void PutI32(uint8_t *p, int32_t v)
-{
-    uint32_t u = (uint32_t)v;
-    p[0] = (uint8_t)(u >> 24);
-    p[1] = (uint8_t)(u >> 16);
-    p[2] = (uint8_t)(u >> 8);
-    p[3] = (uint8_t)u;
-}
-#endif
 
 /*========================= GPIO 继电器 ============================
  * 两路推挽输出。RELAY_ACTIVE_LOW 决定"开"到底是高电平还是低电平。
@@ -690,25 +643,14 @@ static uint8_t Cmd_Verify(const uint8_t *f)
     return (bcc == f[CMD_FRAME_SIZE - 2]);
 }
 
-/*==================== 控制权仲裁 (两个串口共用一个底盘) =============
- * 问题: 主口(RK3588)和从口(ESP32)都能发速度帧, 谁说了算?
- *   - 主口是长期上位机, 优先级高
- *   - 从口是调试用的, 主口不在的时候才能接管
- *
- * 规则:
- *   1. 只有"非零"速度帧才claim控制权(零速度是停车/心跳, 不抢)
- *   2. 主口随时可以抢; 从口只能在"主口不是控制方"或"主口控制权已超时"时拿
- *   3. 控制权 500ms 不刷新就释放(OWNER_TIMEOUT_MS)
- *   4. 不是控制方的速度帧直接丢弃
- *   5. 看门狗只认控制方的帧 —— 否则从口的心跳会把看门狗一直喂着,
- *      主口掉线了车也不会停, 这是会出事的
- *   6. 继电器是"锁存式开关", 两个口都随时可操作, 不参与仲裁
+/*========================= 命令帧应用 =============================
+ * 只有一个上位机, 没有控制权仲裁 —— 收到合法帧就认。
+ * 继电器是"锁存式开关", 任何时候都可以操作。
  *=================================================================*/
 static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
 {
     int16_t vx_mm;
     int16_t wz_mrad;
-    uint8_t nonzero;
 
     /* ---- 功能帧: f[1] 是功能码, 不是速度帧 ---- */
     if (f[1] == FUNC_RELAY)
@@ -739,44 +681,12 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     /* f[1]=AutoRecharge  f[2]=SecurityPLY  f[5..6]=vy (差速车忽略) */
     vx_mm = (int16_t)(((uint16_t)f[3] << 8) | f[4]);
     wz_mrad = (int16_t)(((uint16_t)f[7] << 8) | f[8]);
-    nonzero = (uint8_t)((vx_mm != 0) || (wz_mrad != 0));
     if (ports[port_id].ok_count != 0xFF) ports[port_id].ok_count++;
 
-#if CHASSIS_RK3588_ONLY
-    /* 生产版: 只有 RK3588 一个上位机, 不需要仲裁。
-       理论上从口根本不会被初始化, 这里再挡一道, 免得以后手滑接上 ESP32。 */
-    (void)nonzero;
     if (port_id != PORT_MAIN)
     {
-        return;
+        return;                     /* 只认 PA9/PA10, 别的口一律不理 */
     }
-#else
-    /* ---- 抢占 / 续期 ---- */
-    if (nonzero)
-    {
-        if (port_id == PORT_MAIN)
-        {
-            ctrl_owner = PORT_MAIN;                 /* 主口随时可抢 */
-            ctrl_owner_ms = g_tick_ms;
-        }
-        else if ((ctrl_owner != PORT_MAIN) ||
-                 ((g_tick_ms - ctrl_owner_ms) > OWNER_TIMEOUT_MS))
-        {
-            ctrl_owner = PORT_AUX;                  /* 从口只能捡主口不要的 */
-            ctrl_owner_ms = g_tick_ms;
-        }
-    }
-    else if (ctrl_owner == port_id)
-    {
-        ctrl_owner_ms = g_tick_ms;                  /* 控制方发零速, 续期 */
-    }
-
-    /* ---- 不是控制方就丢弃 ---- */
-    if (ctrl_owner != port_id)
-    {
-        return;
-    }
-#endif
 
     target_vx = ClampF((float)vx_mm / 1000.0f, -MAX_LIN_SPEED, MAX_LIN_SPEED);
     target_wz = ClampF((float)wz_mrad / 1000.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
@@ -887,10 +797,8 @@ static void Drive_Apply(void)
     if (MOTOR1_INVERT) m1 = (int16_t)(-m1);
     if (MOTOR2_INVERT) m2 = (int16_t)(-m2);
 
-#if EKF_ON_STM32
     target_left_rpm = (int16_t)rpm_l;      /* 上报给上位机的是物理轮速目标, */
     target_right_rpm = (int16_t)rpm_r;     /* 不是电机命令, 免得左右概念混淆 */
-#endif
 
     /*===================== 走 / 停 两态 =====================
      * 停车就是一条 STOP_CTRL 帧, 每个控制周期重发。
@@ -909,274 +817,13 @@ static void Drive_Apply(void)
     }
 }
 
-/*==================================================================
- *  扩展卡尔曼滤波
- *
- *  状态 x = [ X, Y, theta, v, wz, bgz ]
- *      X,Y    位置 m
- *      theta  航向 rad, 逆时针为正, 0 指向 +X
- *      v      车体线速度 m/s
- *      wz     车体角速度 rad/s
- *      bgz    陀螺仪 Z 轴零偏 rad/s   (现在没用上, IMU 来了就生效)
- *
- *  预测:  用当前 v, wz 推位姿
- *  观测1: 轮速计算出的 (v, wz)          —— 一直有
- *  观测2: 陀螺仪 Z 轴角速度 gz = wz + bgz —— 接了 IMU 才有
- *
- *  生产版 (CHASSIS_RK3588_ONLY=1) 整块编译掉: EKF 在上位机 RK3588 上做。
- *==================================================================*/
-#if EKF_ON_STM32
-#define EKF_N 6
-
-static float ekf_x[EKF_N];
-static float ekf_P[EKF_N][EKF_N];
-static uint8_t ekf_ready;
-
-static float WrapPi(float a)
-{
-    while (a >  3.14159265f) a -= 6.28318531f;
-    while (a < -3.14159265f) a += 6.28318531f;
-    return a;
-}
-
-static void Ekf_Symmetrize(void)
-{
-    uint8_t i, j;
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = (uint8_t)(i + 1); j < EKF_N; j++)
-        {
-            float s = 0.5f * (ekf_P[i][j] + ekf_P[j][i]);
-            ekf_P[i][j] = s;
-            ekf_P[j][i] = s;
-        }
-        if (ekf_P[i][i] < 1e-9f) ekf_P[i][i] = 1e-9f;
-    }
-}
-
-static void Ekf_Init(void)
-{
-    uint8_t i, j;
-
-    for (i = 0; i < EKF_N; i++)
-    {
-        ekf_x[i] = 0.0f;
-        for (j = 0; j < EKF_N; j++)
-        {
-            ekf_P[i][j] = (i == j) ? 0.01f : 0.0f;
-        }
-    }
-    ekf_ready = 1;
-}
-
-static void Ekf_Predict(float dt)
-{
-    float F[EKF_N][EKF_N];
-    float FP[EKF_N][EKF_N];
-    float FPFt[EKF_N][EKF_N];
-    float v = ekf_x[3];
-    float w = ekf_x[4];
-    float theta_mid = ekf_x[2] + w * dt * 0.5f;
-    float c = cosf(theta_mid);
-    float s = sinf(theta_mid);
-    float ds = fabsf(v) * dt;
-    float dth = fabsf(w) * dt;
-    float q_pos, q_th, q_v, q_w, q_b;
-    float sum;
-    uint8_t i, j, k;
-
-    /* --- 状态传播 --- */
-    ekf_x[0] += v * c * dt;
-    ekf_x[1] += v * s * dt;
-    ekf_x[2] = WrapPi(ekf_x[2] + w * dt);
-
-    /* --- 状态转移雅可比 F = I + 偏置 --- */
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = 0; j < EKF_N; j++)
-        {
-            F[i][j] = (i == j) ? 1.0f : 0.0f;
-        }
-    }
-    F[0][2] = -v * s * dt;
-    F[0][3] =  c * dt;
-    F[0][4] = -v * s * dt * dt * 0.5f;
-    F[1][2] =  v * c * dt;
-    F[1][3] =  s * dt;
-    F[1][4] =  v * c * dt * dt * 0.5f;
-    F[2][4] =  dt;
-
-    /* --- P = F P F' + Q --- */
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = 0; j < EKF_N; j++)
-        {
-            sum = 0.0f;
-            for (k = 0; k < EKF_N; k++) sum += F[i][k] * ekf_P[k][j];
-            FP[i][j] = sum;
-        }
-    }
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = 0; j < EKF_N; j++)
-        {
-            sum = 0.0f;
-            for (k = 0; k < EKF_N; k++) sum += FP[i][k] * F[j][k];   /* F[j][k] = F'[k][j] */
-            FPFt[i][j] = sum;
-        }
-    }
-
-    /* 过程噪声: 走得越远/转得越多, 位置和航向越不确定 */
-    q_pos = EKF_SLIP_DIST * ds + 0.0005f;  q_pos *= q_pos;
-    q_th  = EKF_SLIP_ANG  * dth + 0.001f;  q_th  *= q_th;
-    q_v   = EKF_ACCEL_NOISE * dt;          q_v   *= q_v;
-    q_w   = EKF_ANGACC_NOISE * dt;         q_w   *= q_w;
-    q_b   = EKF_BIAS_WALK * dt;            q_b   *= q_b;
-
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = 0; j < EKF_N; j++)
-        {
-            ekf_P[i][j] = FPFt[i][j];
-        }
-    }
-    ekf_P[0][0] += q_pos;
-    ekf_P[1][1] += q_pos;
-    ekf_P[2][2] += q_th;
-    ekf_P[3][3] += q_v;
-    ekf_P[4][4] += q_w;
-    ekf_P[5][5] += q_b;
-
-    Ekf_Symmetrize();
-}
-
-/* 观测: 轮速计解算出的车体 (v, wz) */
-static void Ekf_UpdateWheel(float v_meas, float w_meas)
-{
-    float S00, S01, S10, S11, det, inv00, inv01, inv10, inv11;
-    float K[EKF_N][2];
-    float y0 = v_meas - ekf_x[3];
-    float y1 = w_meas - ekf_x[4];
-    float row3[EKF_N];
-    float row4[EKF_N];
-    uint8_t i, j;
-
-    S00 = ekf_P[3][3] + EKF_SIGMA_V * EKF_SIGMA_V;
-    S01 = ekf_P[3][4];
-    S10 = ekf_P[4][3];
-    S11 = ekf_P[4][4] + EKF_SIGMA_W * EKF_SIGMA_W;
-
-    det = S00 * S11 - S01 * S10;
-    if (fabsf(det) < 1e-12f) return;
-
-    inv00 =  S11 / det;
-    inv01 = -S01 / det;
-    inv10 = -S10 / det;
-    inv11 =  S00 / det;
-
-    /* K = P H' S^-1 ;  H 选中第 3、4 个状态, 所以 P H' 的两列就是 P 的第 3、4 列 */
-    for (i = 0; i < EKF_N; i++)
-    {
-        float a = ekf_P[i][3];
-        float b = ekf_P[i][4];
-        K[i][0] = a * inv00 + b * inv10;
-        K[i][1] = a * inv01 + b * inv11;
-    }
-
-    for (i = 0; i < EKF_N; i++)
-    {
-        ekf_x[i] += K[i][0] * y0 + K[i][1] * y1;
-    }
-    ekf_x[2] = WrapPi(ekf_x[2]);
-
-    /* P = (I - K H) P ;  先把要用的两行拷出来, 否则原地更新会串味 */
-    for (j = 0; j < EKF_N; j++)
-    {
-        row3[j] = ekf_P[3][j];
-        row4[j] = ekf_P[4][j];
-    }
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = 0; j < EKF_N; j++)
-        {
-            ekf_P[i][j] -= K[i][0] * row3[j] + K[i][1] * row4[j];
-        }
-    }
-
-    Ekf_Symmetrize();
-}
-
-/* 观测: 陀螺仪 Z 轴角速度, 同时估计零偏 */
-static void Ekf_UpdateGyro(float gz)
-{
-    float S;
-    float K[EKF_N];
-    float y = gz - (ekf_x[4] + ekf_x[5]);
-    float row4[EKF_N];
-    float row5[EKF_N];
-    uint8_t i, j;
-
-    S = ekf_P[4][4] + ekf_P[4][5] + ekf_P[5][4] + ekf_P[5][5] + EKF_SIGMA_GZ * EKF_SIGMA_GZ;
-    if (S < 1e-12f) return;
-
-    for (i = 0; i < EKF_N; i++)
-    {
-        K[i] = (ekf_P[i][4] + ekf_P[i][5]) / S;
-    }
-    for (i = 0; i < EKF_N; i++)
-    {
-        ekf_x[i] += K[i] * y;
-    }
-    ekf_x[2] = WrapPi(ekf_x[2]);
-
-    for (j = 0; j < EKF_N; j++)
-    {
-        row4[j] = ekf_P[4][j];
-        row5[j] = ekf_P[5][j];
-    }
-    for (i = 0; i < EKF_N; i++)
-    {
-        for (j = 0; j < EKF_N; j++)
-        {
-            ekf_P[i][j] -= K[i] * (row4[j] + row5[j]);
-        }
-    }
-
-    Ekf_Symmetrize();
-}
-
-/*======================= IMU 陀螺仪接口 (给本地 EKF 用) =============
- * 本地卡尔曼只要陀螺仪 Z 轴角速度(rad/s, 逆时针为正)。
- * 这里返回缓存值, 真正去读 I2C 的是 IMU_Tick()。
- *
- * ★ 车体逆时针为正, 但 IMU 装反了/坐标系不同的话符号可能相反 ——
- *   症状是轮速和陀螺仪互相打架, 航向估计反而更差。这时候改
- *   IMU_GYRO_Z_SIGN 为 -1。
- *
- * 返回 0 表示这次没有可信的陀螺仪数据, EKF 会自动跳过这一步。
- *=================================================================*/
-static uint8_t IMU_ReadGyroZ(float *gz)
-{
-    if (!imu_gyro_ok)
-    {
-        return 0;
-    }
-    *gz = imu_gyro[2] * (float)IMU_GYRO_Z_SIGN;
-    return 1;
-}
-
-#endif /* EKF_ON_STM32 */
-
 /*======================= IMU (YbImu) ==============================
  * 按 ODOM_PERIOD_MS 采一次。读失败不清零 —— 保留上一次的值。
  *
- * 调试版还会记录一串诊断状态, 读失败时最多每秒做一次总线检查 + 地址扫描,
- * 结果通过 0x7E 帧报给网页 —— 否则"读取失败"这四个字什么信息都没有。
- * 生产版没有地方上报这些东西, 整块编译掉, 顺便省掉扫描的开销。
+ * 还会记录一串诊断状态, 读失败时最多每秒做一次总线检查 + 地址扫描,
+ * 结果通过诊断帧上报 —— 否则"读取失败"这四个字什么信息都没有。
  *=================================================================*/
-#if EKF_ON_STM32
 #define IMU_DIAG_PERIOD_MS  1000
-#endif
 
 static void IMU_Tick(void)
 {
@@ -1207,16 +854,13 @@ static void IMU_Tick(void)
             imu_gyro[2] = 0.0f;
         }
 
-#if EKF_ON_STM32
         imu_ok = 1;
         imu_gyro_ok = (uint8_t)(err == YBIMU_ST_OK);
         imu_status = err;
         imu_found_addr = YBIMU_I2C_ADDR;
-#endif
         return;
     }
 
-#if EKF_ON_STM32
     imu_ok = 0;
     imu_gyro_ok = 0;
     imu_status = err;
@@ -1238,7 +882,6 @@ static void IMU_Tick(void)
             imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
         }
     }
-#endif
 }
 
 /* 物理量 -> 协议规定的 ±2g / ±500dps 原始值, 带限幅(超量程夹住而不是回绕) */
@@ -1260,29 +903,17 @@ static int16_t IMU_GyroToRaw(float gyro_rad_s)
     return (int16_t)v;
 }
 
-/*======================= 轮速采样 + (可选)滤波 ===================*/
+/*======================= 轮速采样 + IMU =========================
+ * 只做采样和上报。**定位不在这里**: 卡尔曼滤波在上位机 RK3588 上跑。
+ *=================================================================*/
 static void Odom_Tick(void)
 {
     Wheel_Update();
     IMU_Tick();     /* 位翻转 I2C 读 IMU, 大约 1~3ms */
-
-#if EKF_ON_STM32
-    {
-        const float dt = (float)ODOM_PERIOD_MS / 1000.0f;
-        float gz;
-
-        Ekf_Predict(dt);
-        Ekf_UpdateWheel(body_vx, body_wz);
-        if (IMU_ReadGyroZ(&gz))
-        {
-            Ekf_UpdateGyro(gz);
-        }
-    }
-#endif
 }
 
 /*=========================== 状态回传 ==============================
- * 主遥测帧严格按协议 24 字节; 位姿放在扩展的里程计帧里(头 0x7E)。
+ * 主遥测帧严格按协议 24 字节; 扩展诊断帧头是 0x7E, 见文件开头的说明。
  *=================================================================*/
 static void Send_MainTelemetry(uart_port_t *p)
 {
@@ -1317,69 +948,68 @@ static void Send_MainTelemetry(uart_port_t *p)
     for (i = 0; i < TEL_FRAME_SIZE; i++) Port_SendByte(p, f[i]);
 }
 
-/* 位姿扩展帧 (0x7E) —— 本工程自定义, 厂商驱动不认识。
-   生产版编译掉: EKF 在上位机做, 不需要这个帧。 */
-#if EKF_ON_STM32
-static void Send_OdomFrame(uart_port_t *p)
+/* 扩展诊断帧 (0x7E, 32 字节) —— 本工程自定义, 厂商驱动不认识。
+ *
+ * 完整布局见文件开头。这里只说为什么需要它:
+ * 主遥测帧(24B)是厂商协议定死的, 没有地方放驱动器的输出电流和故障码。
+ * 而"某个轮子到底有没有劲"这件事, 不看这两个量就只能靠猜。
+ *
+ * 帧同步上的安全性 —— 厂商 ROS 节点的入帧条件是"上一字节是帧尾 0x7D(或 0x7F)、
+ * 本字节是帧头 0x7B"。本帧永远夹在两个完整的 24 字节帧之间发出, 自己帧头是
+ * 0x7E、帧尾是 0x7D, 所以厂商那边会把它整帧跳过, 紧接着的那个 0x7B 恰好满足
+ * 入帧条件 —— 24 字节帧一帧都不会丢, 厂商侧不需要任何改动。
+ *=================================================================*/
+static void Send_DiagFrame(uart_port_t *p)
 {
-    uint8_t f[ODOM_FRAME_SIZE];
+    static uint8_t seq;
+    uint8_t f[DIAG_FRAME_SIZE];
     uint8_t i;
     uint8_t bcc = 0;
     uint8_t flags = 0;
-    int32_t x_mm = (int32_t)(ekf_x[0] * 1000.0f);
-    int32_t y_mm = (int32_t)(ekf_x[1] * 1000.0f);
-    int16_t head_cdeg = (int16_t)(ekf_x[2] * 57.29578f * 100.0f);   /* rad -> 0.01度 */
 
-    if (ekf_ready)          flags |= 0x01;
-    if (failsafe_latched)   flags |= 0x02;
-    if (ever_linked)        flags |= 0x04;
-    if (imu_ok)             flags |= 0x08;      /* IMU 最近一次读取成功 */
+    if (ever_linked)      flags |= 0x01;
+    if (failsafe_latched) flags |= 0x02;
+    if (imu_ok)           flags |= 0x04;    /* 加速度最近一次读取成功 */
+    if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪不是恒 0(不是又没接上) */
 
-    f[0] = ODOM_HEAD;
+    f[0] = DIAG_HEAD;
     f[1] = flags;
-    PutI32(&f[2], x_mm);
-    PutI32(&f[6], y_mm);
-    PutI16(&f[10], head_cdeg);
-    PutI16(&f[12], (int16_t)(ekf_x[3] * 1000.0f));    /* 滤波后 vx  mm/s */
-    PutI16(&f[14], (int16_t)(ekf_x[4] * 1000.0f));    /* 滤波后 wz  mrad/s */
-    PutI16(&f[16], wheel_left_rpm);
-    PutI16(&f[18], wheel_right_rpm);
-    PutI16(&f[20], target_left_rpm);
-    PutI16(&f[22], target_right_rpm);
-    f[24] = m1_fault;
-    f[25] = m2_fault;
-    f[26] = can_error_count;
-    f[27] = (uint8_t)(ports[PORT_MAIN].bad_count + ports[PORT_AUX].bad_count);
-    f[28] = (uint8_t)(ports[PORT_MAIN].ok_count + ports[PORT_AUX].ok_count);
-    f[29] = (uint8_t)(ports[PORT_MAIN].overflow + ports[PORT_AUX].overflow);
-    f[30] = relay_state;                       /* bit0 电机 bit1 水泵 */
-    f[31] = (ctrl_owner == OWNER_NONE) ? 0 : (uint8_t)(ctrl_owner + 1);
-    f[32] = imu_status;                        /* YBIMU_ST_* 诊断结果 */
-    f[33] = imu_found_addr;                    /* 扫描到的 I2C 器件地址, 0 = 没扫到 */
-    for (i = 0; i < ODOM_FRAME_SIZE - 2; i++) bcc ^= f[i];
-    f[ODOM_FRAME_SIZE - 2] = bcc;
-    f[ODOM_FRAME_SIZE - 1] = ODOM_TAIL;
+    PutI16(&f[2],  (int16_t)(body_vx * 1000.0f));   /* 轮速正解出的车体速度 */
+    PutI16(&f[4],  (int16_t)(body_wz * 1000.0f));
+    PutI16(&f[6],  wheel_left_rpm);      /* 实际 */
+    PutI16(&f[8],  wheel_right_rpm);
+    PutI16(&f[10], target_left_rpm);     /* 目标 */
+    PutI16(&f[12], target_right_rpm);
+    PutI16(&f[14], m1_cur);              /* 1号驱动器 输出扭矩电流 A×100 */
+    PutI16(&f[16], m2_cur);              /* 2号驱动器 */
+    f[18] = m1_fault;                    /* 1号故障码, 见 FOC_FAULT_* */
+    f[19] = m2_fault;
+    f[20] = m1_mode;                     /* 1号当前模式 0x05 速度 / 0x06 位置 */
+    f[21] = m2_mode;
+    f[22] = can_error_count;
+    f[23] = ports[PORT_MAIN].bad_count;
+    f[24] = ports[PORT_MAIN].ok_count;
+    f[25] = ports[PORT_MAIN].overflow;
+    f[26] = relay_state;                 /* bit0 电机 bit1 水泵 */
+    f[27] = imu_status;                  /* YBIMU_ST_* */
+    f[28] = imu_found_addr;              /* 0 = 没扫到 */
+    f[29] = seq++;                       /* 帧序号, 上位机据此发现丢帧 */
+    /* f[30] = BCC, f[31] = 0x7D 下面填 */
 
-    for (i = 0; i < ODOM_FRAME_SIZE; i++) Port_SendByte(p, f[i]);
+    for (i = 0; i < DIAG_FRAME_SIZE - 2; i++) bcc ^= f[i];
+    f[DIAG_FRAME_SIZE - 2] = bcc;
+    f[DIAG_FRAME_SIZE - 1] = DIAG_TAIL;
+
+    for (i = 0; i < DIAG_FRAME_SIZE; i++) Port_SendByte(p, f[i]);
 }
-#endif /* EKF_ON_STM32 */
 
 /*============================== main ===============================*/
 int main(void)
 {
     Tick_Init();
     CAN1_Init();
-    USART1_Init();          /* PA9/PA10 -> CH340 / RK3588 */
-#if !CHASSIS_RK3588_ONLY
-    USART2_Init();          /* PA2/PA3  -> ESP32 (仅调试版) */
-#endif
+    USART1_Init();          /* PA9/PA10 -> CH340 / RK3588, 唯一的上位机口 */
     Relay_Init();
-#if EKF_ON_STM32
-    Ekf_Init();
-#endif
-#if !CHASSIS_RK3588_ONLY
-    ctrl_owner = OWNER_NONE;
-#endif
     Delay_ms(200);
 
     target_vx = 0.0f;
@@ -1396,23 +1026,10 @@ int main(void)
     while (1)
     {
         Port_ProcessCommands(&ports[PORT_MAIN]);
-#if !CHASSIS_RK3588_ONLY
-        Port_ProcessCommands(&ports[PORT_AUX]);
-#endif
         CAN1_Poll();
 
-#if !CHASSIS_RK3588_ONLY
-        /* 控制权超时 -> 释放, 让另一个口能接管 */
-        if ((ctrl_owner != OWNER_NONE) &&
-            ((g_tick_ms - ctrl_owner_ms) > OWNER_TIMEOUT_MS))
-        {
-            ctrl_owner = OWNER_NONE;
-        }
-#endif
-
-        /* 看门狗: 上位机停发就自动停车。
-           调试版里只认"当前控制方"的帧 —— 否则从口的心跳会把看门狗一直喂着,
-           主口掉线了车也不会停。生产版只有一个上位机, 直接认它就是。 */
+        /* 看门狗: 上位机 800ms 不发命令就自动停车, 并断开继电器。
+           只有一个上位机, 它的帧直接喂狗, 不需要仲裁。 */
         if ((failsafe_latched == 0) &&
             (ever_linked) &&
             ((g_tick_ms - last_cmd_ms) > LINK_TIMEOUT_MS))
@@ -1420,15 +1037,12 @@ int main(void)
             target_vx = 0.0f;
             target_wz = 0.0f;
             failsafe_latched = 1;
-#if !CHASSIS_RK3588_ONLY
-            ctrl_owner = OWNER_NONE;
-#endif
 #if RELAY_OFF_ON_LINK_LOSS
             Relay_Set(0);       /* 断线了顺便把电机/水泵继电器也断开 */
 #endif
         }
 
-        /* 轮速采样 + IMU + (可选)卡尔曼 */
+        /* 轮速采样 + IMU */
         if ((g_tick_ms - last_odom_ms) >= ODOM_PERIOD_MS)
         {
             last_odom_ms = g_tick_ms;
@@ -1442,23 +1056,15 @@ int main(void)
             Drive_Apply();
         }
 
-        /* 上报标准 24 字节帧 */
+        /* 上报: 先标准 24 字节帧, 紧跟一帧扩展诊断帧。
+           顺序不能反 —— 诊断帧必须夹在两个 24 字节帧之间, 厂商节点才能
+           干净地跳过它并正确重新同步。 */
         if ((g_tick_ms - last_tel_ms) >= TELEMETRY_PERIOD_MS)
         {
             last_tel_ms = g_tick_ms;
 
             Send_MainTelemetry(&ports[PORT_MAIN]);
-#if !CHASSIS_RK3588_ONLY
-            Send_MainTelemetry(&ports[PORT_AUX]);
-#endif
-
-#if EKF_ON_STM32
-            /* 位姿帧是本工程扩展, 厂商驱动不认识, 默认只发给调试口 */
-            Send_OdomFrame(&ports[PORT_AUX]);
-#if ODOM_FRAME_TO_MAIN
-            Send_OdomFrame(&ports[PORT_MAIN]);
-#endif
-#endif
+            Send_DiagFrame(&ports[PORT_MAIN]);
         }
 
         CAN1_Poll();
