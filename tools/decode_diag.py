@@ -48,6 +48,7 @@
 """
 
 import argparse
+import collections
 import os
 import struct
 import sys
@@ -145,6 +146,21 @@ def tel_gyro_raw(frame):
       分不清就可能在修一个根本没坏的东西。**转动一下板子看这三个数变不变**
       是一秒就能定性的测试。"""
     return (i16(frame, 14), i16(frame, 16), i16(frame, 18))
+
+
+def tel_accel_ms2(frame):
+    """24 字节主遥测帧 [8-9][10-11][12-13] = 加速度计三轴原始值。
+    单位是协议规定的 ±2g 量程原始值: m/s^2 = 原始值 / 1671.84。
+
+    ★ 这个量最大的用途是给"轮速到底是不是真在抖"当**独立裁判**:
+      驱动器回码在 0~71 RPM 之间暴力来回冲时, 有两种可能 ——
+        (a) 车真的在一窜一窜 -> 纵向加速度必然跟着摆, 幅度约
+            A = v_pp * pi * f, 就算 0.76m/s 峰峰值 / 1Hz 也有 ±2.4 m/s^2;
+        (b) 只是驱动器的转速估计在乱跳, 车其实走得很顺 -> 加速度是平的,
+            只剩路面噪声(约 0.1~0.3 m/s^2)。
+      加速度计和轮速完全独立, 所以这一眼就能定性。"""
+    return (i16(frame, 8) / 1671.84, i16(frame, 10) / 1671.84,
+            i16(frame, 12) / 1671.84)
 
 
 def build_cmd(vx, wz):
@@ -289,7 +305,7 @@ class Diag(object):
                                 % (tag, tgt, act, cur / 10.0)))
         return out
 
-    def line(self, bat_mv=0, gyro=None, nom=None):
+    def line(self, bat_mv=0, gyro=None, nom=None, accel=None):
         bat = (" bat=%.1fV" % (bat_mv / 1000.0)) if bat_mv else ""
         imu = IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st)
         if self.imu_st != 0:
@@ -301,6 +317,9 @@ class Diag(object):
             g = " gyro=(%+d,%+d,%+d)=%.3f,%.3f,%.3frad/s" % (
                 gyro[0], gyro[1], gyro[2],
                 gyro[0] * GYRO_RATIO, gyro[1] * GYRO_RATIO, gyro[2] * GYRO_RATIO)
+        a = ""
+        if accel:
+            a = " acc=(%+.2f,%+.2f,%+.2f)m/s2" % accel
         # 上报的"目标"是含外环修正**和起步助推**的最终命令。
         # ★ 这里显示的是 目标 - 主机理论目标, 也就是"修正 + 助推"的合计,
         #   不是积分的修正量本身。实测踩过: 看到 "+13" 以为积分已经顶到
@@ -315,13 +334,13 @@ class Diag(object):
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s"
                 % (self.seq, self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2), trim,
-                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g))
+                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a))
 
 
 def flags_text(f):
@@ -475,6 +494,11 @@ def main():
     tracker = ProblemTracker()
     bat_mv = 0
     gyro_raw = None
+    accel = None
+    # 加速度峰峰值追踪: 这是判断"轮速是真在抖还是只是回码在抖"的独立裁判,
+    # 见 tel_accel_ms2 的说明。取最近 2 秒(20Hz x 40 帧)的峰峰值。
+    acc_hist = collections.deque(maxlen=40)
+    n_diag = 0
 
     try:
         for kind, frame in iter_frames(stream):
@@ -487,6 +511,7 @@ def main():
             if kind == "tel":
                 bat_mv = tel_battery_mv(frame)
                 gyro_raw = tel_gyro_raw(frame)
+                accel = tel_accel_ms2(frame)
                 continue
             if kind != "diag":
                 continue
@@ -503,9 +528,21 @@ def main():
                 continue
 
             last_diag = d
-            print(d.line(bat_mv, gyro_raw, nom))
+            print(d.line(bat_mv, gyro_raw, nom, accel))
             for p in probs:
                 print("    !! " + p)
+
+            # 每 1 秒报一次加速度峰峰值 —— 用来判断轮速抖动是真是假
+            if accel is not None:
+                acc_hist.append(accel)
+            n_diag += 1
+            if n_diag % 20 == 0 and len(acc_hist) >= 20:
+                pp = [max(a[i] for a in acc_hist) - min(a[i] for a in acc_hist)
+                      for i in range(3)]
+                print("    └ 加速度峰峰值(最近%d帧): x=%.2f y=%.2f z=%.2f m/s2"
+                      % (len(acc_hist), pp[0], pp[1], pp[2]))
+                print("      ^ 轮速在跳时看这个: 有 1 以上 -> 车真的在一窜一窜;"
+                      " 只有 0.1~0.3 -> 车走得挺顺, 只是回码在乱跳")
             if dropped:
                 print("    (累计丢帧 %d — 链路不稳, 数值要打折看)" % dropped)
             sys.stdout.flush()
