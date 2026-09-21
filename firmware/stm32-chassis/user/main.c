@@ -56,7 +56,9 @@
  *   并在下一个 0x7B 处正常重新同步 —— 不需要厂商那边做任何改动。
  *   解析脚本: tools/decode_diag.py
  *   [0]     0x7E
- *   [1]     flags  bit0 曾收到命令  bit1 看门狗已停车  bit2 IMU 有效
+ *   [1]     flags  bit0 曾收到命令  bit1 看门狗已停车  bit2 IMU 加速度有效
+ *                  bit3 IMU 陀螺仪自开机以来读到过非零
+ *                  bit4 上次复位是 IWDG 引起的(说明主循环卡死过, 要查!)
  *   [2-3]   int16 BE 车体 vx   mm/s     (轮速正解)
  *   [4-5]   int16 BE 车体 wz   mrad/s
  *   [6-7]   int16 BE 左轮 实际转速 RPM
@@ -308,6 +310,9 @@ static uint8_t  imu_probe_flags;     /* bit0 版本 bit1 陀螺 bit2 磁力 bit3
 static uint8_t  imu_ver_major;
 static int16_t  imu_euler_yaw_crad;  /* 模块自己融合的偏航角, 单位 0.01rad */
 static uint32_t imu_probe_ms;        /* 上次寄存器体检的时刻 */
+
+/* 上次复位是不是看门狗引起的 —— 是就说明主循环卡死过, 必须知道 */
+static uint8_t  reset_by_iwdg;
 
 /* 继电器 */
 static uint8_t  relay_state;                       /* bit0 电机 bit1 水泵 */
@@ -1083,7 +1088,8 @@ static void Send_DiagFrame(uart_port_t *p)
     if (ever_linked)      flags |= 0x01;
     if (failsafe_latched) flags |= 0x02;
     if (imu_ok)           flags |= 0x04;    /* 加速度最近一次读取成功 */
-    if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪不是恒 0(不是又没接上) */
+    if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪自开机以来读到过非零 */
+    if (reset_by_iwdg)    flags |= 0x10;    /* 上次复位是看门狗引起的(主循环卡死过) */
 
     f[0] = DIAG_HEAD;
     f[1] = flags;
@@ -1124,6 +1130,15 @@ int main(void)
 {
     Tick_Init();
     CAN1_Init();
+
+    /* ★ 读复位原因。IWDG 一旦触发就是"主循环卡死过", 这是必须知道的事 ——
+       否则只会看到"车莫名其妙停了一下"却查不出原因。
+       RCC_CSR 里的标志是掉电才清, 所以读完要主动清掉, 免得下次复位还报旧账。 */
+    if (RCC_GetFlagStatus(RCC_FLAG_IWDGRST) != RESET)
+    {
+        reset_by_iwdg = 1;
+    }
+    RCC_ClearFlag();
 
     /* ★ CAN 一通就立刻刹车, 一毫秒都别等。
        看门狗复位时驱动器还在执行上一条命令, 每多等一毫秒车就多冲一点。

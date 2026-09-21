@@ -238,6 +238,14 @@ class Diag(object):
         """返回 [(key, 描述), ...]; 没问题就返回空列表。
         key 用来做"连续出现多久"的统计, 见 ProblemTracker。"""
         out = []
+        if self.flags & 0x10:
+            # 这条最要紧: IWDG 不会无缘无故触发。触发过就说明主循环卡死过,
+            # STM32 静默了一秒 —— 而驱动器没有命令超时, 那一秒里车是在按
+            # 最后一条命令跑的。必须查清楚卡在哪。
+            out.append(("iwdg",
+                        "STM32 上次复位是看门狗引起的 —— 主循环卡死过! "
+                        "驱动器没有命令超时, 卡死期间车会按最后一条命令继续跑, "
+                        "必须查出卡在哪 (看是不是 I2C/USART 死等)"))
         if self.imu_st != 0:
             out.append(("imuother",
                         "IMU 读取异常: %s（体检: %s）"
@@ -267,6 +275,8 @@ class Diag(object):
         imu = IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st)
         if self.imu_st != 0:
             imu += "[%s]" % self.probe_text()
+        fl = flags_text(self.flags)
+        fl = (" fl=%s" % fl) if fl else ""
         g = ""
         if gyro:
             g = " gyro=(%+d,%+d,%+d)=%.3f,%.3f,%.3frad/s" % (
@@ -275,13 +285,30 @@ class Diag(object):
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s"
                 % (self.seq, self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2),
-                   self.can_err, self.bad, self.ovf, self.relay, imu, bat, g))
+                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g))
+
+
+def flags_text(f):
+    """把诊断帧 [1] 的 flags 翻成人话。只列真正置位的, 没置的不占地方。"""
+    out = []
+    if f & 0x01:
+        out.append("已连过")
+    if f & 0x02:
+        out.append("看门狗停车")
+    if f & 0x04:
+        out.append("IMU加速OK")
+    if f & 0x08:
+        out.append("陀螺有数据")
+    if f & 0x10:
+        # 这条最重要: IWDG 不会无缘无故触发, 触发过就说明主循环卡死过
+        out.append("**上次复位是看门狗(主循环卡死过!)**")
+    return "/".join(out)
 
 
 class ProblemTracker(object):
