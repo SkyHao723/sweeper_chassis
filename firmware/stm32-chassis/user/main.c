@@ -336,6 +336,15 @@ static float    target_wz;          /* rad/s */
 static uint8_t  ever_linked;
 static uint8_t  failsafe_latched;
 
+/* 电机继电器最近一次"合上"的时刻。
+ * ★ 驱动器是继电器供电的, 合闸那一刻它们才开始上电初始化 —— 初始化没完就发
+ *   速度命令是不可靠的。实测(2026-09): 同一条直行命令连着发三次, 结果分别是
+ *   **"没反应"、"向左转"、"正常前进"** —— 直行变成左转, 说明那一次只有一个
+ *   驱动器响应了。而继电器在每次断链(看门狗)时都会断开, 所以每次重新连上都会
+ *   重演这个问题, 导航里会变成"偶尔不动、偶尔歪一下"。
+ *   见 Drive_Ready()。 */
+static uint32_t drive_arm_ms;
+
 /* 物理轮速目标 —— 上报给上位机, 用来和实际轮速对比(诊断"没劲"的关键) */
 static int16_t  target_left_rpm;
 static int16_t  target_right_rpm;
@@ -749,7 +758,18 @@ static void Relay_Apply(void)
 
 static void Relay_Set(uint8_t mask)
 {
+    uint8_t was = relay_state;
+
     relay_state = (uint8_t)(mask & 0x03);
+
+    /* 电机继电器 0->1: 驱动器刚开始上电。记下时刻, 之后 Drive_Ready() 会一直
+       等到**两个驱动器各自回传过一次数据**才允许下发速度命令 —— 理由见
+       drive_arm_ms 的注释。 */
+    if (((was & 0x01) == 0) && ((relay_state & 0x01) != 0))
+    {
+        drive_arm_ms = g_tick_ms;
+    }
+
     Relay_Apply();
 }
 
@@ -1064,6 +1084,23 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
     return out;
 }
 
+/*===================== 驱动器就绪判断 ==============================
+ * 电机继电器合上之后, 必须先看到**两个驱动器各自回传过一次数据**, 才允许下发
+ * 速度命令。这是"等确认再动", 不是"猜它能动了" —— 理由见 drive_arm_ms 的注释:
+ * 驱动器初始化没完时发速度命令, 实测会出现"没反应"或"只一个轮子响应(于是直行
+ * 变左转)"。
+ *
+ * 为什么不会死锁: 等待期间 Drive_Apply 每 20ms 发的是**刹车帧**, 而驱动器对
+ * 刹车帧同样会回码, 所以回码一定会来。万一 CAN 真断了, 那就一直刹车 ——
+ * 这正是应该的结果(驱动器都没通, 本来就不该动)。
+ *=================================================================*/
+static uint8_t Drive_Ready(void)
+{
+    if (m1_rpm_ms < drive_arm_ms) return 0;
+    if (m2_rpm_ms < drive_arm_ms) return 0;
+    return 1;
+}
+
 /*========================= 差速逆解 ================================
  * 车体 (vx, wz) -> 左右轮目标转速。差速车用不到 vy。
  *   v_left  = vx - wz * b/2
@@ -1087,7 +1124,24 @@ static void Drive_Apply(void)
     int16_t m2;
 
     if ((dt <= 0.0f) || (dt > 0.2f)) dt = (float)CAN_PERIOD_MS * 0.001f;
-    last_trim_ms = g_tick_ms;
+    last_trim_ms = g_tick_ms;      /* 就算下面提前 return 也要更新, 免得恢复时 dt 爆掉 */
+
+    /* ★ 驱动器还没确认起来(继电器刚合闸): 只发刹车, 绝不发速度。
+       实测不管这里就会出现"第一次没反应 / 第二次向左转(只有一个轮子响应)"
+       那种不确定行为 —— 而继电器每次断链都会断开, 所以每次重连都重演。
+       顺便把外环状态清零, 免得带着上一次攒的修正冲出去。 */
+    if (!Drive_Ready())
+    {
+        trim_w[TRIM_IDX_LEFT].trim  = 0.0f;
+        trim_w[TRIM_IDX_RIGHT].trim = 0.0f;
+        trim_w[TRIM_IDX_LEFT].kick_until  = 0;
+        trim_w[TRIM_IDX_RIGHT].kick_until = 0;
+        target_left_rpm  = 0;
+        target_right_rpm = 0;
+        CAN1_SendStop(MOTOR1_CAN_ID);
+        CAN1_SendStop(MOTOR2_CAN_ID);
+        return;
+    }
 
     rpm_l = ClampF(rpm_l, -(float)MAX_RPM, (float)MAX_RPM);
     rpm_r = ClampF(rpm_r, -(float)MAX_RPM, (float)MAX_RPM);
@@ -1320,6 +1374,7 @@ static void Send_DiagFrame(uart_port_t *p)
     if (imu_ok)           flags |= 0x04;    /* 加速度最近一次读取成功 */
     if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪自开机以来读到过非零 */
     if (reset_by_iwdg)    flags |= 0x10;    /* 上次复位是看门狗引起的(主循环卡死过) */
+    if (!Drive_Ready())   flags |= 0x20;    /* 驱动器未就绪: 继电器刚合闸, 在等回码 */
 
     f[0] = DIAG_HEAD;
     f[1] = flags;
