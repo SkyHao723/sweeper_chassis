@@ -15,5 +15,13 @@ RestartSec=5
 StandardOutput=journal
 StandardError=journal
 
+# ★ KillMode 必须是 process, 不能用默认的 control-group。
+#   看门狗发现卡死时会用 nohup 把整个底盘栈拉起来, 那些进程就落在这个 service
+#   的 cgroup 里。默认的 control-group 会在 stop/restart 时把 cgroup 内**所有**
+#   进程一起杀掉 —— 于是 `systemctl restart chassis-watchdog` 会把正在正常工作的
+#   底盘一起干掉。实测踩到过: 停掉看门狗之后 /odom 立刻没了, 一开始还以为是
+#   看门狗之外的原因。底盘该由 chassis_bringup.sh 管, 不该被看门狗的启停连坐。
+KillMode=process
+
 [Install]
 WantedBy=multi-user.target
