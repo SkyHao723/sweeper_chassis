@@ -1,0 +1,138 @@
+# 厂商节点改动: 新增 /chassis_relay -> STM32 滚刷/水泵继电器帧 (f[1]=0x05)
+#
+# 背景: STM32 只认串口上的 11 字节帧, 而这个串口被 wheeltec_robot_node 独占,
+#       别的进程发不进去 —— 所以新增的外设(滚刷/水泵)控制只能由它代为转发。
+#       厂商协议里没有这条帧。
+#
+# ★ 路径是相对 ~/smart_ws 的, 所以必须在 ~/smart_ws 下用 -p0 应用:
+#     cd ~/smart_ws && patch -p0 < 本补丁
+#     colcon build --packages-select turn_on_wheeltec_robot
+#
+# 撤销 (smart_ws 本身是 git 仓库, 这两个文件被跟踪):
+#     cd ~/smart_ws && git checkout -- src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp src/turn_on_wheeltec_robot/include/turn_on_wheeltec_robot/wheeltec_robot.h
+#   下面的 diff 是**纯新增、0 删除**, 所以撤销后不会有残留。
+#
+# 用法: ros2 topic pub --once /chassis_relay std_msgs/msg/UInt8 "{data: 1}"
+#       1=滚刷 2=水泵 3=两个都开 0=都关
+#
+# Relay_Hold_Timer 每 200ms 重申一次, 是对抗 STM32 的**链路看门狗**
+# (800ms 收不到任何合法帧就断开继电器) —— 本节点只在 /cmd_vel 到来时才发帧,
+# 停着不动时"开着滚刷"会被看门狗自己关掉。
+
+--- src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp.orig	2026-09-21 19:26:40.299037938 +0800
++++ src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp	2026-09-21 19:22:56.270936771 +0800
+@@ -115,6 +115,57 @@
+ }
+ 
+ 
++//=============================================================================
++// 滚刷/水泵继电器 (本工程自定义扩展, 对应 STM32 的 FUNC_RELAY = f[1]=0x05)
++//
++// 为什么要在厂商节点里做: STM32 只认串口上的 11 字节帧, 而这个串口被本节点
++// **独占** —— 别的进程根本发不进去。所以新增的外设控制只能由这里代为转发。
++//
++// 帧格式和速度帧同头同尾同长度, 靠 f[1]=0x05 区分:
++//     tx[1]=0x05, tx[2]=掩码(bit0 滚刷 bit1 水泵), tx[3..8]=0
++// ★ 千万不能写成速度帧的样子 —— 那样 tx[3..8] 会被解析成 vx/wz, 车会窜。
++//=============================================================================
++void turn_on_robot::ChassisRelay_Callback(const std_msgs::msg::UInt8::SharedPtr msg)
++{
++  Relay_Mask = (uint8_t)(msg->data & 0x03);
++  RCLCPP_INFO(this->get_logger(), "chassis relay mask -> %d (bit0 滚刷 bit1 水泵)",
++              (int)Relay_Mask);
++  Send_Relay_Frame();
++}
++
++void turn_on_robot::Send_Relay_Frame()
++{
++  Send_Data.tx[0] = FRAME_HEADER;   // 0x7B
++  Send_Data.tx[1] = 0x05;           // FUNC_RELAY
++  Send_Data.tx[2] = Relay_Mask;     // bit0 滚刷 bit1 水泵
++  Send_Data.tx[3] = 0; Send_Data.tx[4] = 0;
++  Send_Data.tx[5] = 0; Send_Data.tx[6] = 0;
++  Send_Data.tx[7] = 0; Send_Data.tx[8] = 0;
++  Send_Data.tx[9] = Check_Sum(9, SEND_DATA_CHECK); //BCC
++  Send_Data.tx[10] = FRAME_TAIL;    // 0x7D
++  try
++  {
++    Stm32_Serial.write(Send_Data.tx, sizeof(Send_Data.tx));
++  }
++  catch (serial::IOException& e)
++  {
++    RCLCPP_ERROR(this->get_logger(), "Unable to send relay frame through serial port");
++  }
++}
++
++void turn_on_robot::Relay_Hold_Callback()
++{
++  // 只为对抗 STM32 的**链路看门狗**: 800ms 收不到任何合法帧就把两个继电器都
++  // 断开, 而本节点只在 /cmd_vel 到来时才发帧 —— 停着不动时"开着滚刷"会被它
++  // 自己关掉。定时重申一下就解决。
++  // mask=0 时不必发: "断开"本来就是看门狗的默认结果。
++  if (Relay_Mask != 0)
++  {
++    Send_Relay_Frame();
++  }
++}
++
++
+ //避障实现函数
+ geometry_msgs::msg::Twist turn_on_robot::avoid_obstacle(const geometry_msgs::msg::Twist& twist)
+ {
+@@ -1032,6 +1083,16 @@
+         "arm_cmd", 10, std::bind(&turn_on_robot::arm_cmd_Callback, this,std::placeholders::_1));
+   SetRgb_Sub = create_subscription<std_msgs::msg::UInt8MultiArray>(
+       "set_rgb_color", 5, std::bind(&turn_on_robot::Set_LightRgb_Callback, this,std::placeholders::_1));
++
++  // ★ 本工程扩展: 滚刷/水泵继电器。厂商协议里没有这条帧, 而 STM32 只认串口上
++  //   的 11 字节帧、串口又被本节点独占, 所以只能由这里转发。
++  //   用法: ros2 topic pub --once /chassis_relay std_msgs/msg/UInt8 "{data: 1}"
++  //         1=滚刷 2=水泵 3=两个都开 0=都关
++  //   定时器是必须的 —— STM32 的链路看门狗 800ms 收不到任何合法帧就断开继电器。
++  ChassisRelay_Sub = create_subscription<std_msgs::msg::UInt8>(
++      "chassis_relay", 5, std::bind(&turn_on_robot::ChassisRelay_Callback, this, std::placeholders::_1));
++  Relay_Hold_Timer = create_wall_timer(std::chrono::milliseconds(200),
++      std::bind(&turn_on_robot::Relay_Hold_Callback, this));
+   
+   //Set the velocity control command callback function
+   //速度控制命令订阅回调函数设置
+--- src/turn_on_wheeltec_robot/include/turn_on_wheeltec_robot/wheeltec_robot.h.orig	2026-09-21 19:26:40.307038097 +0800
++++ src/turn_on_wheeltec_robot/include/turn_on_wheeltec_robot/wheeltec_robot.h	2026-09-21 19:22:56.694943807 +0800
+@@ -5,6 +5,7 @@
+ #include <iostream>
+ #include <string.h>
+ #include <string> 
++#include <chrono>          // create_wall_timer 用 (滚刷继电器定时重申)
+ #include <iostream>
+ #include <math.h> 
+ #include <stdlib.h>    
+@@ -240,6 +241,18 @@
+ 		rclcpp::Subscription<std_msgs::msg::Int8>::SharedPtr Security_Sub;
+ 		//灯带设置
+ 		rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr SetRgb_Sub;
++
++		// ★ 本工程扩展: 滚刷/水泵继电器 (STM32 的 PB0/PB1)。
++		//   厂商协议里没有这条帧, 而 STM32 只认串口上的 11 字节帧 —— 所以必须由
++		//   本节点代为转发 (它独占串口)。std_msgs/UInt8: bit0 滚刷, bit1 水泵。
++		//   对应固件里的 FUNC_RELAY (f[1]=0x05), 见 Cmd_Apply()。
++		//
++		//   为什么要 Relay_Hold_Timer: STM32 有**链路看门狗** —— 800ms 收不到
++		//   任何合法帧就把两个继电器都断开, 而本节点只在 /cmd_vel 到来时才发帧。
++		//   所以停着不动时, "开着滚刷"会被看门狗自己关掉。定时重申一下就解决。
++		rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr ChassisRelay_Sub;
++		uint8_t Relay_Mask = 0;                        //当前想要的继电器掩码
++		rclcpp::TimerBase::SharedPtr Relay_Hold_Timer;
+ 		//The speed topic subscribes to the callback function
+ 		//速度话题订阅回调函数
+         void Cmd_Vel_Callback(const geometry_msgs::msg::Twist::SharedPtr twist_aux);
+@@ -255,6 +268,10 @@
+ 		//底盘安全等级回调函数
+ 		void Security_Callback(const std_msgs::msg::Int8 &Security_Flag);
+     void Set_LightRgb_Callback(const std_msgs::msg::UInt8MultiArray::SharedPtr msg);
++		//滚刷/水泵继电器 (本工程扩展, f[1]=0x05)
++		void ChassisRelay_Callback(const std_msgs::msg::UInt8::SharedPtr msg);
++		void Send_Relay_Frame();
++		void Relay_Hold_Callback();
+ 		//回充相关发布函数
+ 		void Publish_Charging();       
+ 		void Publish_ChargingCurrent();

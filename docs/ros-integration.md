@@ -133,6 +133,41 @@ KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
 普通 CH340 **没有唯一序列号**（`ID_SERIAL=1a86_USB_Serial`），只能按 VID:PID
 匹配。以后加第二个 CH340 就得改用 `KERNELS=="3-1.2"` 指定 USB 物理口。
 
+### 3.4 厂商节点改动：滚刷/水泵转发通路（补丁）
+
+**为什么必须改厂商节点**：STM32 只认串口上的 11 字节帧，而这个串口被
+`wheeltec_robot_node` **独占** —— 别的进程（包括我们自己的脚本）根本写不进去。
+所以滚刷/水泵这类新增外设的控制，只能由厂商节点代为转发。
+
+改动很小，**纯新增、0 删除**，全部集中在两个文件：
+
+| 文件 | 加了什么 |
+|---|---|
+| `src/wheeltec_robot.cpp` | `ChassisRelay_Callback` / `Send_Relay_Frame` / `Relay_Hold_Callback`；构造函数里注册订阅 + 200ms 定时器 |
+| `include/.../wheeltec_robot.h` | 订阅者 / 掩码 / 定时器成员，三个方法声明，`#include <chrono>` |
+
+**补丁存在本仓库**：`vendor-patches/chassis_relay_vendor.patch`（138 行）。
+
+```bash
+# 应用 (路径相对 ~/smart_ws, 必须在 ~/smart_ws 下用 -p0)
+cd ~/smart_ws && patch -p0 < <本仓库>/vendor-patches/chassis_relay_vendor.patch
+colcon build --packages-select turn_on_wheeltec_robot
+
+# 撤销 (smart_ws 自己就是 git 仓库, 这两个文件被跟踪)
+cd ~/smart_ws && git checkout -- src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp \
+    src/turn_on_wheeltec_robot/include/turn_on_wheeltec_robot/wheeltec_robot.h
+```
+
+用法与**那个 200ms 定时器为什么不能省**，见 `README.md` 的继电器一节。
+
+> ⚠ `Send_Data` 是节点里的共享发送缓冲，定时器回调和 `/cmd_vel` 回调都会写它。
+> 安全的前提是**单线程** —— 本节点用的是 `rclcpp::spin_some()`，回调天然串行。
+> 如果以后改成 `MultiThreadedExecutor`，这两处必须加锁。
+>
+> ⚠ `smart_ws` 这个 git 仓库里有若干**未提交**的改动（`ekf.yaml`、
+> `wheeltec_param.yaml`、`base_serial.launch.py`、以及本补丁）。它们只存在于车上的
+> 工作区，本仓库的文档记录了内容但**不是可执行备份** —— 换机器时别只拷本仓库。
+
 ---
 
 ## 4. 底盘验收
@@ -412,7 +447,7 @@ for i in 1 2 3; do python3 ~/chassis_tools/chassis_check.py --turn-only --dur 3;
 | **CH340 USB 掉线** | 硬件问题 | 内核日志实测会 `USB disconnect` + 重新枚举。软件侧已加 `chassis-watchdog`（`/odom` 停发自动重启栈，能处理崩溃和卡死）。**硬件侧要查 USB 线/接头** |
 | IMU | 正常 | 加速度/陀螺仪/磁力计都验证过。陀螺仪**静止时输出 0 是模块的正常行为**，不是故障 |
 | 里程计刻度 | 正常 | 轮周长实测验证（2m ÷ 3.1 圈 = 0.645m）；换算公式读码确认 |
-| 滚刷/水泵继电器 | 固件已改成只在显式命令下动作 | PB0 滚刷、PB1 水泵 ——**和轮毂电机无关**（驱动器常电）。台架可用 `decode_diag.py --relay` 开关。**⚠ ROS 里还开不了**：这条自定义帧厂商节点不认识、而它独占串口，需要在厂商节点里加一条转发通路 |
+| 滚刷/水泵继电器 | 已解决 | PB0 滚刷、PB1 水泵 ——**和轮毂电机无关**（驱动器常电）。两条通路：台架 `decode_diag.py --relay`，ROS 里 `ros2 topic pub /chassis_relay std_msgs/msg/UInt8 "{data: 1}"`。ROS 侧靠在厂商节点里加转发通路实现，补丁见 `vendor-patches/chassis_relay_vendor.patch` |
 | 看门狗 | 已拆成两条 | **运动看门狗**（800ms 无速度帧→停车）和**链路看门狗**（800ms 无任何合法帧→断继电器）分开；混在一起会让"只发继电器帧"把车也停住、或者让显式开的继电器被自己关掉 |
 | 驱动器就绪联锁 | 已加 | 两个驱动器没都回码时只发刹车，防"单轮出力 = 原地打转"。**根因（三次三种结果）未查明** |
 | 位置锁位 | 已删除 | 曾经导致实车失控 |

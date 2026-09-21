@@ -407,20 +407,27 @@ KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
 分开的理由：只发继电器帧时，车必须停住（没有速度命令），但滚刷要保持转 ——
 混成一条的话，继电器帧不算喂狗，"开滚刷"会在 800ms 后自己被断链保护关掉。
 
-**怎么控制它们**：
+**怎么控制它们**（两条通路都对）：
 
 ```bash
-# 台架: 直接开关 (需要先停掉 ROS 底盘节点, 串口独占)
+# A) 台架: 直接开关 (需要先停掉 ROS 底盘节点, 串口独占)
 python3 tools/decode_diag.py -p /dev/wheeltec_controller --relay 1   # 滚刷开
-python3 tools/decode_diag.py -p /dev/wheeltec_controller --relay 2   # 水泵开
-python3 tools/decode_diag.py -p /dev/wheeltec_controller --relay 3   # 都开
-# Ctrl-C 退出时会自动发 0 关掉
+# 1=滚刷 2=水泵 3=都开 0=都关; Ctrl-C 退出时会自动发 0
+
+# B) ROS 跑着的时候: 走厂商节点的转发通路 (见下)
+ros2 topic pub --once /chassis_relay std_msgs/msg/UInt8 "{data: 1}"
 ```
 
-> ⚠ **ROS 栈跑着的时候目前开不了滚刷。** 这条 `f[1]=0x05` 是本工程自定义的扩展，
-> 厂商 `wheeltec_robot_node` 不认识它，而它**独占串口**。所以要在 ROS 里控制滚刷，
-> 必须给厂商节点加一条转发通路（订阅一个话题 → 组这条 11 字节帧发出去）。
-> 见 `docs/ros-integration.md` 的缺口表。
+**ROS 侧为什么必须靠厂商节点转发**：这条 `f[1]=0x05` 是本工程自定义的扩展，
+厂商 `wheeltec_robot_node` 不认识它，而且它**独占串口** —— 别的进程根本写不进去。
+所以在厂商节点里加了一个订阅者（`/chassis_relay`，`std_msgs/UInt8`）代为转发。
+
+改动以补丁形式存在本仓库：**`vendor-patches/chassis_relay_vendor.patch`**
+（纯新增 0 删除，可用 `git checkout` 撤销）。
+
+> ⚠ 补丁里有一个 **200ms 的定时器** `Relay_Hold_Timer`，它才是关键：本节点只在
+> `/cmd_vel` 到来时才发帧，而 STM32 的**链路看门狗** 800ms 收不到任何合法帧就把
+> 两个继电器都断开 —— 不加定时器的话，"停着不动时开着滚刷"会被看门狗自己关掉。
 
 ---
 
