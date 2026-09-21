@@ -242,8 +242,20 @@ def main():
 
     imu_st = stats(node.rows, COL_IMU, t_start, t_end)
     if imu_st:
-        print('  IMU wz 均值 %+.4f rad/s  (直行时应≈0; 明显非零 -> 陀螺零偏, '
-              '会被误当成跑偏)' % imu_st['mean'])
+        # ★ 均值是**零偏**, 标准差是**噪声** —— 这两个要分开看:
+        #   零偏会把直行积成一条弧线(可以扣), 噪声不会造成系统性偏差, 但会决定
+        #   滤波器该信它多少。厂商给 EKF 的 angular_velocity_covariance[8] 是
+        #   2.5e-3(标准差 0.05 rad/s); 实测行驶中陀螺尖峰能到 ±0.5 rad/s,
+        #   如果这里的标准差远大于 0.05, 说明 EKF 把这个噪声源信得太死了。
+        print('  IMU wz 均值 %+.4f rad/s (零偏; 直行时应≈0)'
+              % imu_st['mean'])
+        print('  IMU wz 标准差 %.4f rad/s (噪声; 厂商给 EKF 的是 0.05)'
+              % imu_st['std'])
+        print('    -> 按实测该填的协方差 = 标准差^2 = %.2e'
+              % (imu_st['std'] ** 2))
+        if imu_st['std'] > 0.10:
+            print('    ★ 噪声明显大于厂商假设的 0.05 -> EKF 把 IMU 信得太死,')
+            print('      而它的偏航权重还是轮速的 20 倍。值得按实测改协方差。')
 
     # ---- 2. 速度 ----
     print()
