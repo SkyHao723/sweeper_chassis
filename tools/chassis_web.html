@@ -44,6 +44,40 @@
   .pill{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;
         background:var(--card2);color:var(--dim)}
   .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+
+  /* ---- 运动控制 ---- */
+  .ctrlwrap{display:flex;gap:22px;flex-wrap:wrap;align-items:flex-start}
+  .pad{position:relative;width:230px;height:230px;background:var(--card2);
+       border:1px solid var(--line);border-radius:14px;touch-action:none;
+       cursor:crosshair;flex:none;overflow:hidden}
+  .pad.disabled{opacity:.35;cursor:not-allowed}
+  .pad .knob{position:absolute;width:46px;height:46px;border-radius:50%;
+             background:var(--accent);opacity:.9;left:50%;top:50%;
+             transform:translate(-50%,-50%);pointer-events:none;
+             transition:background .1s}
+  .pad.act .knob{background:var(--ok)}
+  .pad .ax{position:absolute;background:var(--line)}
+  .pad .ax.h{left:8px;right:8px;top:50%;height:1px}
+  .pad .ax.v{top:8px;bottom:8px;left:50%;width:1px}
+  .pad .lab{position:absolute;color:var(--dim);font-size:11px;pointer-events:none}
+  .pad .lab.u{top:5px;left:50%;transform:translateX(-50%)}
+  .pad .lab.d{bottom:5px;left:50%;transform:translateX(-50%)}
+  .pad .lab.l{left:7px;top:50%;transform:translateY(-50%)}
+  .pad .lab.r{right:7px;top:50%;transform:translateY(-50%)}
+  .ctrlside{flex:1;min-width:260px}
+  .ctrlrow{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+  .btn{border:1px solid var(--line);background:var(--card2);color:var(--fg);
+       padding:9px 16px;border-radius:8px;font-size:14px;cursor:pointer;font-weight:600}
+  .btn:hover{filter:brightness(1.15)}
+  .btn.arm{min-width:190px}
+  .btn.arm.on{background:var(--ok);color:#08211a;border-color:var(--ok)}
+  .btn.stop{background:#3a1f22;border-color:#6b2f34;color:#ffb3b3;min-width:150px}
+  .btn.stop:hover{background:#552a2f}
+  .ctrlside label{font-size:13px;color:var(--dim);min-width:150px}
+  input[type=range]{flex:1;min-width:130px;accent-color:var(--accent)}
+  .ctrlstat{font-size:13px;line-height:1.7;padding:9px 11px;border-radius:8px;
+            background:var(--card2);border:1px solid var(--line)}
+  .ctrlstat b{font-weight:600}
 </style>
 </head>
 <body>
@@ -55,6 +89,41 @@
 </header>
 
 <main>
+  <!-- ============ 运动控制 ============
+       设计要点: **摇杆必须按住才动**, 松手/移出/切标签页/按空格都会立刻发停车。
+       服务端另有一道 0.5s 心跳超时兜底, STM32 还有 800ms 看门狗 —— 三层。 -->
+  <div class="row">
+    <div class="card">
+      <h2>运动控制</h2>
+      <div class="ctrlwrap">
+        <div class="pad disabled" id="pad">
+          <div class="ax h"></div><div class="ax v"></div>
+          <div class="lab u">前</div><div class="lab d">后</div>
+          <div class="lab l">左</div><div class="lab r">右</div>
+          <div class="knob" id="knob"></div>
+        </div>
+        <div class="ctrlside">
+          <div class="ctrlrow">
+            <button class="btn arm" id="btnArm">使能（必须先点）</button>
+            <button class="btn stop" id="btnStop">急停 / 空格</button>
+          </div>
+          <div class="ctrlrow">
+            <label>最高前进 <span class="mono" id="lbVx">—</span> m/s</label>
+            <input type="range" id="slVx" min="0.10" max="0.35" step="0.05" value="0.25">
+          </div>
+          <div class="ctrlrow">
+            <label>最高转向 <span class="mono" id="lbWz">—</span> rad/s</label>
+            <input type="range" id="slWz" min="0.2" max="1.2" step="0.1" value="0.6">
+          </div>
+          <div class="ctrlstat" id="ctrlStat">读取中…</div>
+          <div class="sub" style="margin-top:8px">
+            键盘：<b>W/S</b> 前后 · <b>A/D</b> 左右转 · <b>空格</b> 急停（都要按住）。
+            松手、鼠标移出、切到别的标签页都会立刻停车。
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
   <!-- 这三个是首页主角: 达成率回答"车有没有照我说的做",
        航向差回答"EKF 到底有没有在纠偏" -->
   <div class="row hero">
@@ -369,6 +438,52 @@ async function tick() {
       "</td><td class='mono " + cls + "'>" + txt + "</td></tr>";
   }).join("");
 
+  /* ---- 运动控制状态 ---- */
+  const c = d.ctrl;
+  ctl.allow = c.allow;
+  ctl.vxMax = c.vx_max; ctl.wzMax = c.wz_max;
+  // 没在操作时以服务端为准(它才是权威); 正在操作时不覆盖, 免得来回抖
+  if (!ctl.down && !Object.keys(ctl.keys).length) ctl.armed = c.armed;
+
+  const armBtn = $("btnArm");
+  if (!c.allow) {
+    armBtn.disabled = true;
+    armBtn.textContent = "控制已禁用";
+    $("pad").classList.add("disabled");
+    $("ctrlStat").innerHTML = '服务端用 <span class="mono">--no-control</span> ' +
+      '启动, 这一版是纯监视, <b>不会发任何速度</b>。';
+  } else {
+    armBtn.disabled = false;
+    armBtn.classList.toggle("on", c.armed);
+    armBtn.textContent = c.armed ? "已使能 — 点击取消" : "使能（必须先点）";
+    $("pad").classList.toggle("disabled", !c.armed);
+
+    const slV = $("slVx"), slW = $("slWz");
+    slV.max = c.vx_max; slW.max = c.wz_max;      // 上限由服务端说了算
+    if (+slV.value > c.vx_max) slV.value = c.vx_max;
+    if (+slW.value > c.wz_max) slW.value = c.wz_max;
+    ctl.vxMax = +slV.value; ctl.wzMax = +slW.value;
+    $("lbVx").textContent = ctl.vxMax.toFixed(2);
+    $("lbWz").textContent = ctl.wzMax.toFixed(2);
+
+    const out = "实际发出 <b class='mono'>vx=" + c.out_vx.toFixed(3) +
+                "  wz=" + c.out_wz.toFixed(3) + "</b>";
+    const st = [];
+    if (!c.armed) st.push('<span class="dim">未使能</span>');
+    else if (c.live) st.push('<span class="ok">正在发布</span>');
+    else if (c.hb_age === null || c.hb_age > c.cmd_timeout)
+      st.push('<span class="bad">心跳超时 ' +
+        (c.hb_age === null ? "—" : c.hb_age.toFixed(2) + "s") + " → 已停车</span>");
+    else if (c.odom_age === null || c.odom_age > c.odom_max_age)
+      st.push('<span class="bad">看不到 /odom → 已停车</span>');
+    else st.push('<span class="warn">刹车补发中</span>');
+    st.push(out);
+    if (c.other_pub > 0)
+      st.push('<span class="bad">⚠ /cmd_vel 上还有 ' + c.other_pub +
+              ' 个别的发布者 (Nav2?), 你的操作会和它打架</span>');
+    $("ctrlStat").innerHTML = st.join("<br>");
+  }
+
   /* 曲线 */
   const P = (col) => h.map(r => [r[0], r[col]]).filter(p => p[1] !== null);
   lineChart($("cvVx"), [
@@ -390,6 +505,121 @@ async function tick() {
 window.addEventListener("resize", () => { for (const id of ["cvVx","cvWz","cvXY"]) {
   const c = $(id); c.width = 0;   // 逼它重算尺寸
 }});
+
+/* ================= 运动控制 =================
+   分两层状态, 别混:
+     halt()  = 停下来, **保持使能**(松手、松开按键用这个, 不然开车要一直重新点使能)
+     estop() = 停下来 + **撤销使能**(急停键、空格、切标签页、失焦用这个)
+   三层兜底: 本层立刻发停车 -> 服务端 0.5s 心跳超时自己发 0 -> STM32 800ms 看门狗 */
+const ctl = { armed:false, allow:true, vxMax:0.35, wzMax:1.2,
+              nx:0, ny:0, down:false, keys:{} };
+
+async function post(path, obj) {
+  try {
+    await fetch(path, { method:"POST", cache:"no-store",
+                        headers:{"Content-Type":"application/json"},
+                        body: JSON.stringify(obj || {}) });
+  } catch (e) { /* 闪断交给心跳超时兜底; 这里刷屏反而会盖住重要信息 */ }
+}
+
+const padRect = () => $("pad").getBoundingClientRect();
+function setKnob(nx, ny) {
+  $("knob").style.left = (50 + nx * 42) + "%";
+  $("knob").style.top  = (50 + ny * 42) + "%";
+}
+
+/* 键盘和摇杆取"绝对值更大"的那个, 免得两种输入互相抵消 */
+function wanted() {
+  let vx = -ctl.ny * ctl.vxMax, wz = -ctl.nx * ctl.wzMax;
+  const k = ctl.keys;
+  const kx = (k.a ? -1 : 0) + (k.d ? 1 : 0);
+  const ky = (k.w ? -1 : 0) + (k.s ? 1 : 0);
+  if (kx || ky) { vx = -ky * ctl.vxMax; wz = -kx * ctl.wzMax; }
+  return { vx: vx, wz: wz };
+}
+
+async function halt() {
+  ctl.nx = ctl.ny = 0; ctl.down = false; ctl.keys = {};
+  setKnob(0, 0);
+  $("pad").classList.remove("act");
+  if (ctl.armed) await post("/api/cmd", { vx:0, wz:0 });
+}
+async function estop() {
+  await halt();
+  ctl.armed = false;
+  await post("/api/stop", {});
+}
+
+async function toggleArm() {
+  if (!ctl.allow) return;
+  if (ctl.armed) { await estop(); return; }
+  try {
+    const r = await fetch("/api/arm", { method:"POST", cache:"no-store",
+      headers:{"Content-Type":"application/json"}, body:'{"on":true}' });
+    const j = await r.json();
+    ctl.armed = !!j.armed;
+  } catch (e) { /* 失败就当没使能 */ }
+}
+
+/* ---- 摇杆: 按住才动 ---- */
+const pad = $("pad");
+pad.addEventListener("pointerdown", e => {
+  if (!ctl.armed) return;
+  ctl.down = true;
+  try { pad.setPointerCapture(e.pointerId); } catch (e2) {}
+  pad.classList.add("act");
+  movePad(e);
+});
+pad.addEventListener("pointermove", e => { if (ctl.down) movePad(e); });
+["pointerup", "pointercancel", "pointerleave"].forEach(ev =>
+  pad.addEventListener(ev, () => { if (ctl.down) halt(); }));
+
+function movePad(e) {
+  const r = padRect();
+  let nx = (e.clientX - r.left - r.width / 2) / (r.width / 2);
+  let ny = (e.clientY - r.top - r.height / 2) / (r.height / 2);
+  const m = Math.hypot(nx, ny);
+  if (m > 1) { nx /= m; ny /= m; }        // 限制在圆内
+  ctl.nx = nx; ctl.ny = ny;
+  setKnob(nx, ny);
+}
+
+/* ---- 键盘 (都要按住) ---- */
+const KEYMAP = { w:"w", a:"a", s:"s", d:"d",
+                 arrowup:"w", arrowleft:"a", arrowdown:"s", arrowright:"d" };
+window.addEventListener("keydown", e => {
+  const t = (e.target.tagName || "").toLowerCase();
+  if (t === "input" || t === "textarea") return;   // 别抢滑块的键盘操作
+  if (e.code === "Space") { e.preventDefault(); estop(); return; }
+  const k = KEYMAP[(e.key || "").toLowerCase()];
+  if (!k) return;
+  e.preventDefault();
+  if (!ctl.armed) return;
+  ctl.keys[k] = true;
+});
+window.addEventListener("keyup", e => {
+  const k = KEYMAP[(e.key || "").toLowerCase()];
+  if (!k) return;
+  delete ctl.keys[k];
+  if (ctl.armed && !Object.keys(ctl.keys).length && !ctl.down) halt();
+});
+
+/* ---- 切走 / 失焦 / 关页面: 一律急停 ---- */
+document.addEventListener("visibilitychange", () => { if (document.hidden) estop(); });
+window.addEventListener("blur", estop);
+window.addEventListener("beforeunload", () => {
+  if (navigator.sendBeacon) navigator.sendBeacon("/api/stop");
+});
+
+$("btnArm").addEventListener("click", toggleArm);
+$("btnStop").addEventListener("click", estop);
+
+/* ---- 心跳 10Hz。只在"真的在操作"时发, 免得平时白刷 ----
+   服务端 0.5s 收不到就自己发 0 —— 所以浏览器崩了/网断了车也会停。 */
+setInterval(() => {
+  if (ctl.armed && (ctl.down || Object.keys(ctl.keys).length))
+    post("/api/cmd", wanted());
+}, 100);
 
 tick();
 setInterval(tick, 200);

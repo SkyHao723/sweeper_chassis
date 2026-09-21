@@ -6,16 +6,11 @@
     ssh 到车之后:  python3 ~/chassis_tools/chassis_web.py
     然后浏览器开:  http://192.168.5.17:8080
 
-================================ 两个刻意的取舍 ================================
+================================ 一个刻意的取舍 ==================================
 
-1. **只用标准库, 不装任何包。**
-   板子上没有 flask, 而装包要么走 apt 要么走 pip, 都可能和 ROS 的 python 环境
-   打架(这台车已经因为环境问题绕过好几次)。http.server + json 足够, 单文件就能跑。
-
-2. **只读, 网页不提供任何"发速度"的入口。**
-   这台车因为控制层的 bug 真失控过。一个能从浏览器点着走的东西, 要负责的是急停、
-   指令超时、权限、误触 —— 那是另一个东西, 不该混进"简单数据前端"里。想看数据
-   和想开车是两件事, 这一版只做前者。
+**只用标准库, 不装任何包。**
+板子上没有 flask, 而装包要么走 apt 要么走 pip, 都可能和 ROS 的 python 环境
+打架(这台车已经因为环境问题绕过好几次)。http.server + json 足够, 单文件就能跑。
 
 ================================ 为什么首页主角是那两个数 ======================
 
@@ -35,6 +30,35 @@
        由前端拿历史里的两列偏航自己减。
 
 所以它们不是"顺便显示", 而是页面上最大、最显眼的两块。
+
+================================ 关于运动控制 ==================================
+
+这个页面**能控车**, 但它是照"绝不允许出现'浏览器不发了车还在走'"来设计的。
+这台车因为控制层的 bug 真失控过一次, 而网页遥控最容易出的就是那一类问题
+(标签页切走、WiFi 断、手指离开、笔记本合盖)。
+
+所以:
+
+1. **服务端绝不替浏览器"保持"运动。** 浏览器必须以 10Hz 持续发心跳; 超过
+   CMD_TIMEOUT(0.5s) 没收到, 服务端立刻按停车处理。三条独立的兜底:
+     浏览器松手 -> 立刻发 0;
+     浏览器卡死/断网 -> 服务端 0.5s 超时 -> 0;
+     服务端也挂了 -> STM32 自己的 800ms 运动看门狗 -> 0。
+   三层都失效才可能出事, 而这个概率不用赌。
+
+2. **必须显式"使能"。** 默认禁止运动, 要点一下才能动; 丢失心跳会自动回到禁止。
+
+3. **限幅在服务端做, 不信浏览器。** vx/wz 都被夹住, 界面上改不了上限。
+
+4. **看不到车就不许动。** /odom 超过 ODOM_MAX_AGE(1s) 没更新, 一律停车 ——
+   底盘链路断了(CH340 掉线那种)时, 你的操作是没有反馈的, 那就别动。
+
+5. **不主动霸占 /cmd_vel。** 只在"使能 + 心跳新鲜"时发布; 松开时补发几帧零速
+   (STOP_BURST) 就闭嘴。否则本页面 20Hz 的零速会和 Nav2 抢 /cmd_vel, 车会一抖
+   一抖。同时页面会显示 /cmd_vel 上还有没有别的发布者。
+
+6. **只读了半天, 关键的两个数还是主角**: 你一边动, 一边就能看到达成率和航向差
+   怎么变 —— 这比单独一个遥控器有用得多。
 
 ================================ 关于诊断帧 ====================================
 
@@ -67,6 +91,19 @@ RATE_WINDOW = 5.0       # 频率统计窗口(秒)
 
 RANGE_TOPICS = ["/ultrasonic_data_" + c for c in "ABCDEF"]
 
+# ---- 运动控制的安全参数 (都写死在服务端, 界面上改不了) ----
+CMD_TIMEOUT = 0.5        # 浏览器这么久没发心跳 -> 立刻按停车处理
+ODOM_MAX_AGE = 1.0       # /odom 这么久没更新 -> 不许动 (底盘链路可能断了)
+CTRL_HZ = 20             # 发布 /cmd_vel 的频率
+STOP_BURST = 8           # 松开/失能时补发几帧零速再闭嘴 (8 帧 @20Hz = 0.4s)
+PUB_CHECK_EVERY = 1.0    # 多久查一次 /cmd_vel 上还有没有别的发布者
+VX_LIMIT_DEFAULT = 0.35  # m/s。实测工作包线 0.25~0.35 最好, >0.4 超速
+WZ_LIMIT_DEFAULT = 1.2   # rad/s
+
+# 版本标记。改控制逻辑时**顺手加一**, 这样"测试到底连的是哪份代码"一眼能看出来 ——
+# 曾经因为旧实例没杀干净, 测试连了旧代码, 报了一堆假 FAIL, 白查半天。
+BUILD_ID = "webctl-3"
+
 
 def yaw_of(q):
     """四元数 -> 偏航角(rad)。只在平面运动下用, 所以不用完整旋转矩阵。"""
@@ -76,12 +113,19 @@ def yaw_of(q):
 
 
 class Collector(Node):
-    """把 ROS 话题收成一坨给网页看的快照 + 一段滚动历史。"""
+    """把 ROS 话题收成一坨给网页看的快照 + 一段滚动历史, 顺便管运动控制。"""
 
-    def __init__(self):
+    def __init__(self, vx_max=VX_LIMIT_DEFAULT, wz_max=WZ_LIMIT_DEFAULT,
+                 allow_control=True, pub_topic="/cmd_vel"):
         super().__init__("chassis_web")
         self.lock = threading.Lock()
         self.t0 = time.time()
+        self.vx_max = float(vx_max)
+        self.wz_max = float(wz_max)
+        self.allow_control = bool(allow_control)
+        # --dry-run 时改发到别的主题: 限幅/超时/刹车补发这些逻辑能完整验证,
+        # 而真车一动不动。想安全地改控制代码, 这个开关很有用。
+        self.pub_topic = pub_topic
 
         # 频率统计: 话题 -> [计数, 窗口起点, Hz]
         self.rate = {}
@@ -99,6 +143,24 @@ class Collector(Node):
         }
         # 每收到一帧 /odom 就记一行, 让曲线上各条线时间轴严格对齐
         self.hist = collections.deque(maxlen=HIST_MAX)
+
+        # ---- 运动控制状态 ----
+        # ★ 浏览器只"表达意愿", 真正发布由本节点的定时器做 —— 这样 HTTP 线程和
+        #   rclpy 线程不会互相踩。所有字段都在 self.lock 下读写。
+        self.armed = False          # 必须显式使能
+        self.want_vx = 0.0          # 浏览器最近一次表达的意愿
+        self.want_wz = 0.0
+        self.cmd_rx_t = 0.0         # 最近一次收到心跳的时刻 (0 = 从没收到)
+        self.stop_burst = 0         # 还要补发几帧零速
+        self.was_live = False       # 上一拍是不是真在发布(用来检测"刚停下"这个边沿)
+        self.out_vx = 0.0           # 实际发出去的值 (给界面显示)
+        self.out_wz = 0.0
+        self.last_pub_live = False  # 上一次是不是真在发布(而不是沉默)
+        self.other_pub = 0          # /cmd_vel 上别的发布者数量
+        self._pub_check_t = 0.0
+
+        self.pub = self.create_publisher(Twist, self.pub_topic, 10)
+        self.create_timer(1.0 / CTRL_HZ, self._drive_tick)
 
         # 传感器数据用 sensor QoS (BEST_EFFORT) —— 厂商节点就是那样发的,
         # 用默认的 RELIABLE 会一个都收不到, 而且是静默收不到。
@@ -193,9 +255,103 @@ class Collector(Node):
                 else round(v, 3)
             self._tick(RANGE_TOPICS[i])
 
+    # ---------------- 运动控制 ----------------
+    # 分工: HTTP 线程只"表达意愿"(set_cmd/set_arm), 真正的发布只发生在
+    # _drive_tick 里。这样 rclpy 和 HTTP 两个线程不会互相踩, 而且所有安全判断
+    # 集中在一处, 不会散落到 HTTP 处理里被漏掉。
+    def set_arm(self, on):
+        with self.lock:
+            self.armed = bool(on) and self.allow_control
+            if not self.armed:
+                self.want_vx = 0.0
+                self.want_wz = 0.0
+                self.cmd_rx_t = 0.0
+            self.stop_burst = STOP_BURST
+        return self.armed
+
+    def set_cmd(self, vx, wz):
+        """浏览器的心跳+意愿。没使能就当没收到 —— 不报错, 因为超时和失能本来
+        就会让浏览器的请求落在空处, 那是正常现象, 不该刷一堆错误。"""
+        with self.lock:
+            if not (self.allow_control and self.armed):
+                return False
+            self.want_vx = float(vx)
+            self.want_wz = float(wz)
+            self.cmd_rx_t = time.time()
+            return True
+
+    def set_stop(self):
+        with self.lock:
+            self.want_vx = 0.0
+            self.want_wz = 0.0
+            self.armed = False
+            self.cmd_rx_t = 0.0
+            self.stop_burst = STOP_BURST
+
+    def _drive_tick(self):
+        """★ 唯一发布 /cmd_vel 的地方。三层兜底里的第二层就是这里。"""
+        now = time.time()
+        with self.lock:
+            armed = self.armed
+            hb_age = (now - self.cmd_rx_t) if self.cmd_rx_t else None
+            want_vx, want_wz = self.want_vx, self.want_wz
+            was_live = self.was_live
+
+            if (now - self._pub_check_t) >= PUB_CHECK_EVERY:
+                self._pub_check_t = now
+                try:
+                    # 自己也是一个发布者, 所以 >1 才叫"还有别人"
+                    self.other_pub = max(0,
+                        self.count_publishers(self.pub_topic) - 1)
+                except Exception:
+                    self.other_pub = 0
+
+        odom_age = self._age("/odom")
+        live = bool(armed and self.allow_control
+                    and hb_age is not None and hb_age <= CMD_TIMEOUT
+                    and odom_age is not None and odom_age <= ODOM_MAX_AGE)
+
+        with self.lock:
+            if live:
+                self.was_live = True
+            elif was_live:
+                # ★ 刚才还在发布、现在不能发了(超时 / 失能 / 看不到 odom) ——
+                #   必须**立刻补一段零速**。绝不能就这么沉默: 沉默的话 STM32 要等
+                #   它自己的 800ms 看门狗才停, 那 0.8 秒车还在按最后一条命令走。
+                #   这是死手设计里最容易漏的一条缝。
+                self.stop_burst = STOP_BURST
+                self.was_live = False
+
+            if live:
+                # 限幅在服务端做 —— 浏览器那边改了也不算数
+                vx = max(-self.vx_max, min(self.vx_max, want_vx))
+                wz = max(-self.wz_max, min(self.wz_max, want_wz))
+            elif self.stop_burst > 0:
+                self.stop_burst -= 1
+                vx = wz = 0.0
+            else:
+                # 既不活跃、刹车余量也发完了: **一个字都不发**。
+                # 否则本节点 20Hz 的零速会和 Nav2 抢 /cmd_vel, 车会一抖一抖。
+                self.out_vx = self.out_wz = 0.0
+                self.last_pub_live = False
+                return
+
+            self.out_vx, self.out_wz = float(vx), float(wz)
+            self.last_pub_live = live
+
+        # 发布放在锁外, 免得网络/中间件卡住时把 HTTP 线程也堵住
+        m = Twist()
+        m.linear.x = float(vx)
+        m.angular.z = float(wz)
+        try:
+            self.pub.publish(m)
+        except Exception:
+            pass
+
     # ---------------- 打包给网页 ----------------
     def payload(self):
         with self.lock:
+            now_hb = time.time()
             l = dict(self.latest)
             l["cmd_age"] = self._age("/cmd_vel")
             l["imu_age"] = self._age("/imu/data_raw")
@@ -206,6 +362,30 @@ class Collector(Node):
                      "/cmd_vel", "/PowerVoltage")}
             hist = list(self.hist)[-WINDOW:]
             n_total = len(self.hist)
+
+            ctrl = {
+                "allow": self.allow_control,     # 服务端是否允许控制(--no-control)
+                "armed": self.armed,
+                "want_vx": round(self.want_vx, 3),
+                "want_wz": round(self.want_wz, 3),
+                "out_vx": round(self.out_vx, 3),   # 实际发出去的
+                "out_wz": round(self.out_wz, 3),
+                "live": self.last_pub_live,        # 正在发布(而不是沉默)
+                "hb_age": None if not self.cmd_rx_t else round(now_hb - self.cmd_rx_t, 2),
+                "odom_age": self._age("/odom"),
+                "other_pub": self.other_pub,
+                "vx_max": self.vx_max,
+                "wz_max": self.wz_max,
+                "cmd_timeout": CMD_TIMEOUT,
+                "odom_max_age": ODOM_MAX_AGE,
+                # 这两个是为了能看出来"到底发生了什么": 刹车还剩几帧、上一拍在不在发。
+                # 顺带也是个版本标记 —— 测试脚本靠它确认自己连的是新代码而不是
+                # 某个没杀干净的旧实例(踩过: 旧实例占着端口, 新实例起不来,
+                # 测试连了旧代码还给出了一堆假 FAIL)。
+                "stop_burst": self.stop_burst,
+                "was_live": self.was_live,
+                "build": BUILD_ID,
+            }
 
         # 达成率: 只在命令足够大时算, 否则"0/0"没意义还会刷出一堆假数
         def ratio(meas, cmd, eps):
@@ -229,6 +409,7 @@ class Collector(Node):
             "ages": ages,
             "hist": hist,
             "hist_total": n_total,
+            "ctrl": ctrl,
             "range_names": [c for c in "ABCDEF"],
         }
 
@@ -270,6 +451,41 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass            # 默认每个请求都打一行, 5Hz 轮询会把终端刷爆
 
+    # ---------------- 控制接口 (只有这三个会改变车的行为) ----------------
+    def _json(self, obj):
+        self._send(200, json.dumps(obj).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def do_POST(self):
+        global NODE
+        p = urlparse(self.path).path
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b"{}"
+        try:
+            body = json.loads(raw.decode("utf-8") or "{}")
+        except Exception:
+            body = {}
+
+        if p == "/api/arm":
+            on = NODE.set_arm(bool(body.get("on")))
+            self._json({"ok": True, "armed": on})
+        elif p == "/api/cmd":
+            try:
+                vx = float(body.get("vx", 0.0))
+                wz = float(body.get("wz", 0.0))
+            except (TypeError, ValueError):
+                vx, wz = 0.0, 0.0
+            acc = NODE.set_cmd(vx, wz)
+            self._json({"ok": True, "accepted": acc})
+        elif p == "/api/stop":
+            NODE.set_stop()
+            self._json({"ok": True})
+        else:
+            self._send(404, b"not found", "text/plain; charset=utf-8")
+
 
 def main():
     global NODE, HTML_PATH
@@ -280,6 +496,17 @@ def main():
                     help="监听地址, 默认 0.0.0.0 也就是局域网都能访问")
     ap.add_argument("--html", default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "chassis_web.html"))
+    ap.add_argument("--vx-max", type=float, default=VX_LIMIT_DEFAULT,
+                    help="前进速度上限 m/s (默认 %.2f)。实测工作包线 0.25~0.35 "
+                         "最好, >0.4 会超速" % VX_LIMIT_DEFAULT)
+    ap.add_argument("--wz-max", type=float, default=WZ_LIMIT_DEFAULT,
+                    help="转向角速度上限 rad/s (默认 %.2f)" % WZ_LIMIT_DEFAULT)
+    ap.add_argument("--no-control", action="store_true",
+                    help="彻底关掉运动控制当纯监视用 —— 想只看看数据、"
+                         "绝对不给任何发速度的可能时用这个")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="把要发的速度发到 /cmd_vel_dryrun 而不是 /cmd_vel。"
+                         "用来安全地验限幅/超时/刹车补发 —— 逻辑全跑, 车不动")
     args = ap.parse_args()
 
     HTML_PATH = args.html
@@ -288,7 +515,9 @@ def main():
                  "(它应该和本脚本放在同一个目录里)" % HTML_PATH)
 
     rclpy.init()
-    NODE = Collector()
+    NODE = Collector(vx_max=args.vx_max, wz_max=args.wz_max,
+                     allow_control=not args.no_control,
+                     pub_topic="/cmd_vel_dryrun" if args.dry_run else "/cmd_vel")
 
     # rclpy 的 spin 必须在自己的线程里 —— 主线程留给 HTTP 服务。
     # 所有共享状态都用 NODE.lock 保护, 回调里不会碰 HTTP 的东西。
@@ -300,6 +529,15 @@ def main():
     print("  本机:     http://127.0.0.1:%d" % args.port)
     print("  局域网:   http://<本机IP>:%d   (这台车是 192.168.5.17)" % args.port)
     print("  界面文件: %s" % HTML_PATH)
+    if args.no_control:
+        print("  运动控制: **已关闭** (--no-control), 纯监视")
+    else:
+        print("  运动控制: 开启, 上限 vx=%.2f m/s  wz=%.2f rad/s" %
+              (args.vx_max, args.wz_max))
+        print("            必须在网页上显式使能才会动; 心跳断 %.1fs 自动停" %
+              CMD_TIMEOUT)
+        if args.dry_run:
+            print("            ★ dry-run: 速度发到 /cmd_vel_dryrun, 真车不会动")
     print("  Ctrl-C 退出")
     try:
         srv.serve_forever()
