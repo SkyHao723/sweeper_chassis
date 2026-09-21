@@ -15,6 +15,13 @@
 #     2. 数据探测要**连续失败 3 次(30 秒)才动手** —— 给 DDS 发现和节点 respawn
 #        留足时间
 #     3. 探测本身也放宽: 转 6 秒、阈值降到 >10 条
+#     4. **支持手动暂停**: 建一个 PAUSE_FILE 就跳过所有检查。
+#        台架调试必须这样 —— `decode_diag.py --drive` 要求先停掉 ROS 节点
+#        (串口是独占的), 而看门狗会把"节点进程没了"当成故障、每 10 秒把栈
+#        拉回来抢串口。实测踩到: 连着重启了 4 次, decode_diag 最后报
+#        "device disconnected or multiple access on port?" —— 数据是废的。
+#        用法: touch /tmp/chassis_watchdog.pause   (调试)
+#              rm    /tmp/chassis_watchdog.pause   (调完一定要删!)
 #
 # 为什么需要它: 这台车有两种"看起来上电了其实没数据"的故障, respawn 只能
 # 处理其中一种 ——
@@ -31,6 +38,7 @@
 CHECK_EVERY=10              # 每多少秒查一次
 FAILS_TO_RESTART=3          # 连续失败多少次才重启(=30 秒)
 LOG=/tmp/chassis_watchdog.log
+PAUSE_FILE=/tmp/chassis_watchdog.pause
 LAUNCH="ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py"
 
 # ★ 不要加 set -u —— ROS 的 setup.bash 内部引用未定义变量, 会被打断
@@ -60,13 +68,18 @@ sys.exit(0 if n[0] > 10 else 1)
 PYEOF
 }
 
-# 进程还在不在 —— 不依赖 DDS, 最可靠的判据。
+# 栈还完整吗 —— 不依赖 DDS, 最可靠的判据。
 # ★ 模式开头那个 / 不能省。不加的话 pgrep -f 会匹配到**任何**命令行里出现这串
 #   字的进程 —— 实测它匹配到了我自己那条 `pgrep -af wheeltec_robot_node` 的
 #   ssh 命令行。节点真死了却因为这种巧合被判定为"还活着", 看门狗就白装了。
 #   实际的命令行是 .../lib/turn_on_wheeltec_robot/wheeltec_robot_node, 带斜杠能对上。
-node_running() {
-    pgrep -f '/wheeltec_robot_node' > /dev/null 2>&1
+# ★ launch 和 node 两个都要查。只看 node 的话, launch 监督进程被杀掉之后不会
+#   察觉 —— 实测踩到: pkill 掉 ros2 launch 之后 wheeltec_robot_node 还活着,
+#   看门狗认为一切正常, 但这时 respawn 已经不工作了, 下一次崩溃就没人拉起。
+stack_running() {
+    pgrep -f '/wheeltec_robot_node' > /dev/null 2>&1 || return 1
+    pgrep -f 'ros2 launch turn_on_wheeltec_robot' > /dev/null 2>&1 || return 1
+    return 0
 }
 
 kill_all() {
@@ -91,10 +104,27 @@ log "看门狗启动 (每 ${CHECK_EVERY}s 查一次; 数据探测要连续失败
 
 fails=0
 last_beat=$(date +%s)
+paused=0
 while true; do
-    if ! node_running; then
-        # 进程都没了, 没什么好犹豫的
-        restart_stack "底盘节点进程不在了"
+    # 手动暂停: 台架调试时用 decode_diag 独占串口, 必须让看门狗闭嘴
+    if [ -f "$PAUSE_FILE" ]; then
+        if [ "$paused" -eq 0 ]; then
+            log "已暂停 (发现 $PAUSE_FILE) —— 期间不做任何检查和重启。调完记得删掉它"
+            paused=1
+        fi
+        fails=0
+        sleep $CHECK_EVERY
+        continue
+    fi
+    if [ "$paused" -eq 1 ]; then
+        log "已恢复 (暂停文件没了)"
+        paused=0
+        last_beat=$(date +%s)
+    fi
+
+    if ! stack_running; then
+        # 栈不完整(launch 或 node 缺了), 没什么好犹豫的
+        restart_stack "底盘栈不完整 (launch 或节点进程不在了)"
         fails=0
     elif odom_alive; then
         if [ "$fails" -gt 0 ]; then
@@ -114,7 +144,7 @@ while true; do
     # 死了。每 5 分钟记一条, 超过 5 分钟没动静就说明看门狗本身出问题了。
     now=$(date +%s)
     if [ $((now - last_beat)) -ge 300 ]; then
-        log "心跳: 正常 (节点进程在, /odom 在线)"
+        log "心跳: 正常 (launch 和节点都在, /odom 在线)"
         last_beat=$now
     fi
 

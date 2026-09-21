@@ -48,6 +48,7 @@
 """
 
 import argparse
+import os
 import struct
 import sys
 import threading
@@ -417,7 +418,12 @@ def open_stream(args):
     except ImportError:
         sys.exit("需要 pyserial: pip3 install pyserial  "
                  "(或者先用 --dump 存文件, 再用 -f 离线分析)")
-    sp = serial.Serial(args.port, args.baud, timeout=1)
+    # ★ write_timeout 不能省。CH340 在 USB 层掉线之后, 无超时的 write() 会一直
+    #   卡住 —— 而 halt() 里连发零速用的就是 write。实测踩到过: decode_diag 在
+    #   读线程报 SerialException 之后卡在 halt() 的 write 上, **进程僵了 19 分钟
+    #   不退出、还一直开着串口**, 于是后面所有测量都在"两个进程抢同一个 tty"的
+    #   状态下做的, 数据全废。诊断工具自己必须先保证不僵死。
+    sp = serial.Serial(args.port, args.baud, timeout=1, write_timeout=0.3)
     dump = open(args.dump, "wb") if args.dump else None
     return sp, dump
 
@@ -523,6 +529,14 @@ def main():
             stream.close()
         except Exception:
             pass
+
+        # ★ 最后一道保险: 不管上面哪一步卡住, 都强制退出。
+        #   诊断工具绝不允许僵在那里占着串口 —— 那会让后面所有测量都作废
+        #   (两个进程抢同一个 tty, 字节被随机分走), 而且极难察觉。
+        #   实测踩到过一次, 白测了一整轮。
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":

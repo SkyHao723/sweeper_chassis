@@ -26,6 +26,7 @@ angular_velocity.z 应该**为正**。
     python3 ~/chassis_tools/turn_truth.py -0.5 4     # 右转
 """
 import argparse
+import os
 import sys
 import time
 
@@ -120,6 +121,29 @@ def main():
         node.destroy_node()
         rclpy.shutdown()
         return 1
+
+    # --- ★ 污染自检 ---------------------------------------------------
+    # 如果 /cmd_vel 上除了本脚本还有别的发布者, 这次测量毫无意义 ——
+    # 底盘节点会同时收到两条互相冲突的速度命令, 谁后到听谁的, 结果是
+    # 一个随机混合的指令。实测踩到过: decode_diag.py --drive 的进程在报错
+    # 之后僵住不退出, 而它的发送线程一直在发 wz=+0.5, 于是"外环到底振不振"
+    # 根本没法定论, 白追一轮。
+    # 宁可在这里挡住, 也不要拿着一堆看着像模像样的假数据去下结论。
+    t_disc = time.time()
+    while time.time() - t_disc < 2.0:
+        rclpy.spin_once(node, timeout_sec=0.1)
+    n_pub = node.count_publishers('/cmd_vel')
+    if n_pub > 1:
+        print()
+        print('!! /cmd_vel 上有 %d 个发布者 —— 除了本脚本还有别人在发速度。' % n_pub)
+        print('   这样测出来的东西没有意义, 已中止。先找出是谁:')
+        print('     ps -eo pid,etimes,cmd | grep -E "decode_diag|turn_truth|chassis_check" \\')
+        print('         | grep -v grep')
+        print('   僵死的直接 kill -9 <pid>。注意: 卡住的进程可能还开着串口,')
+        print('   两个进程读同一个 tty 会随机分走字节, 那样连里程计都不可信。')
+        node.destroy_node()
+        rclpy.shutdown()
+        return 2
 
     # 先空转 1 秒, 把静止时的基线收进去
     for _ in range(20):
@@ -218,7 +242,12 @@ def main():
 
     node.destroy_node()
     rclpy.shutdown()
-    return 0
+
+    # ★ 强制退出。rclpy/DDS 的关闭偶尔会卡住, 而一个卡住的进程会一直占着
+    #   DDS 资源和订阅 —— 更糟的是如果它还在发 /cmd_vel, 后面的测量就全废。
+    #   一次性诊断脚本不值得为"优雅关闭"冒这个风险。
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == '__main__':

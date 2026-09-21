@@ -18,6 +18,7 @@
 
 import argparse
 import math
+import os
 import sys
 import time
 
@@ -107,6 +108,29 @@ class ChassisCheck(object):
                 print("  等 /odom ... 已等 %.0f 秒 (底盘节点在不在跑? 串口在不在?)"
                       % (time.monotonic() - t0))
         return self.cur is not None
+
+    def check_cmd_vel_exclusive(self):
+        """★ 污染自检: /cmd_vel 上除了本脚本还有别的发布者就中止。
+
+        底盘节点会同时收到多条速度命令, 谁后到听谁的 —— 于是测出来的是一个
+        随机混合的指令, 但数据看着像模像样, 极难察觉。实测踩到过:
+        decode_diag.py --drive 的进程在读线程报错后僵住不退出, 而它的发送
+        线程一直在发 wz=+0.5, 于是"外环到底振不振"根本没法定论, 白追一轮。
+        宁可在这里挡住, 也不要拿假数据去下结论。
+        """
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 2.0:
+            rclpy.spin_once(self.node, timeout_sec=0.1)
+        n = self.node.count_publishers("/cmd_vel")
+        if n > 1:
+            print("!! /cmd_vel 上有 %d 个发布者 —— 还有别人在发速度, 数据不可信。"
+                  % n)
+            print("   先查是谁: ps -eo pid,etimes,cmd | grep -E "
+                  "'decode_diag|turn_truth|chassis_check' | grep -v grep")
+            print("   僵死的直接 kill -9。注意卡住的进程可能还开着串口,")
+            print("   两个进程读同一个 tty 会随机分走字节, 那样里程计也不可信。")
+            return False
+        return True
 
     def run_to_distance(self, vx, target_m, timeout_s=40.0):
         """往前开, 直到 /odom 报的位移达到 target_m 就停。
@@ -376,6 +400,8 @@ def main():
     chk = ChassisCheck(node)
     try:
         chk.wait_for_odom()        # 先确保 /odom 有数据(节点可能正在 respawn)
+        if not chk.check_cmd_vel_exclusive():
+            return                 # 有别的发布者, 测了也是废数据
         chk.run(cases)
     except KeyboardInterrupt:
         pass
@@ -384,6 +410,10 @@ def main():
         print("\n已发零速停车。")
         node.destroy_node()
         rclpy.shutdown()
+
+    # ★ 强制退出: rclpy/DDS 的关闭偶尔会卡住, 卡住的进程会一直占着资源,
+    #   更糟的是如果它还在发 /cmd_vel, 后面的测量就全废了。
+    os._exit(0)
 
 
 if __name__ == "__main__":

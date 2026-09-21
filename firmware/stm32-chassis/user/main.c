@@ -229,33 +229,62 @@
 /*------------------- 轮速闭环修正 (外环 trim) ----------------------
  * 为什么需要:
  *   驱动器自己的速度环在小误差下给出的电流不足以快速突破静摩擦。实测原地
- *   转(2026-09): 第 0 秒只有目标的 1%~26% —— **即使目标高达 43 RPM 也一样**;
- *   第 2 秒又过冲到 120%; 稳态则散在 85%~115%; 左右两轮还不一样。
- *   而直线运动 0.07 秒就到 80%, 同一个轮速区间表现完全不同, 所以这不是
- *   驱动器低速死区, 是原地转要克服轮胎刮擦/静摩擦。既然轮子是真的没转
- *   (不是空转打滑), 那就把指令顶上去, 直到它真的转。
+ *   转: 第 0 秒只有目标的 1%~26% —— **即使目标高达 43 RPM 也一样**; 而直线
+ *   运动 0.07 秒就到 80%。同一个轮速区间表现差这么多, 所以这不是驱动器低速
+ *   死区, 是原地转要克服轮胎刮擦/静摩擦。轮子是真的没转(不是空转打滑),
+ *   所以把指令顶上去它就会转。
  *   STM32 这边原来是**纯开环**: 算完目标轮速直接发, 从不回读实际转速。
  *
- * 做法: 只含积分的慢外环, 按驱动器回传的实际转速修目标值。
- *   不做比例项 —— 比例项等于把驱动器那个环照抄一遍, 两个快环叠在一起容易
- *   互相激振; 积分只修偏差的平均值, 不介入快速动态, 风险最低。
- *   也不需要额外低通滤波器: 驱动器低速回码本身在抖, 而积分天然就是在取平均,
- *   再加一级低通只会白白引入相位滞后。
+ * ★ 第一版的教训 (已实测, 别重犯)
+ *   第一版是"纯积分 + 绝对限幅 ±30 RPM + KI=1.5"。原地转的四秒总角度确实从
+ *   41%~82% 提到了 85%~93%, 稳态也从 115% 回到了 101% —— 但代价是:
+ *
+ *   1. **绝对限幅在小名义值下会把指令顶成反向。** 原地转 wz=0.30 的名义轮速
+ *      只有 13 RPM, 而修正量能到 -30, 于是 指令 = 13-30 = **-17 (轮子反转)**,
+ *      车直接停住。直线 0.15 m/s (13.9 RPM) 更明显: 车中途往回走, 于是
+ *      chassis_check 报出"后 40% 有 92% 但全程只有 26%"这种自相矛盾的数据。
+ *      一个"修正"把自己修成了故障。
+ *   2. **KI=1.5 太快, 和驱动器那个环组成慢速极限环。** 逐秒角速率变成
+ *      过冲→塌陷→再爬: wz=1.00 是 0.43/1.73/0.90/0.54 (第 1 秒 173%)。
+ *      积分增益和"被控对象滞后"的乘积大于 1 就会这样。
+ *   3. 原注释里"输出永远落在普通全速命令能到的范围内"是**错的** ——
+ *      MAX_RPM 是 200, 而 ±30 的绝对限幅在名义值 13 时已经把指令推到 2~3 倍。
+ *
+ * 第二版(现在)的三条改动, 逐条对症:
+ *   a. **限幅改成按名义值的比例**(TRIM_UP_K / TRIM_DOWN_K), 不用绝对值。
+ *      这样每种速度下行为一致, 而且反向最多只能减到名义值的一半 ——
+ *      **修正量在任何情况下都不可能把指令的方向改掉**, 反转从机制上被消除。
+ *   b. **KI 降到 0.6**, 让它只修稳态偏差, 不去和驱动器那个环抢动态。
+ *   c. **起步助推 (kick) 单独做**, 见 KICK_*。突破静摩擦需要的是"立刻给力",
+ *      而积分天生要"等误差攒起来"。把积分调快到能立刻给力, 它就会在轮子追上
+ *      来之后迟迟不回, 造成上面那种过冲和振荡。两件事分开: 积分慢而稳只管
+ *      稳态, 助推开环/定时/有界只管起步这一下 —— 开环所以不会构成第二个
+ *      反馈回路, 也就不会振。
  *
  * 安全性(按"绝不引入新的失控模式"设计):
- *   1. 修正量硬限幅 ±TRIM_MAX_RPM, 最后整体再限到 ±MAX_RPM —— 输出永远落在
- *      "普通全速命令"能到的范围内, 到不了开环命令到不了的转速。
- *   2. 目标为 0(停车/刹车/单轮不动)时修正量立即清零, 不留历史, 否则下次
- *      起步会带着上次攒的修正猛地一下冲出去。
- *   3. 驱动器回码不新鲜时不积分(只保持) —— 拿掉线后的旧数据积分会把修正量
- *      一路喂到限幅。
+ *   1. 修正量按比例限幅(正向最多 +TRIM_UP_K 倍名义值, 反向最多 -TRIM_DOWN_K 倍),
+ *      再受 TRIM_MAX_RPM 约束; 输出另受 MAX_RPM 约束。**净效果: 指令永远落在
+ *      [1-TRIM_DOWN_K, 1+TRIM_UP_K] 倍名义值之内, 方向不变。**
+ *   2. 目标为 0(停车/刹车/单轮不动)时修正量和助推一起清零, 不留历史。
+ *   3. 驱动器回码不新鲜时不积分(只保持) —— 拿旧数据积分会把修正量喂到限幅。
  *   4. 修正量可从诊断帧推出(上报的"目标"是修正后的最终命令, 减去主机下发的
  *      理论目标就是修正量), 它有没有在乱冲一看便知。
  *=================================================================*/
 #define TRIM_ENABLE        1
-#define TRIM_KI            1.5f     /* 每秒、每 1 RPM 偏差攒多少 RPM 修正 */
-#define TRIM_MAX_RPM       30.0f    /* 单轮修正量上限 (RPM) */
-#define TRIM_DEADBAND_RPM  0.5f     /* 目标小于这个就当"不该动", 修正清零 */
+#define TRIM_KI            0.6f     /* 每秒、每 1 RPM 偏差攒多少 RPM 修正 */
+#define TRIM_UP_K          0.5f     /* 正向修正最多 +50% 名义值 */
+#define TRIM_DOWN_K        0.5f     /* 反向修正最多 -50% 名义值 -> 永不反转 */
+#define TRIM_MAX_RPM       20.0f    /* 绝对上限, 防高名义值下修正量过大 */
+#define TRIM_DEADBAND_RPM  0.5f     /* 目标小于这个就当"不该动", 全部清零 */
+
+/* 起步助推: 目标从"不动"变成"要动"的瞬间, 额外给一段固定时长的速度。
+ * 专门用来突破静摩擦 —— 这是积分做不好也不该做的事(见上面第 c 条)。
+ * 幅度取固定值而不是按名义值缩放: 要突破的是**摩擦力矩**, 它和你要跑多快
+ * 没关系, 所以固定的一脚在低速档反而相对更有力, 正是需要的。
+ * 想 A/B 就把 KICK_RPM 改成 0。 */
+#define KICK_RPM           12.0f    /* 助推幅度 (RPM) */
+#define KICK_MS            400      /* 助推时长 */
+#define KICK_REARM_MS      300      /* 目标归零后要静止这么久才允许再次助推 */
 
 /*-------------------------- IMU --------------------------------*/
 /* IMU 读一次大概 1~3ms(位翻转 I2C), 和轮速一起按 ODOM_PERIOD_MS 采样。
@@ -325,8 +354,18 @@ static int16_t  wheel_left_rpm, wheel_right_rpm;   /* 已按接线校准的物�
 static uint8_t  wheel_left_fresh, wheel_right_fresh; /* 该轮回码是否新鲜 */
 static float    body_vx, body_wz;                  /* 轮速正解出的车体速度 */
 
-/* 外环修正量 (RPM, 物理轮速域) —— 见 TRIM_* 的说明 */
-static float    trim_l, trim_r;
+/* 外环修正状态 (物理轮速域, 左右各一份) —— 见 TRIM_* 的说明 */
+typedef struct
+{
+    float    trim;          /* 积分修正量, RPM */
+    uint32_t kick_until;    /* 起步助推的截止时刻 */
+    uint32_t zero_since;    /* 目标从何时起为 0 (0 = 还没开始记) */
+    uint8_t  armed;         /* 助推是否已武装 (1 = 下次目标非零时助推) */
+} wheel_trim_t;
+
+static wheel_trim_t trim_w[2];      /* [0] = 左轮, [1] = 右轮 */
+#define TRIM_IDX_LEFT   0
+#define TRIM_IDX_RIGHT  1
 
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
@@ -903,52 +942,101 @@ static void Wheel_Update(void)
 
 /*========================= 轮速外环修正 ============================
  * 按实际轮速修目标轮速, 返回真正要发给驱动器的转速。
- * 只含积分 —— 为什么不做比例项、为什么安全, 见 TRIM_* 上面那段。
+ * 两部分: 慢积分修稳态偏差 + 定时助推破静摩擦。
+ * 为什么这么分、第一版错在哪, 见上面 TRIM_* / KICK_* 那一大段。
  *
- * 注意 nominal 是主机下发的理论物理轮速, actual 是驱动器回传的实际物理轮速,
- * 两者都在物理轮速域(已按接线校准), 所以可以直接相减。
+ * nominal / actual 都在物理轮速域(已按接线校准), 可以直接相减。
+ *★ 输出保证: 落在 [1-TRIM_DOWN_K, 1+TRIM_UP_K] 倍名义值之内(助推另加),
+ *  且**方向永远和名义值一致** —— 修正不可能把车修成倒着走。
  *=================================================================*/
-static float Trim_Apply(float nominal, float actual, uint8_t fresh,
-                        float dt, float *trim)
+static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
+                        uint8_t fresh, float dt)
 {
     float out;
+    float kick = 0.0f;
 
 #if TRIM_ENABLE
-    /* 不该动的时候立刻清零, 不留历史 */
-    if ((nominal > -TRIM_DEADBAND_RPM) && (nominal < TRIM_DEADBAND_RPM))
+    float mag;
+    float up;
+    float dn;
+
+    mag = fabsf(nominal);
+
+    /*---- 不该动: 修正、助推、计时全部清零, 不留任何历史 ----*/
+    if (mag < TRIM_DEADBAND_RPM)
     {
-        *trim = 0.0f;
+        w->trim = 0.0f;
+        w->kick_until = 0;
+
+        /* 静止够久才重新武装助推。没这一条的话, 目标在 0 附近抖动
+           (比如主机反复发 0.001 m/s) 会不停触发助推, 车一窜一窜的。 */
+        if (w->armed == 0)
+        {
+            if (w->zero_since == 0)
+            {
+                w->zero_since = g_tick_ms;
+            }
+            else if ((g_tick_ms - w->zero_since) >= KICK_REARM_MS)
+            {
+                w->armed = 1;
+                w->zero_since = 0;
+            }
+        }
         return 0.0f;
     }
 
-    /* 回码不新鲜就不积分, 只保持当前值 */
+    /*---- 目标从"不动"变成"要动": 起一次助推 ----*/
+    if (w->armed)
+    {
+        w->armed = 0;
+        w->zero_since = 0;
+        w->kick_until = g_tick_ms + KICK_MS;
+    }
+    if ((int32_t)(g_tick_ms - w->kick_until) < 0)
+    {
+        kick = KICK_RPM;
+    }
+
+    /*---- 慢积分: 只修稳态偏差。回码不新鲜就只保持, 不积分 ----*/
     if (fresh)
     {
-        *trim += TRIM_KI * (nominal - actual) * dt;
-        if (*trim >  TRIM_MAX_RPM) *trim =  TRIM_MAX_RPM;
-        if (*trim < -TRIM_MAX_RPM) *trim = -TRIM_MAX_RPM;
+        w->trim += TRIM_KI * (nominal - actual) * dt;
     }
 
-    out = nominal + *trim;
+    /*---- 限幅: 按名义值的比例, 不用绝对值 ----
+       反向最多 -TRIM_DOWN_K 倍名义值, 所以指令的正负号永远不变。
+       第一版用的是绝对 ±30 RPM, 在名义值只有 13 RPM 的原地转上把指令
+       顶成了 13-30 = -17, 轮子反转、车停住 —— 比例限幅从机制上消除它。 */
+    up = mag * TRIM_UP_K;
+    dn = mag * TRIM_DOWN_K;
+    if (up > TRIM_MAX_RPM) up = TRIM_MAX_RPM;
+    if (dn > TRIM_MAX_RPM) dn = TRIM_MAX_RPM;
+    if (w->trim >  up) w->trim =  up;
+    if (w->trim < -dn) w->trim = -dn;
 
-    /* 抗积分饱和: 输出顶到 MAX_RPM 时把修正量收回, 让它刚好不超 */
-    if (out > (float)MAX_RPM)
+    out = nominal + w->trim;
+
+    /* 助推按名义方向叠加 */
+    if (kick > 0.0f)
     {
-        out = (float)MAX_RPM;
-        *trim = out - nominal;
-    }
-    else if (out < -(float)MAX_RPM)
-    {
-        out = -(float)MAX_RPM;
-        *trim = out - nominal;
+        out += (nominal > 0.0f) ? kick : -kick;
     }
 #else
     (void)actual;
     (void)fresh;
     (void)dt;
-    *trim = 0.0f;
+    w->trim = 0.0f;
+    w->kick_until = 0;
     out = nominal;
 #endif
+
+    out = ClampF(out, -(float)MAX_RPM, (float)MAX_RPM);
+
+    /* ★ 最后一道保险: 修正 + 助推绝不允许把指令的方向改掉。
+       名义为正就保证输出 >= 0, 名义为负就保证输出 <= 0。
+       即使上面的限幅哪天被人改错了, 这一条也能兜住。 */
+    if ((nominal > 0.0f) && (out < 0.0f)) out = 0.0f;
+    if ((nominal < 0.0f) && (out > 0.0f)) out = 0.0f;
 
     return out;
 }
@@ -983,10 +1071,13 @@ static void Drive_Apply(void)
 
     /* 外环修正: 用实际轮速去修目标轮速。原地转起步时轮子是真的没转, 这里会把
        指令顶上去直到它真的转; 稳态偏高时又会把指令压回来。
-       ★ 目标为 0 时 Trim_Apply 恒定返回 0, 所以外环**不可能**在主机下令停车
-         的时候把车带着走 —— 这是这套做法敢上车的底线。 */
-    cmd_l = Trim_Apply(rpm_l, (float)wheel_left_rpm,  wheel_left_fresh,  dt, &trim_l);
-    cmd_r = Trim_Apply(rpm_r, (float)wheel_right_rpm, wheel_right_fresh, dt, &trim_r);
+       ★ 目标为 0 时 Trim_Apply 恒定返回 0, 而且它保证输出方向和名义值一致,
+         所以外环**不可能**在主机下令停车的时候把车带着走, 也不可能把某个轮子
+         修成倒转 —— 这是这套做法敢上车的底线。 */
+    cmd_l = Trim_Apply(&trim_w[TRIM_IDX_LEFT], rpm_l,
+                       (float)wheel_left_rpm, wheel_left_fresh, dt);
+    cmd_r = Trim_Apply(&trim_w[TRIM_IDX_RIGHT], rpm_r,
+                       (float)wheel_right_rpm, wheel_right_fresh, dt);
 
     /* 物理轮速 -> CAN 命令 (反向应用接线校准) */
     if (MOTOR1_IS_LEFT) { m1 = (int16_t)cmd_l; m2 = (int16_t)cmd_r; }
