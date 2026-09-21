@@ -18,6 +18,7 @@ Listings/
 *.sct
 *.iex
 *.build_log.htm
+build.log
 JLinkLog.txt
 JLinkSettings.ini
 
