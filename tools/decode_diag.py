@@ -301,14 +301,17 @@ class Diag(object):
             g = " gyro=(%+d,%+d,%+d)=%.3f,%.3f,%.3frad/s" % (
                 gyro[0], gyro[1], gyro[2],
                 gyro[0] * GYRO_RATIO, gyro[1] * GYRO_RATIO, gyro[2] * GYRO_RATIO)
-        # 上报的"目标"是含外环修正的最终命令; 知道主机下发的理论目标就能把它
-        # 还原出来。只在非零时显示, 免得占地方。
+        # 上报的"目标"是含外环修正**和起步助推**的最终命令。
+        # ★ 这里显示的是 目标 - 主机理论目标, 也就是"修正 + 助推"的合计,
+        #   不是积分的修正量本身。实测踩过: 看到 "+13" 以为积分已经顶到
+        #   比例限幅(±13.95)了, 其实其中 12 是助推, 积分只剩 1 —— 判断完全
+        #   反了。想分开看只能改协议(诊断帧没有空余字节), 暂时按合计显示。
         trim = ""
         if nom is not None:
             dl = int(round(self.tl - nom[0]))
             dr = int(round(self.tr - nom[1]))
             if dl or dr:
-                trim = " 外环修正%+d/%+d" % (dl, dr)
+                trim = " 目标-理论%+d/%+d(含助推)" % (dl, dr)
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
