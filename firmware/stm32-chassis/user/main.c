@@ -89,7 +89,7 @@
  *   别的位置 1, 就说明模块其它功能块是活的, 问题只在陀螺仪这一块;
  *   同时 [32-33] 的偏航角还能当角速度的替代来源(对时间求导)。
  *
- *   为什么把驱动器的电流/故� ��码单独报出来: 目标转速和实际转速对不上时,
+ *   为什么把驱动器的电流/故障码单独报出来: 目标转速和实际转速对不上时,
  *   看电流就能分清是"驱动器根本没给力"(电流≈0, 多半是故障或没使能)还是
  *   "给了力但被堵住/拖住"(电流很大) —— 这是判断轮子没劲唯一的客观依据。
  *========================================================================*/
@@ -236,7 +236,7 @@
  */
 #define IMU_ACCEL_G_TO_RAW  (9.80665f * 1671.84f)   /* g      -> ±2g   原始值 */
 #define IMU_GYRO_TO_RAW     (1.0f / 0.00026644f)    /* rad/s  -> ±500dps 原始值 */
-#define IMU_GYRO_Z_SIGN     1       /* 陀螺 Z 方向和车体逆时针不一致时改成 -1 */
+#define IMU_GYRO_Z_SIGN     1       /* 陀螺 Z 轴方向; 见下面 IMU_Tick 里的用法 */
 
 /*=========================== 全局状态 ==============================*/
 volatile uint32_t g_tick_ms;
@@ -346,6 +346,33 @@ void TIM2_IRQHandler(void)
         TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
         g_tick_ms++;
     }
+}
+
+/*======================= 独立看门狗 (IWDG) =========================
+ * ★ 为什么必须有它: 原来只有"软件看门狗" —— 在主循环里检查上位机多久没发
+ *   命令。**但它本身也在主循环里**: 一旦主循环卡住(比如某处死等), 软件看门狗
+ *   也跟着停, STM32 就再也不发 CAN 命令了。
+ *
+ *   而 FOC 驱动器**没有命令超时** —— 它会一直执行最后收到的那条命令。
+ *   于是最坏情况是: 主循环卡死 -> STM32 静默 -> 驱动器保持最后的速度
+ *   -> **车自己开走**。
+ *
+ *   IWDG 用的是芯片内部独立的 40kHz LSI(不受主时钟影响), 主循环卡住超过
+ *   超时时间就强制复位 MCU。复位后 main() 会在 CAN 初始化完的第一时间发
+ *   刹车帧, 车就停下了。
+ *
+ *   超时 = 预分频 / LSI * 重装值 = 64 / 40000 * 625 = 1.0 秒。
+ *   (LSI 实际在 30~60kHz 之间飘, 所以真实超时约 0.67~1.33 秒, 够用。)
+ *
+ *   IWDG 一旦使能就**关不掉**, 只能靠复位。所以初始化放在这里、喂狗放主循环。
+ *=================================================================*/
+static void IWDG_Init(void)
+{
+    IWDG_WriteAccessCmd(IWDG_WriteAccess_Enable);
+    IWDG_SetPrescaler(IWDG_Prescaler_64);   /* 40kHz / 64 = 625Hz */
+    IWDG_SetReload(625);                    /* 625 / 625Hz = 1 秒 */
+    IWDG_ReloadCounter();
+    IWDG_Enable();
 }
 
 /*============================= CAN1 ================================*/
@@ -531,11 +558,24 @@ void USART1_IRQHandler(void)
     Port_Isr(&ports[PORT_MAIN]);
 }
 
+#define USART_TX_TIMEOUT    20000   /* 等 TXE 的最多循环次数, 见 Port_SendByte */
+
 static void Port_SendByte(uart_port_t *p, uint8_t value)
 {
-    while (USART_GetFlagStatus(p->usart, USART_FLAG_TXE) == RESET)
+    uint32_t timeout = USART_TX_TIMEOUT;
+
+    /* ★ 必须有超时。原来是 `while (TXE == RESET) {}` 死等 —— 万一 USART 出
+       状态问题(时钟被关、寄存器异常), 这里会**永久卡住**。而软件看门狗就在
+       主循环里, 会跟着一起死: STM32 不再发 CAN 命令, 但**驱动器没有命令超时,
+       会一直执行最后一条命令 -> 车自己开走**。
+       加了 IWDG 之后最坏也就是被复位, 但明确超时更干净:
+       丢一帧遥测无所谓, 卡死是要命的。
+       115200 下发一个字节只要约 87us, 20000 次循环 > 5ms, 余量足够。 */
+    while ((USART_GetFlagStatus(p->usart, USART_FLAG_TXE) == RESET) &&
+           (--timeout != 0))
     {
     }
+    if (timeout == 0) return;           /* 发不出去就放弃这一字节 */
     USART_SendData(p->usart, value);
 }
 
@@ -878,7 +918,13 @@ static void IMU_Tick(void)
         imu_accel_g[2] = accel[2];
         imu_gyro[0] = gyro[0];
         imu_gyro[1] = gyro[1];
-        imu_gyro[2] = gyro[2];
+        /* ★ Z 轴方向在这里生效。IMU_GYRO_Z_SIGN 以前是个死宏(只定义没使用),
+           现在接回来了 —— 否则万一陀螺仪 Z 装反了, 上位机 EKF 会拿它去
+           "纠正"轮速, 越纠越偏, 而且没有任何可调的地方。
+           验证方法: 把车从上方看**逆时针**转(左转),
+           `ros2 topic echo /imu/data_raw --field angular_velocity`
+           的 z 应该是**正的**。反了就把它改成 -1。 */
+        imu_gyro[2] = gyro[2] * (float)IMU_GYRO_Z_SIGN;
 
         /* 静止时模块会把角速度输出归零, 那是正常行为, 不是故障。
            所以"读数是否为零"判断不了陀螺仪死活 —— 这里改成记录
@@ -899,21 +945,36 @@ static void IMU_Tick(void)
         imu_gyro_ok = 0;
         imu_status = err;
 
-        /* 失败了才诊断, 而且不要每次都跑(扫描很慢) */
+        /* 失败了才诊断, 而且不要每次都跑。
+         *
+         * ★ 而且**只在车停着的时候诊断**。原因: 地址扫描要遍历 0x08~0x77
+         *   共 112 个地址, 位翻转 I2C 全程要 100~150ms —— 这段时间主循环被
+         *   堵住, CAN 命令发不出去, 车会一顿一顿的。诊断是给"停车排查"用的,
+         *   行驶中不需要, 更不该干扰控制。
+         *   (现在 IMU 正常所以看不出来; 但一旦 IMU 坏了, 诊断本身就会变成
+         *    一个新的故障源 —— 这种"为了查问题而制造问题"的坑踩过。) */
         if ((g_tick_ms - imu_diag_ms) >= IMU_DIAG_PERIOD_MS)
         {
-            uint8_t bus = YbImu_BusCheck();
-            imu_diag_ms = g_tick_ms;
-
-            if (bus != YBIMU_ST_OK)
+            if ((target_vx == 0.0f) && (target_wz == 0.0f))
             {
-                imu_status = bus;               /* 总线本身就不对 */
-                imu_found_addr = 0;
+                uint8_t bus = YbImu_BusCheck();
+                imu_diag_ms = g_tick_ms;
+
+                if (bus != YBIMU_ST_OK)
+                {
+                    imu_status = bus;               /* 总线本身就不对 */
+                    imu_found_addr = 0;
+                }
+                else
+                {
+                    imu_found_addr = YbImu_Scan();  /* 总线是好的, 那就是地址/器件问题 */
+                    imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
+                }
             }
             else
             {
-                imu_found_addr = YbImu_Scan();  /* 总线是好的, 那就是地址/器件问题 */
-                imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK : YBIMU_ST_READ_ERR;
+                /* 在动, 只记录"读失败", 等停下来再做重诊断 */
+                imu_diag_ms = g_tick_ms - IMU_DIAG_PERIOD_MS + 100;
             }
         }
     }
@@ -1063,13 +1124,29 @@ int main(void)
 {
     Tick_Init();
     CAN1_Init();
+
+    /* ★ CAN 一通就立刻刹车, 一毫秒都别等。
+       看门狗复位时驱动器还在执行上一条命令, 每多等一毫秒车就多冲一点。
+       以前这里是先 Delay_ms(200) 再刹车 —— 那个延时大概是等驱动器上电就绪
+       用的, 但对"MCU 软件复位"这种情况毫无必要: 驱动器本来就是活的,
+       帧发过去立刻生效。 */
+    CAN1_SendStop(MOTOR1_CAN_ID);
+    CAN1_SendStop(MOTOR2_CAN_ID);
+
     USART1_Init();          /* PA9/PA10 -> CH340 / RK3588, 唯一的上位机口 */
     Relay_Init();
+
+    /* 独立看门狗。放在初始化后面开 —— 前面这些初始化是确定性的、不会卡,
+       真正的风险在主循环里(见 IWDG_Init 的说明)。 */
+    IWDG_Init();
+
+    /* 只给驱动器/IMU 留点上电就绪的时间。
+       200ms 远小于 1 秒的看门狗超时, 所以这里不用喂狗。 */
     Delay_ms(200);
 
     target_vx = 0.0f;
     target_wz = 0.0f;
-    /* 上电先刹住, 等上位机发命令 */
+    /* 再刹一次, 覆盖上面那 200ms */
     CAN1_SendStop(MOTOR1_CAN_ID);
     CAN1_SendStop(MOTOR2_CAN_ID);
 
@@ -1080,6 +1157,8 @@ int main(void)
 
     while (1)
     {
+        IWDG_ReloadCounter();       /* 喂狗: 主循环还在转就说明没卡死 */
+
         Port_ProcessCommands(&ports[PORT_MAIN]);
         CAN1_Poll();
 
