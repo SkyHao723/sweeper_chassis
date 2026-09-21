@@ -103,8 +103,19 @@ def stats(rows, col, t0, t1):
         return None
     m = sum(v) / len(v)
     var = sum((x - m) ** 2 for x in v) / len(v)
+    s = sorted(v)
+
+    def pct(p):
+        return s[min(len(s) - 1, int(p * len(s)))]
+
     return {'n': len(v), 'mean': m, 'std': math.sqrt(var),
-            'min': min(v), 'max': max(v), 'series': v}
+            'min': min(v), 'max': max(v), 'series': v,
+            # ★ 分位数是**稳健统计**: 峰峰值和标准差都会被单帧残值撑大。
+            #   实测踩到: 轮速里偶尔有一帧精确 0(驱动器回码超过 RPM_STALE_MS
+            #   时固件把实际转速当成 0 上报 —— 那是残值不是真停), 于是
+            #   min=0、峰峰值虚高、连"均值穿越次数"估出来的振荡频率都被带偏。
+            'p05': pct(0.05), 'p50': pct(0.50), 'p95': pct(0.95),
+            'n_zero': sum(1 for x in v if abs(x) < 1e-6)}
 
 
 def osc_freq(st, dt):
@@ -267,24 +278,34 @@ def main():
         if st is None:
             print('  %-24s 无数据' % name)
             continue
-        print('  %-24s 均值 %+.3f m/s (%+5.0f%%)  标准差 %.3f  范围 %+.3f~%+.3f'
+        print('  %-24s 均值 %+.3f m/s (%+5.0f%%)  标准差 %.3f  '
+              '5~95%%区间 %+.3f~%+.3f'
               % (name, st['mean'], st['mean'] / args.vx * 100.0,
-                 st['std'], st['min'], st['max']))
+                 st['std'], st['p05'], st['p95']))
+        if st['n_zero']:
+            print('      ⚠ 其中 %d/%d 帧是精确 0 —— 多半是驱动器回码超时'
+                  '(RPM_STALE_MS=200ms)' % (st['n_zero'], st['n']))
+            print('        被固件当成"实际转速 0"上报的**残值**, 不是车真停了。'
+                  '它会撑大 min/max 和标准差。')
     if od_st:
-        f = osc_freq(od_st, SAMPLE_DT)
         rng = od_st['max'] - od_st['min']
-        print('    -> 峰峰值 %.3f m/s (命令的 %.0f%%)   主振荡约 %.2f Hz'
-              % (rng, rng / abs(args.vx) * 100.0, f))
-        print('    判据: 峰峰值 <20% 命令 -> 算稳; 20~50% -> 明显在忽快忽慢;')
+        rng95 = od_st['p95'] - od_st['p05']
+        f = osc_freq(od_st, SAMPLE_DT)
+        print('    -> 峰峰值 %.3f m/s (命令的 %.0f%%)  ← 会被单帧残值撑大'
+              % (rng, rng / abs(args.vx) * 100.0))
+        print('       5~95%% 区间宽度 %.3f m/s (命令的 %.0f%%)  ← 这个更可信'
+              % (rng95, rng95 / abs(args.vx) * 100.0))
+        print('       主振荡约 %.2f Hz  ← 单帧残值会让这个数虚高, 配合上面看'
+              % f)
+        print('    判据: 5~95% 宽度 <20% 命令 -> 算稳; 20~50% -> 明显在忽快忽慢;')
         print('          >50% -> 是极限环, 必须治')
         if 0.15 <= f <= 1.2:
-            print('    ★ 这个频段**已实测确认**是外环(轮速修正)的积分造成的:')
-            print('      起步时轮子没转, 误差 20~28 RPM, 积分一路顶到比例限幅,')
-            print('      然后和驱动器自己的 PI 组成慢极限环。')
-            print('      直接证据在 decode_diag 的"目标-理论"那一列 —— 开局 400ms')
-            print('      助推退出后它就是积分, 会跟着一起摆(实测 ±14 RPM)。')
-            print('      修法在 main.c: TRIM_LIN_BAND_RPM(误差大就不积分) + 降 TRIM_KI')
-            print('      + 收窄 TRIM_UP_K/TRIM_DOWN_K。')
+            print('    ★ 这个频段本来最像外环(轮速修正)的积分造成的慢极限环 ——')
+            print('      那个已经修掉了(TRIM_LIN_BAND_RPM: 误差大就不积分),')
+            print('      验证方式是 decode_diag 的"目标-理论"那一列变平(实测 ±1 RPM)。')
+            print('      **如果它还是平的而这里仍在振, 那就不是外环, 是驱动器自己')
+            print('      的速度环** —— 外环够不着那一层, 只能走扭矩模式。')
+            print('      另外先确认这个 f 不是被单帧残值撑出来的(看上面的 5~95% 宽度)。')
         elif f > 1.2:
             print('    ★ 频率偏高: 更像驱动器自己的速度环在振, 外环够不着这一层。')
 
