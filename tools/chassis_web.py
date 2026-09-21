@@ -109,7 +109,7 @@ EXPORT_HEADER = [
     "命令wz(rad/s)", "轮速wz(rad/s)", "EKFwz(rad/s)", "转向达成率(%)",
     "轮速x(m)", "轮速y(m)", "轮速偏航(deg)",
     "EKFx(m)", "EKFy(m)", "EKF偏航(deg)",
-    "航向差(deg,相对本表首行)",
+    "航向差(deg 相对本表首行)",
     "陀螺x(rad/s)", "陀螺y(rad/s)", "陀螺z(rad/s)",
     "加速度x(m/s2)", "加速度y(m/s2)", "加速度z(m/s2)",
     "电池(V)",
@@ -463,11 +463,22 @@ class Collector(Node):
         def f(v, nd):
             return "" if v is None else ("%.*f" % (nd, v))
 
+        def cell(s):
+            """★ CSV 字段转义, 不能省。
+            实测踩过: 表头里写了 "航向差(deg,相对本表首行)", 那个逗号没被引起来,
+            于是**表头被切成 24 列而数据是 23 列, 整张表从第 16 列开始错位一格** ——
+            Excel 里看就是列名和数据对不上, 而且不报错, 很容易当成数据本身有问题。
+            规范做法: 含逗号/引号/换行的字段用双引号包起来, 内部的双引号翻倍。"""
+            s = str(s)
+            if ('"' in s) or ("," in s) or ("\n" in s) or ("\r" in s):
+                return '"' + s.replace('"', '""') + '"'
+            return s
+
         # 相对航向差的基准 = 本表第一行, 和页面上"相对打开页面时"是同一口径
         base_o = rows[0][11] if rows else None
         base_e = rows[0][12] if rows else None
 
-        out = ["\ufeff" + ",".join(EXPORT_HEADER)]
+        out = ["\ufeff" + ",".join(cell(h) for h in EXPORT_HEADER)]
         for r in rows:
             ratio_vx = None
             if r[1] is not None and r[2] is not None and abs(r[1]) >= 0.02:
@@ -484,7 +495,7 @@ class Collector(Node):
                 while ydiff < -180.0:
                     ydiff += 360.0
 
-            out.append(",".join([
+            out.append(",".join(cell(x) for x in [
                 f(r[0], 3),
                 f(r[1], 4), f(r[2], 4), f(r[3], 4), f(ratio_vx, 1),
                 f(r[4], 4), f(r[5], 4), f(r[6], 4), f(ratio_wz, 1),

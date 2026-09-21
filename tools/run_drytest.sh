@@ -39,7 +39,11 @@ if ! kill -0 "$DRY" 2>/dev/null; then
     exit 1
 fi
 echo
-python3 -u /tmp/test_webctl.py
+# ★ 用脚本自己所在的目录, 别写死 /tmp —— 这台机器的 /tmp 会被清掉, 实测因此
+#   白跑一轮("can't open file /tmp/test_webctl.py")。两个脚本现在都在
+#   ~/chassis_tools/ 下, 就按相对自己的位置找。
+HERE="$(cd "$(dirname "$0")" && pwd)"
+python3 -u "$HERE/test_webctl.py"
 rc=$?
 echo
 echo "测试退出码: $rc"

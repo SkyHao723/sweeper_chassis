@@ -149,6 +149,39 @@ c = get("/api/data")["ctrl"]
 check("armed 已撤", c["armed"] is False, "armed=%s" % c["armed"])
 check("want 归零", abs(c["want_vx"]) < 1e-9 and abs(c["want_wz"]) < 1e-9)
 
+print("=== 7) 导出 CSV: BOM / 行尾 / 列对齐 ===")
+import csv as _csv
+import io as _io
+import urllib.request as _u
+try:
+    with _u.urlopen(BASE + "/api/export.csv", timeout=8) as r:
+        raw = r.read()
+        ctype = r.headers.get("Content-Type", "")
+        cdisp = r.headers.get("Content-Disposition", "")
+except Exception as e:
+    raw, ctype, cdisp = b"", "取不到: %s" % e, ""
+
+check("Content-Type 是 text/csv", "text/csv" in ctype, ctype)
+check("带 Content-Disposition 文件名",
+      "attachment" in cdisp and ".csv" in cdisp, cdisp)
+# ★ BOM 一个字节都不能省: 不带的话 Windows 版 Excel 按本地代码页解, 中文表头全乱码
+check("有 UTF-8 BOM", raw[:3] == b"\xef\xbb\xbf", "前 3 字节 " + raw[:3].hex())
+
+if raw:
+    text = raw.decode("utf-8-sig")
+    check("行尾是 CRLF", "\r\n" in text)
+    # ★ 用 csv 模块解析, 别自己 split(",") —— 字段里出现逗号时手拆就会错位,
+    #   而"表头字段含逗号"正是这次踩的坑: 表头 24 列 / 数据 23 列, 整表从第 16 列
+    #   开始错位一格, Excel 里列名和数据对不上而且不报错。
+    rows = list(_csv.reader(_io.StringIO(text)))
+    ncol = len(rows[0])
+    check("表头列数 >= 20", ncol >= 20, "%d 列" % ncol)
+    bad = [i for i, r in enumerate(rows) if len(r) != ncol]
+    check("所有行列数和表头一致(不错位)", len(bad) == 0,
+          "不一致的行号: %s" % bad[:5])
+    check("有数据行", len(rows) > 2, "%d 行(含表头)" % len(rows))
+    check("表头没有空列名", all(c.strip() for c in rows[0]))
+
 print()
 print("结论:", "全部通过" if ok else "**有不通过项**")
 node.destroy_node()
