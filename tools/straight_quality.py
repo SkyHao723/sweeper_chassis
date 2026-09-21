@@ -47,7 +47,7 @@ from sensor_msgs.msg import Imu
 SAMPLE_DT = 0.01
 PUB_HZ = 20.0
 
-COL_T, COL_ODX, COL_ODZ, COL_CBX, COL_CBZ, COL_IMU = range(6)
+COL_T, COL_ODX, COL_ODZ, COL_CBX, COL_CBZ, COL_IMU, COL_ACC = range(7)
 
 
 class Rec(Node):
@@ -56,7 +56,10 @@ class Rec(Node):
         self.pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.rows = []
         self.n = [0, 0, 0]
-        self.cur = [None] * 5
+        # 第 6 列记加速度模长。它的唯一用途是**判断 IMU 是不是死的** —— 见 main 里
+        # 的检查。真实加速度计无论如何都会读到重力(约 9.8), 所以"三轴全零"是
+        # 铁证; 而陀螺仪在静止时输出 0 是这颗模块的正常行为, **不能**用来判死活。
+        self.cur = [None] * 6
         self.create_subscription(Odometry, '/odom', self.cb_odom, 20)
         self.create_subscription(Odometry, '/odom_combined', self.cb_comb, 20)
         self.create_subscription(Imu, '/imu/data_raw', self.cb_imu, 50)
@@ -75,6 +78,8 @@ class Rec(Node):
     def cb_imu(self, m):
         self.n[2] += 1
         self.cur[4] = m.angular_velocity.z
+        a = m.linear_acceleration
+        self.cur[5] = math.sqrt(a.x * a.x + a.y * a.y + a.z * a.z)
 
     def sample(self):
         self.rows.append((time.time(),) + tuple(self.cur))
@@ -135,6 +140,28 @@ def main():
     if node.n[0] == 0 or node.n[2] == 0:
         print('!! 收不到 /odom 或 /imu/data_raw, 底盘栈起来了吗?')
         node.destroy_node(); rclpy.shutdown(); return 1
+
+    # ★ IMU 死活自检 —— 这一步不能省。
+    #   本脚本拿 IMU 积分当"偏航真值", 而 IMU 一旦死了, 厂商节点发出来的
+    #   angular_velocity.z 就是常量 0 —— 于是脚本会算出"真实偏航 +0.00°",
+    #   报出一条完美直线。**拿死 IMU 去验证里程计, 结论会完全反过来。**
+    #   判据必须用**加速度计**: 真实加速度计无论如何都读到重力(约 9.8),
+    #   三轴全零是铁证。**不能**用陀螺仪判 —— 这颗模块静止时本来就输出 0。
+    for _ in range(20):
+        rclpy.spin_once(node, timeout_sec=0.05)
+    accs = [r[COL_ACC] for r in node.rows if r[COL_ACC] is not None]
+    if not accs or max(accs) < 1.0:
+        print()
+        print('!! IMU 没有有效数据: 加速度模长最大只有 %.2f m/s^2'
+              % (max(accs) if accs else 0.0))
+        print('   真实加速度计静止时也该读到约 9.8(重力), 读不到就是 IMU 死了。')
+        print('   **这次测量没有意义** —— 偏航真值就是这颗 IMU, 它算出来会是 0,')
+        print('   看着像"完美直线", 结论完全反了。已中止。')
+        print('   查: python3 ~/chassis_tools/decode_diag.py -p /dev/wheeltec_controller')
+        print('       看 imu= 状态码 (4=无应答 -> 供电/接线/模块本身)')
+        node.destroy_node(); rclpy.shutdown(); return 3
+    print('IMU 自检: 加速度模长 %.1f~%.1f m/s^2 (读到重力, 活着)'
+          % (min(accs), max(accs)))
 
     # 污染自检: 除了本脚本还有谁在发 /cmd_vel
     t0 = time.time()
