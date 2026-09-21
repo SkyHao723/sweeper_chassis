@@ -10,7 +10,7 @@
  *   USART1  PA9(TX) / PA10(RX)  <->  上位机 CH340 / RK3588   115200 8N-1
  *   CAN1    PA12(TX)/ PA11(RX)  -->  两台 FOC 驱动器          500 kbps 扩展帧
  *   PB10/PB11                   <->  亚博 YbImu (软件 I2C)
- *   PB0 / PB1                   -->  电机继电器 / 水泵继电器
+ *   PB0 / PB1                   -->  滚刷继电器 / 水泵继电器
  *
  * 只有一个上位机(RK3588)。**定位不在本板做**: 卡尔曼滤波在上位机跑,
  * 本板只出运动学、CAN 下发、看门狗、继电器和状态上报。PA2/PA3 空着。
@@ -75,7 +75,7 @@
  *   [23]    UART 坏帧计数
  *   [24]    UART 有效命令计数
  *   [25]    UART 溢出计数
- *   [26]    继电器状态  bit0 电机 bit1 水泵
+ *   [26]    继电器状态  bit0 滚刷 bit1 水泵
  *   [27]    IMU 诊断码  0=正常 1=SCL拉不高 2=SDA拉不高 3=总线死 4=无应答 5=读出错
  *                      6=加速度正常但角速度恒为 0
  *   [28]    IMU 扫描到的 I2C 地址 (0 = 没扫到)
@@ -130,7 +130,15 @@
 #define LINK_TIMEOUT_MS     800
 
 /*---------------------- GPIO 继电器 (外设开关) ----------------------
- *   PB0 -> 电机继电器 IN     PB1 -> 水泵继电器 IN
+ *   PB0 -> 滚刷继电器 IN     PB1 -> 水泵继电器 IN
+ *
+ *   ★ 这两个继电器是**外设开关**: PB0 管扫地滚刷电机, PB1 管水泵。
+ *     它们和轮毂电机**没有任何关系** —— 轮毂电机的 FOC 驱动器是独立供电、
+ *     常电的, 继电器断开不会给它们断电, CAN 通信和使能状态都不受影响。
+ *
+ *     ★ 命名教训: PB0 以前叫 RELAY_MOTOR / "电机继电器", 文档里还写成
+ *       "继电器给驱动器供电"。于是所有基于"继电器合闸 = 驱动器上电初始化"
+ *       的推理全是错的, 白追了一轮"为什么第一条命令没反应"。**叫滚刷**。
  *
  *   ★ 接线铁律: 模块的 VCC/GND 一定要和 STM32 共用同一个电源参考，
  *     最省事的做法就是直接从本板引 5V 和 GND。
@@ -145,8 +153,8 @@
  *
  *   RELAY_OFF_ON_LINK_LOSS: 链路断了(看门狗)自动断开两个继电器。
  *-----------------------------------------------------------------*/
-#define RELAY_MOTOR_PIN     GPIO_Pin_0      /* PB0 */
-#define RELAY_PUMP_PIN      GPIO_Pin_1      /* PB1 */
+#define RELAY_BRUSH_PIN     GPIO_Pin_0      /* PB0 滚刷电机 */
+#define RELAY_PUMP_PIN      GPIO_Pin_1      /* PB1 水泵 */
 #define RELAY_PORT          GPIOB
 #define RELAY_ACTIVE_LOW    1               /* 1=低电平触发(实测) 0=高电平触发 */
 #define RELAY_OFF_ON_LINK_LOSS  1
@@ -218,7 +226,7 @@
 
 /* 命令帧里的功能码(f[1]), 沿用协议里"非速度帧靠功能码区分"的做法。
  * 协议已占用: 0x04 灯带 / 0x01 回充开关 / 0x00 安全防护, 0x05 是空的。 */
-#define FUNC_RELAY         0x05     /* f[2] = 掩码: bit0 电机继电器 bit1 水泵继电器 */
+#define FUNC_RELAY         0x05     /* f[2] = 掩码: bit0 滚刷继电器 bit1 水泵继电器 */
 
 /*-------------------------- 周期 --------------------------------*/
 #define CAN_PERIOD_MS      20       /* 向电机重复发送的周期 */
@@ -336,14 +344,17 @@ static float    target_wz;          /* rad/s */
 static uint8_t  ever_linked;
 static uint8_t  failsafe_latched;
 
-/* 电机继电器最近一次"合上"的时刻。
- * ★ 驱动器是继电器供电的, 合闸那一刻它们才开始上电初始化 —— 初始化没完就发
- *   速度命令是不可靠的。实测(2026-09): 同一条直行命令连着发三次, 结果分别是
- *   **"没反应"、"向左转"、"正常前进"** —— 直行变成左转, 说明那一次只有一个
- *   驱动器响应了。而继电器在每次断链(看门狗)时都会断开, 所以每次重新连上都会
- *   重演这个问题, 导航里会变成"偶尔不动、偶尔歪一下"。
- *   见 Drive_Ready()。 */
-static uint32_t drive_arm_ms;
+/* 两个驱动器是否都回过码 (bit0 = 1号, bit1 = 2号, 自开机起累计)。
+ *
+ * ★ 为什么需要: 差速车**只有一个轮子出力就等于原地打转**。实测出现过同一条
+ *   直行命令连着发三次, 结果分别是"没反应"、"向左转"、"正常前进" ——
+ *   直行变左转, 就是那一次只有一个驱动器响应了。
+ *   所以策略: 没确认两个驱动器都活着之前, 只发刹车, 不发速度。见 Drive_Ready()。
+ *
+ * ★ 这里以前写的是"继电器合闸后等驱动器上电初始化" —— 那是错的:
+ *   继电器管的是**滚刷和水泵**, 和轮毂驱动器没有关系(驱动器是常电的)。
+ *   等待条件本身是对的, 错的是理由; 现在按真实理由重写。 */
+static uint8_t drv_seen_mask;
 
 /* 物理轮速目标 —— 上报给上位机, 用来和实际轮速对比(诊断"没劲"的关键) */
 static int16_t  target_left_rpm;
@@ -405,7 +416,7 @@ static uint32_t imu_probe_ms;        /* 上次寄存器体检的时刻 */
 static uint8_t  reset_by_iwdg;
 
 /* 继电器 */
-static uint8_t  relay_state;                       /* bit0 电机 bit1 水泵 */
+static uint8_t  relay_state;                       /* bit0 滚刷 bit1 水泵 */
 
 /*=========================== 1ms 时基 ==============================*/
 static void Tick_Init(void)
@@ -596,6 +607,7 @@ static void CAN1_Poll(void)
             m1_fault = rx.Data[1];
             m1_rpm = (int16_t)(((uint16_t)rx.Data[2] << 8) | rx.Data[3]);
             m1_rpm_ms = g_tick_ms;
+            drv_seen_mask |= 0x01;          /* 1号回过码了 */
             if (rx.DLC >= 6)
             {
                 m1_cur = (int16_t)(((uint16_t)rx.Data[4] << 8) | rx.Data[5]);
@@ -607,6 +619,7 @@ static void CAN1_Poll(void)
             m2_fault = rx.Data[1];
             m2_rpm = (int16_t)(((uint16_t)rx.Data[2] << 8) | rx.Data[3]);
             m2_rpm_ms = g_tick_ms;
+            drv_seen_mask |= 0x02;          /* 2号回过码了 */
             if (rx.DLC >= 6)
             {
                 m2_cur = (int16_t)(((uint16_t)rx.Data[4] << 8) | rx.Data[5]);
@@ -741,16 +754,16 @@ static void PutU16(uint8_t *p, uint16_t v)
  *=================================================================*/
 static void Relay_Apply(void)
 {
-    uint8_t motor_on = (relay_state & 0x01) != 0;
+    uint8_t brush_on = (relay_state & 0x01) != 0;
     uint8_t pump_on  = (relay_state & 0x02) != 0;
 
 #if RELAY_ACTIVE_LOW
-    motor_on = (uint8_t)(!motor_on);
+    brush_on = (uint8_t)(!brush_on);
     pump_on  = (uint8_t)(!pump_on);
 #endif
 
-    if (motor_on) GPIO_SetBits(RELAY_PORT, RELAY_MOTOR_PIN);
-    else          GPIO_ResetBits(RELAY_PORT, RELAY_MOTOR_PIN);
+    if (brush_on) GPIO_SetBits(RELAY_PORT, RELAY_BRUSH_PIN);
+    else          GPIO_ResetBits(RELAY_PORT, RELAY_BRUSH_PIN);
 
     if (pump_on) GPIO_SetBits(RELAY_PORT, RELAY_PUMP_PIN);
     else         GPIO_ResetBits(RELAY_PORT, RELAY_PUMP_PIN);
@@ -758,18 +771,7 @@ static void Relay_Apply(void)
 
 static void Relay_Set(uint8_t mask)
 {
-    uint8_t was = relay_state;
-
     relay_state = (uint8_t)(mask & 0x03);
-
-    /* 电机继电器 0->1: 驱动器刚开始上电。记下时刻, 之后 Drive_Ready() 会一直
-       等到**两个驱动器各自回传过一次数据**才允许下发速度命令 —— 理由见
-       drive_arm_ms 的注释。 */
-    if (((was & 0x01) == 0) && ((relay_state & 0x01) != 0))
-    {
-        drive_arm_ms = g_tick_ms;
-    }
-
     Relay_Apply();
 }
 
@@ -779,7 +781,7 @@ static void Relay_Init(void)
 
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
 
-    gpio.GPIO_Pin = RELAY_MOTOR_PIN | RELAY_PUMP_PIN;
+    gpio.GPIO_Pin = RELAY_BRUSH_PIN | RELAY_PUMP_PIN;
     gpio.GPIO_Mode = GPIO_Mode_Out_PP;
     gpio.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(RELAY_PORT, &gpio);
@@ -824,7 +826,7 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     /* ---- 功能帧: f[1] 是功能码, 不是速度帧 ---- */
     if (f[1] == FUNC_RELAY)
     {
-        Relay_Set(f[2]);            /* f[2] = 掩码 bit0 电机 bit1 水泵 */
+        Relay_Set(f[2]);            /* f[2] = 掩码 bit0 滚刷 bit1 水泵 */
         if (ports[port_id].ok_count != 0xFF) ports[port_id].ok_count++;
         return;
     }
@@ -860,14 +862,18 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     target_vx = ClampF((float)vx_mm / 1000.0f, -MAX_LIN_SPEED, MAX_LIN_SPEED);
     target_wz = ClampF((float)wz_mrad / 1000.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
 
-    /* ★ 电机继电器必须有人自动管。
-       继电器帧(f[1]=0x05)是本工程自定义的扩展, 厂商 ROS 节点不认识、永远
-       不会发 —— 如果只靠上位机显式合闸, 换成 RK3588 当上位机之后电机永远
-       没有电, 而 STM32 照样会发 CAN 转速命令, 现象是"目标转速有、实际为 0、
-       电流≈0", 和"驱动器没给力"在诊断上完全分不出来。
-       所以策略改成: 只要收到有效命令就自动合上电机继电器, 断链时由看门狗
-       自动断开(见 main 里的 Relay_Set(0)) —— 不需要上位机配合, 车也不会在
-       断链后自己复活。
+    /* ★ 收到速度命令就自动合上 **滚刷** 继电器。
+       继电器帧(f[1]=0x05)是本工程自定义的扩展, 厂商 ROS 节点不认识、永远不
+       会发, 所以上位机没法管它。
+
+       ⚠ 但这条逻辑的**原始理由已经作废了**: 当初写的是"不合闸电机就没电",
+          那个"电机"指的是轮毂驱动电机 —— 而继电器管的是**滚刷和水泵**,
+          和轮毂驱动器毫无关系(驱动器常电)。所以这句话原本要防的问题不存在。
+
+       现在的实际效果是: **一收到运动命令, 扫地滚刷就开始转。**
+       这对"边走边扫"也许正是想要的, 但它是一个没人明确决定过的副作用,
+       而且滚刷空转/误转是有安全含义的。**待确认**: 见 README 的继电器一节。
+       如果要改成"和外设一样只能上位机显式开", 把下面这个 if 删掉即可。
 
        ★ 水泵**不**自动合闸: 误抽水的代价太大, 只能由上位机显式发 0x05 帧。 */
     if ((relay_state & 0x01) == 0)
@@ -1085,19 +1091,23 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
 }
 
 /*===================== 驱动器就绪判断 ==============================
- * 电机继电器合上之后, 必须先看到**两个驱动器各自回传过一次数据**, 才允许下发
- * 速度命令。这是"等确认再动", 不是"猜它能动了" —— 理由见 drive_arm_ms 的注释:
- * 驱动器初始化没完时发速度命令, 实测会出现"没反应"或"只一个轮子响应(于是直行
- * 变左转)"。
+ * 差速车只有一个轮子出力就等于原地打转, 所以**没确认两个驱动器都活着之前,
+ * 只发刹车、绝不发速度** —— 直行命令变成左转就是这么来的(见 drv_seen_mask)。
+ *
+ * 判据是两条, 都要满足:
+ *   1. 两个驱动器**各自回过码**(证明 CAN 通、驱动器活着);
+ *   2. 两路回码**现在都还新鲜** —— 用一次就够不算数, 半路掉线的驱动器必须
+ *      立刻让车停下来, 否则又是一次"单轮驱动 = 原地打转"。
  *
  * 为什么不会死锁: 等待期间 Drive_Apply 每 20ms 发的是**刹车帧**, 而驱动器对
- * 刹车帧同样会回码, 所以回码一定会来。万一 CAN 真断了, 那就一直刹车 ——
+ * 刹车帧同样会回码, 所以回码一定会来。万一 CAN 真断了就一直刹车 ——
  * 这正是应该的结果(驱动器都没通, 本来就不该动)。
  *=================================================================*/
 static uint8_t Drive_Ready(void)
 {
-    if (m1_rpm_ms < drive_arm_ms) return 0;
-    if (m2_rpm_ms < drive_arm_ms) return 0;
+    if ((drv_seen_mask & 0x03) != 0x03) return 0;             /* 有一路从没回过 */
+    if ((g_tick_ms - m1_rpm_ms) > RPM_STALE_MS) return 0;     /* 1号现在不回了 */
+    if ((g_tick_ms - m2_rpm_ms) > RPM_STALE_MS) return 0;     /* 2号现在不回了 */
     return 1;
 }
 
@@ -1126,9 +1136,8 @@ static void Drive_Apply(void)
     if ((dt <= 0.0f) || (dt > 0.2f)) dt = (float)CAN_PERIOD_MS * 0.001f;
     last_trim_ms = g_tick_ms;      /* 就算下面提前 return 也要更新, 免得恢复时 dt 爆掉 */
 
-    /* ★ 驱动器还没确认起来(继电器刚合闸): 只发刹车, 绝不发速度。
-       实测不管这里就会出现"第一次没反应 / 第二次向左转(只有一个轮子响应)"
-       那种不确定行为 —— 而继电器每次断链都会断开, 所以每次重连都重演。
+    /* ★ 驱动器没都就绪: 只发刹车, 绝不发速度。
+       差速车单轮出力 = 原地打转, 而实测真的出现过"直行命令变成向左转"。
        顺便把外环状态清零, 免得带着上一次攒的修正冲出去。 */
     if (!Drive_Ready())
     {
@@ -1374,7 +1383,7 @@ static void Send_DiagFrame(uart_port_t *p)
     if (imu_ok)           flags |= 0x04;    /* 加速度最近一次读取成功 */
     if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪自开机以来读到过非零 */
     if (reset_by_iwdg)    flags |= 0x10;    /* 上次复位是看门狗引起的(主循环卡死过) */
-    if (!Drive_Ready())   flags |= 0x20;    /* 驱动器未就绪: 继电器刚合闸, 在等回码 */
+    if (!Drive_Ready())   flags |= 0x20;    /* 有驱动器没回码/掉线: 此时只发刹车 */
 
     f[0] = DIAG_HEAD;
     f[1] = flags;
@@ -1394,7 +1403,7 @@ static void Send_DiagFrame(uart_port_t *p)
     f[23] = ports[PORT_MAIN].bad_count;
     f[24] = ports[PORT_MAIN].ok_count;
     f[25] = ports[PORT_MAIN].overflow;
-    f[26] = relay_state;                 /* bit0 电机 bit1 水泵 */
+    f[26] = relay_state;                 /* bit0 滚刷 bit1 水泵 */
     f[27] = imu_status;                  /* YBIMU_ST_* */
     f[28] = imu_found_addr;              /* 0 = 没扫到 */
     f[29] = seq++;                       /* 帧序号, 上位机据此发现丢帧 */
@@ -1472,7 +1481,7 @@ int main(void)
             target_wz = 0.0f;
             failsafe_latched = 1;
 #if RELAY_OFF_ON_LINK_LOSS
-            Relay_Set(0);       /* 断线了顺便把电机/水泵继电器也断开 */
+            Relay_Set(0);       /* 断线了顺便把滚刷/水泵继电器也断开 */
 #endif
         }
 
