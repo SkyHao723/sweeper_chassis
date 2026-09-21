@@ -190,8 +190,13 @@ class ChassisCheck(object):
                     t80 = trace[i][0] - t0
                     break
 
-        exp_fwd = vx * dur
-        exp_dth = wz * dur
+        # ---- 期望值必须按**窗口**时长算, 不能按整条命令的时长 ----
+        # ★ 踩过: SETTLE_S 秒的起步段被排除在测量窗之外了, 但期望值原来仍按
+        #   dur 算, 于是"全程比例"凭空低 (dur-SETTLE)/dur —— 0.6/2.0 就是少 30%,
+        #   还让脚本一直打印"比稳态低说明起步慢", 完全是误导。
+        win = max(0.1, dur - SETTLE_S)
+        exp_fwd = vx * win
+        exp_dth = wz * win
         ratio_all = (fwd / exp_fwd * 100.0) if abs(exp_fwd) > 1e-6 else 0.0
         # 稳态比例: 直线看 vx, 转向看 wz
         if abs(wz) > 1e-6:
@@ -228,19 +233,31 @@ class ChassisCheck(object):
             al = [r["ratio_all"] for r in lin]
             print("直线稳态比例: 平均 %.0f%%  最小 %.0f%%  最大 %.0f%%"
                   % (sum(ss) / len(ss), min(ss), max(ss)))
-            print("直线全程比例: 平均 %.0f%%   <- 比稳态低说明起步慢" % (sum(al) / len(al)))
+            print("直线全程比例: 平均 %.0f%%  (同一窗口内的平均速度, 和稳态比可看出加速段占比)"
+                  % (sum(al) / len(al)))
             t80s = [r["t80"] for r in lin if r["t80"] is not None]
             if t80s:
                 print("爬到 80%% 速度用时: 平均 %.2fs  最长 %.2fs"
                       % (sum(t80s) / len(t80s), max(t80s)))
         turns = [r for r in results if abs(r["exp_dth"]) > 1e-6]
         if turns:
-            ss = [r["ratio_ss"] for r in turns]
-            print("转向稳态比例: 平均 %.0f%%  (正负号直接看上面)" % (sum(ss) / len(ss)))
+            print("转向 (按窗口时长算的期望值):")
+            for r in turns:
+                print("   %-18s 实测 %+6.1f° / 期望 %+6.1f°  =  %3.0f%%"
+                      % (r["name"], math.degrees(r["dth"]),
+                         math.degrees(r["exp_dth"]),
+                         r["dth"] / r["exp_dth"] * 100.0))
+            # 左右对不对称: 同样的角速度、相反的符号, 幅度应该接近
+            if len(turns) >= 2:
+                mags = [abs(r["dth"] / r["exp_dth"]) for r in turns]
+                print("   左右对称性: 最大 %.0f%% / 最小 %.0f%%  (差得多说明两轮出力不匀)"
+                      % (max(mags) * 100, min(mags) * 100))
         print()
         print("怎么用这些数:")
-        print("  * 稳态比例明显不是 100% -> 改 config/ekf*.yaml 的 odom_*_scale 按比例修正")
-        print("  * 全程比稳态低很多 / 到80%用很久 -> 起步慢, 见 README 的'低速拖死'")
+        print("  * 稳态比例明显不是 100% -> 看是不是随速度变化: 低速偏低+高速偏高")
+        print("    说明是速度环的增益问题, 不是刻度问题, **不要**用单一系数去补")
+        print("  * 到80%用很久 / 全程远低于稳态 -> 起步慢")
+        print("  * 转向左右不对称 -> 两轮出力不匀(速度环振荡的相位差)")
 
 
 def main():
