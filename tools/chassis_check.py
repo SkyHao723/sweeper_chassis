@@ -186,13 +186,20 @@ class ChassisCheck(object):
         cmd.linear.x = vx
         cmd.angular.z = wz
 
+        # ★ 计时段必须是 win = dur - SETTLE_S, 不是 dur。
+        #   下面算期望位移用的是 vx*win, 而分子是这段窗口里量到的位移 ——
+        #   两者必须是同一段时间, 否则比例被系统性地放大 dur/win 倍
+        #   (--once 时 dur=3.0/win=2.4, 也就是所有"全程比例"凭空高 25%)。
+        #   上一版把分母从 dur 改成 win 时漏了这里, 于是 bug 从"偏低 30%"
+        #   变成了"偏高 25%", 一样是错的。
+        win = max(0.1, dur - SETTLE_S)
         self.spin_for(SETTLE_S, cmd)      # 起步(不计量, 避开加速段)
         trace = []
         ctrace = []
         x0, y0, th0 = self.cur
         cx0, cy0, cth0 = self.comb if self.comb else self.cur
         t0 = time.monotonic()
-        self.spin_for(dur, cmd, trace, ctrace)   # 计时段, 逐帧采样
+        self.spin_for(win, cmd, trace, ctrace)   # 计时段, 逐帧采样
         xe, ye, the = self.cur
         cxe, cye, cthe = self.comb if self.comb else self.cur
         self.stop()
@@ -200,6 +207,35 @@ class ChassisCheck(object):
         if len(trace) < 8:
             print("%-22s 采样太少" % name)
             return None
+
+        # ---- 位姿连续性检查 ------------------------------------------
+        # 为什么需要: "稳态/全程"全是从 /odom 的**位姿差分**算出来的。只要位姿
+        # 中途跳变一次(底盘节点 respawn、看门狗重启栈、别的发布者抢 /cmd_vel),
+        # 整段就是垃圾 —— 而现象往往只是"数字有点怪", 极难察觉, 实测被坑过好几次。
+        # 逐帧看瞬时速度并把不合理的直接报出来, 让数据自己说明可不可信。
+        # 用 0.25 秒的窗口算瞬时速度, 不然位姿的毫米级噪声会把它淹掉。
+        W = 5
+        vmax = max(abs(vx), 0.05)
+        n_back = 0          # 命令前进却在后退
+        n_fast = 0          # 比命令快 3 倍以上
+        worst = 0.0
+        for i in range(W, len(trace)):
+            d = trace[i][0] - trace[i - W][0]
+            if d <= 1e-6:
+                continue
+            a = ((trace[i][1] - trace[i - W][1]) * math.cos(th0) +
+                 (trace[i][2] - trace[i - W][2]) * math.sin(th0))
+            inst = a / d
+            if vx > 0.01 and inst < -0.3 * vmax:
+                n_back += 1
+            if abs(inst) > 3.0 * vmax:
+                n_fast += 1
+                worst = max(worst, abs(inst))
+        if n_back or n_fast:
+            print("   ⚠ 位姿异常: 反向 %d 次 / 瞬时超速 %d 次 (最大 %.2f m/s, 命令 %.2f)"
+                  % (n_back, n_fast, worst, vx))
+            print("     -> 这组数字不可信。查: 有没有别的进程在发 /cmd_vel、"
+                  "底盘节点是不是 respawn 过")
 
         # 车体系位移
         dx, dy = xe - x0, ye - y0
@@ -241,10 +277,14 @@ class ChassisCheck(object):
                     t80 = trace[i][0] - t0
                     break
 
-        # ---- 期望值必须按**窗口**时长算, 不能按整条命令的时长 ----
-        # ★ 踩过: SETTLE_S 秒的起步段被排除在测量窗之外了, 但期望值原来仍按
-        #   dur 算, 于是"全程比例"凭空低 (dur-SETTLE)/dur —— 0.6/2.0 就是少 30%,
-        #   还让脚本一直打印"比稳态低说明起步慢", 完全是误导。
+        # ---- 期望值必须和"实际计量的那段时间"严格一致 ----
+        # ★ 这个 bug 修过两次, 因为第一次只改了一半:
+        #   第一版: 起步段 SETTLE_S 被排除在测量窗之外, 期望值却仍按 dur 算,
+        #           于是"全程比例"凭空低 (dur-SETTLE)/dur —— 0.6/2.0 少 30%。
+        #   第二版: 把分母改成 win = dur - SETTLE_S 了, **但计时段还在跑 dur 秒**,
+        #           于是 bug 从偏低 30% 变成偏高 dur/win —— --once 时高 25%。
+        #   现在: 计时段本身就是 win 秒(见上面 spin_for(win, ...)), 两边对齐。
+        #   教训: 改比例公式时, 分子和分母必须一起看, 只改一半等于换个方向错。
         win = max(0.1, dur - SETTLE_S)
         exp_fwd = vx * win
         exp_dth = wz * win
