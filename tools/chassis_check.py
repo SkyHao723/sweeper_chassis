@@ -47,19 +47,36 @@ def wrap(a):
 
 
 class ChassisCheck(object):
+    """同时盯两路里程计 —— 这个区别很关键:
+
+      /odom           纯轮速积分(编码器), **完全不含 IMU**。
+                      厂商节点的 Robot_Pos.X += Vx*cos(psi)*dt 就是这么算的。
+      /odom_combined  EKF 融合输出 = 轮速 + IMU 的 yaw 角速度。
+
+    只测 /odom 会得出"漂得很厉害"的结论, 但那是纯轮速的漂移 —— **不是 EKF 的**。
+    EKF 的航向主要信的正是 IMU(协方差 2.5e-3 对轮速 5e-2, IMU 权重高 20 倍),
+    所以 /odom_combined 的航向通常好得多。要判断"融合数据真不真"必须看后者。
+    """
+
     def __init__(self, node):
         self.node = node
         self.pub = node.create_publisher(Twist, "/cmd_vel", 10)
-        self.cur = None
+        self.cur = None        # /odom           纯轮速
+        self.comb = None       # /odom_combined  EKF 融合
         node.create_subscription(Odometry, "/odom", self._on_odom, 10)
+        node.create_subscription(Odometry, "/odom_combined", self._on_comb, 10)
 
     def _on_odom(self, msg):
         p = msg.pose.pose
         self.cur = (p.position.x, p.position.y, yaw_of(p.orientation))
 
-    def spin_for(self, seconds, cmd=None, trace=None):
+    def _on_comb(self, msg):
+        p = msg.pose.pose
+        self.comb = (p.position.x, p.position.y, yaw_of(p.orientation))
+
+    def spin_for(self, seconds, cmd=None, trace=None, ctrace=None):
         """边发命令边转 ROS, 持续 seconds 秒。
-        trace 非 None 时, 每帧把 (t, x, y, yaw) 记进去。"""
+        trace/ctrace 非 None 时, 每帧把 (t, x, y, yaw) 记进去。"""
         n = max(1, int(seconds * PUB_HZ))
         for _ in range(n):
             if cmd is not None:
@@ -67,6 +84,8 @@ class ChassisCheck(object):
             rclpy.spin_once(self.node, timeout_sec=1.0 / PUB_HZ)
             if trace is not None and self.cur is not None:
                 trace.append((time.monotonic(),) + self.cur)
+            if ctrace is not None and self.comb is not None:
+                ctrace.append((time.monotonic(),) + self.comb)
 
     def stop(self):
         z = Twist()
@@ -145,10 +164,13 @@ class ChassisCheck(object):
 
         self.spin_for(SETTLE_S, cmd)      # 起步(不计量, 避开加速段)
         trace = []
+        ctrace = []
         x0, y0, th0 = self.cur
+        cx0, cy0, cth0 = self.comb if self.comb else self.cur
         t0 = time.monotonic()
-        self.spin_for(dur, cmd, trace)    # 计时段, 逐帧采样
+        self.spin_for(dur, cmd, trace, ctrace)   # 计时段, 逐帧采样
         xe, ye, the = self.cur
+        cxe, cye, cthe = self.comb if self.comb else self.cur
         self.stop()
 
         if len(trace) < 8:
@@ -160,6 +182,11 @@ class ChassisCheck(object):
         fwd = dx * math.cos(th0) + dy * math.sin(th0)
         lat = -dx * math.sin(th0) + dy * math.cos(th0)
         dth = wrap(the - th0)
+        # EKF 那一路
+        cdx, cdy = cxe - cx0, cye - cy0
+        cfwd = cdx * math.cos(cth0) + cdy * math.sin(cth0)
+        clat = -cdx * math.sin(cth0) + cdy * math.cos(cth0)
+        cdth = wrap(cthe - cth0)
 
         # ---- 稳态: 取窗口后 40% 的平均速度 ----
         k = int(len(trace) * 0.6)
@@ -210,13 +237,23 @@ class ChassisCheck(object):
               % (name, fwd, exp_fwd, ratio_all, ratio_ss,
                  ("%.2fs" % t80) if t80 is not None else "  >窗口",
                  lat, math.degrees(dth)))
+        # 第二行专门打印 EKF 那一路 —— 用它和上一行对比, 就能看出 IMU 到底
+        # 有没有帮上忙: 航向差得多说明 EKF 把纯轮速的漂移纠正掉了(IMU 生效);
+        # 两行几乎一样说明 IMU 没被用上, 那才需要去查协方差配置。
+        print("%-20s   └ EKF: 全程 %+6.3f m | 横漂 %+.3f | 航向 %+5.1f°%s"
+              % ("", cfwd, clat, math.degrees(cdth),
+                 ("   (比轮速少 %.1f°)" % (math.degrees(dth) - math.degrees(cdth)))
+                 if abs(math.degrees(dth) - math.degrees(cdth)) > 0.3 else
+                 "   (和轮速几乎一致 —— IMU 可能没起作用)"))
         return dict(name=name, fwd=fwd, exp_fwd=exp_fwd, lat=lat,
                     dth=dth, exp_dth=exp_dth, ratio_all=ratio_all,
-                    ratio_ss=ratio_ss, t80=t80)
+                    ratio_ss=ratio_ss, t80=t80,
+                    cfwd=cfwd, clat=clat, cdth=cdth)
 
     def run(self, cases):
         print("=" * 108)
-        print("底盘验收: /cmd_vel 命令 vs /odom 实测")
+        print("底盘验收: /cmd_vel 命令 vs 里程计实测")
+        print("  上一行 = /odom 纯轮速(不含 IMU)   下一行 = /odom_combined EKF 融合")
         print("=" * 108)
         results = []
         for name, vx, wz, dur in cases:
@@ -252,6 +289,30 @@ class ChassisCheck(object):
                 mags = [abs(r["dth"] / r["exp_dth"]) for r in turns]
                 print("   左右对称性: 最大 %.0f%% / 最小 %.0f%%  (差得多说明两轮出力不匀)"
                       % (max(mags) * 100, min(mags) * 100))
+        print()
+        # ★ 用户最关心的一个对比: 走直线时(命令 wz=0)两路各自的航向漂移。
+        #   纯轮速那一路的漂移来自"左右轮编码器报的转速不相等";
+        #   EKF 那一路主要信 IMU, 所以如果 IMU 真的在起作用, 这里应该小得多。
+        st = [r for r in results if abs(r["exp_dth"]) < 1e-6 and abs(r["exp_fwd"]) > 1e-6]
+        if st:
+            print("走直线时的航向漂移 (命令 wz=0, 理想都是 0):")
+            print("   %-18s %12s %12s" % ("", "/odom(纯轮速)", "/odom_combined"))
+            for r in st:
+                d = math.hypot(r["fwd"], r["lat"]) or abs(r["fwd"])
+                print("   %-18s %+8.1f° (%+5.1f°/m) %+8.1f° (%+5.1f°/m)"
+                      % (r["name"], math.degrees(r["dth"]),
+                         math.degrees(r["dth"]) / d if d > 0.05 else 0,
+                         math.degrees(r["cdth"]),
+                         math.degrees(r["cdth"]) / d if d > 0.05 else 0))
+            raw_m = sum(abs(math.degrees(r["dth"])) for r in st) / len(st)
+            ekf_m = sum(abs(math.degrees(r["cdth"])) for r in st) / len(st)
+            print("   平均: 纯轮速 %.1f°  vs  EKF %.1f°" % (raw_m, ekf_m))
+            if raw_m > 1.0 and ekf_m < raw_m * 0.6:
+                print("   -> **EKF 明显改善了航向, IMU 在起作用** ✓")
+            elif raw_m > 1.0:
+                print("   -> EKF 和纯轮速差不多 —— **IMU 可能没被用上**, 去查")
+                print("      /imu/data_raw 的 angular_velocity.z 有没有数据、")
+                print("      符号对不对(逆时针转应该是正的)、以及 ekf.yaml 的 imu0_config")
         print()
         print("怎么用这些数:")
         print("  * 稳态比例明显不是 100% -> 看是不是随速度变化: 低速偏低+高速偏高")
