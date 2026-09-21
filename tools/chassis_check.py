@@ -110,26 +110,30 @@ class ChassisCheck(object):
         return self.cur is not None
 
     def check_cmd_vel_exclusive(self):
-        """★ 污染自检: /cmd_vel 上除了本脚本还有别的发布者就中止。
+        """★ 污染自检: /cmd_vel 上真的有人在发速度就中止。
 
         底盘节点会同时收到多条速度命令, 谁后到听谁的 —— 于是测出来的是一个
-        随机混合的指令, 但数据看着像模像样, 极难察觉。实测踩到过:
-        decode_diag.py --drive 的进程在读线程报错后僵住不退出, 而它的发送
-        线程一直在发 wz=+0.5, 于是"外环到底振不振"根本没法定论, 白追一轮。
-        宁可在这里挡住, 也不要拿假数据去下结论。
+        随机混合的指令, 但数据看着像模像样, 极难察觉。
+
+        ★ 判据**不能只看发布者数量**。实测踩到: chassis-web.service 开机自启,
+          它一启动就 create_publisher, 却只在"网页使能 + 心跳新鲜"时才真发
+          (见 chassis_web.py 的说明)。按数量判会平白无故中止一次正常的测量。
+          正确做法: **在本脚本还没发任何东西之前, 先听 2 秒 /cmd_vel** ——
+          有消息才是真有人在发。
         """
+        heard = []
+        self.node.create_subscription(Twist, "/cmd_vel",
+                                      lambda m: heard.append(m), 10)
         t0 = time.monotonic()
         while time.monotonic() - t0 < 2.0:
             rclpy.spin_once(self.node, timeout_sec=0.1)
-        n = self.node.count_publishers("/cmd_vel")
-        if n > 1:
-            print("!! /cmd_vel 上有 %d 个发布者 —— 还有别人在发速度, 数据不可信。"
-                  % n)
-            print("   先查是谁: ps -eo pid,etimes,cmd | grep -E "
-                  "'decode_diag|turn_truth|chassis_check' | grep -v grep")
-            print("   僵死的直接 kill -9。注意卡住的进程可能还开着串口,")
-            print("   两个进程读同一个 tty 会随机分走字节, 那样里程计也不可信。")
+        if heard:
+            print("!! 本脚本还没开始发, /cmd_vel 上就来了 %d 条消息 —— "
+                  "有别人在发速度, 数据不可信。" % len(heard))
+            print("   先查是谁: ros2 topic info /cmd_vel --verbose")
+            print("             ros2 node list")
             return False
+        print("污染自检: 静止 2 秒内 /cmd_vel 上 0 条消息 -> 没有别人在发, 可以测")
         return True
 
     def run_to_distance(self, vx, target_m, timeout_s=40.0):

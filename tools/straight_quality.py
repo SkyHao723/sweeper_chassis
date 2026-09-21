@@ -163,15 +163,32 @@ def main():
     print('IMU 自检: 加速度模长 %.1f~%.1f m/s^2 (读到重力, 活着)'
           % (min(accs), max(accs)))
 
-    # 污染自检: 除了本脚本还有谁在发 /cmd_vel
+    # ★ 污染自检 —— 但**绝不能只看发布者的数量**。
+    #   实测踩到: chassis-web.service 开机自启, 它一启动就 create_publisher,
+    #   但设计上**只在"网页使能 + 心跳新鲜"时才真发**(见 chassis_web.py 的说明:
+    #   "否则本页面 20Hz 的零速会和 Nav2 抢 /cmd_vel, 车会一抖一抖")。
+    #   于是"有 2 个发布者"里有一个是完全静默的, 按数量判断会**平白无故中止
+    #   一次本来正常的测量**。
+    #   正确判据: **在本脚本还没发任何东西之前, 先听 2 秒 /cmd_vel。**
+    #     收到消息 -> 确实有别人在发, 中止
+    #     一条都没有 -> 那个发布者是静的, 可以测
+    n_pub = node.count_publishers('/cmd_vel')
+    heard = []
+    node.create_subscription(Twist, '/cmd_vel', lambda m: heard.append(m), 10)
     t0 = time.time()
     while time.time() - t0 < 2.0:
         rclpy.spin_once(node, timeout_sec=0.1)
-    n_pub = node.count_publishers('/cmd_vel')
-    if n_pub > 1:
-        print('!! /cmd_vel 上有 %d 个发布者 —— 数据不可信, 已中止。' % n_pub)
-        print('   查: ps -eo pid,etimes,cmd | grep chassis_tools | grep -v grep')
+    if heard:
+        print()
+        print('!! 本脚本还没开始发, /cmd_vel 上就已经来了 %d 条消息 —— '
+              '确实有别人在发速度。' % len(heard))
+        print('   两个源同时发会让底盘"谁后到听谁的", 表现是忽快忽慢 + 偏航乱,')
+        print('   而且完全不可复现。已中止。先查是谁:')
+        print('     ros2 topic info /cmd_vel --verbose   # 看发布者节点名')
+        print('     ros2 node list')
         node.destroy_node(); rclpy.shutdown(); return 2
+    print('污染自检: /cmd_vel 上有 %d 个发布者, 但静止 2 秒内 0 条消息'
+          ' -> 那个是静的, 可以测' % n_pub)
 
     for _ in range(20):
         rclpy.spin_once(node, timeout_sec=0.05)
