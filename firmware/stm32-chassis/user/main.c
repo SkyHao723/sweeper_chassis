@@ -360,7 +360,8 @@ static uint8_t drv_seen_mask;
 static int16_t  target_left_rpm;
 static int16_t  target_right_rpm;
 
-static uint32_t last_cmd_ms;
+static uint32_t last_cmd_ms;        /* 最后一条**速度帧** (决定运动超时) */
+static uint32_t last_frame_ms;      /* 最后一条**任何合法帧** (决定链路超时, 见看门狗) */
 static uint32_t last_can_ms;
 static uint32_t last_odom_ms;
 static uint32_t last_tel_ms;
@@ -817,11 +818,17 @@ static uint8_t Cmd_Verify(const uint8_t *f)
 /*========================= 命令帧应用 =============================
  * 只有一个上位机, 没有控制权仲裁 —— 收到合法帧就认。
  * 继电器是"锁存式开关", 任何时候都可以操作。
+ *
+ * ★ 进来就记 last_frame_ms: 能走到这里的帧都过了长度+帧尾+BCC 校验, 足以证明
+ *   上位机还活着。但**不**动 last_cmd_ms —— 那个只认速度帧, 否则发一堆灯带帧
+ *   就能把运动看门狗喂饱, 车会一直跑下去。见主循环里的看门狗。
  *=================================================================*/
 static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
 {
     int16_t vx_mm;
     int16_t wz_mrad;
+
+    last_frame_ms = g_tick_ms;
 
     /* ---- 功能帧: f[1] 是功能码, 不是速度帧 ---- */
     if (f[1] == FUNC_RELAY)
@@ -862,24 +869,19 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
     target_vx = ClampF((float)vx_mm / 1000.0f, -MAX_LIN_SPEED, MAX_LIN_SPEED);
     target_wz = ClampF((float)wz_mrad / 1000.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
 
-    /* ★ 收到速度命令就自动合上 **滚刷** 继电器。
-       继电器帧(f[1]=0x05)是本工程自定义的扩展, 厂商 ROS 节点不认识、永远不
-       会发, 所以上位机没法管它。
+    /* ★ 滚刷和水泵都**不**自动合闸。
+       两个继电器都是"外设开关", 只能由上位机显式发 f[1]=0x05 帧
+       (f[2] = 掩码: bit0 滚刷 bit1 水泵)。
 
-       ⚠ 但这条逻辑的**原始理由已经作废了**: 当初写的是"不合闸电机就没电",
-          那个"电机"指的是轮毂驱动电机 —— 而继电器管的是**滚刷和水泵**,
-          和轮毂驱动器毫无关系(驱动器常电)。所以这句话原本要防的问题不存在。
+       ★ 历史上这里会自动合上 PB0, 理由是"不合闸电机就没电" —— 但那个"电机"
+         指的是**轮毂驱动电机**, 而继电器根本不管它(驱动器独立常电)。理由本身
+         就是错的, 于是实际效果变成了"一给运动命令扫地滚刷就转", 一个没人明确
+         决定过的副作用。**已改成显式控制。**
 
-       现在的实际效果是: **一收到运动命令, 扫地滚刷就开始转。**
-       这对"边走边扫"也许正是想要的, 但它是一个没人明确决定过的副作用,
-       而且滚刷空转/误转是有安全含义的。**待确认**: 见 README 的继电器一节。
-       如果要改成"和外设一样只能上位机显式开", 把下面这个 if 删掉即可。
-
-       ★ 水泵**不**自动合闸: 误抽水的代价太大, 只能由上位机显式发 0x05 帧。 */
-    if ((relay_state & 0x01) == 0)
-    {
-        Relay_Set((uint8_t)(relay_state | 0x01));
-    }
+       ⚠ 后果要说清楚: 厂商 ROS 节点不认识这条自定义帧, 而且它独占串口 ——
+         所以在 ROS 栈跑着的时候**没法开关滚刷**, 需要另加一条控制通路。
+         台架上可以先用 tools/decode_diag.py --relay 直接开关。
+         详见 README 的继电器一节。 */
 
     last_cmd_ms = g_tick_ms;
     ever_linked = 1;
@@ -1471,8 +1473,19 @@ int main(void)
         Port_ProcessCommands(&ports[PORT_MAIN]);
         CAN1_Poll();
 
-        /* 看门狗: 上位机 800ms 不发命令就自动停车, 并断开继电器。
-           只有一个上位机, 它的帧直接喂狗, 不需要仲裁。 */
+        /*--------------------- 看门狗 (两件事, 必须分开) ---------------------
+         * 以前只有一条 last_cmd_ms, 把两件事混在一起了, 结果**继电器帧不算喂狗**,
+         * 于是"显式开滚刷"会在 800ms 后自己被断链保护关掉 —— 那样显式控制根本
+         * 没法用。两件事本来就不是一回事:
+         *
+         *   1. **运动超时**: 多久没收到"速度帧" -> 停车(target=0)。
+         *      只认速度帧 —— 收到一堆灯带帧/继电器帧并不代表有人在管车速。
+         *   2. **链路超时**: 多久没收到"任何合法帧" -> 认定上位机没了, 断继电器。
+         *      任何通过校验的帧都算 (证明上位机还活着)。
+         *
+         * 注意第 1 条是**锁存**的(failsafe_latched), 免得每个周期重复清 target;
+         * 第 2 条不锁存 —— Relay_Set(0) 本身幂等, 而且链路恢复后必须能自动合回来。
+         *-------------------------------------------------------------------*/
         if ((failsafe_latched == 0) &&
             (ever_linked) &&
             ((g_tick_ms - last_cmd_ms) > LINK_TIMEOUT_MS))
@@ -1480,10 +1493,15 @@ int main(void)
             target_vx = 0.0f;
             target_wz = 0.0f;
             failsafe_latched = 1;
-#if RELAY_OFF_ON_LINK_LOSS
-            Relay_Set(0);       /* 断线了顺便把滚刷/水泵继电器也断开 */
-#endif
         }
+
+#if RELAY_OFF_ON_LINK_LOSS
+        if ((ever_linked) &&
+            ((g_tick_ms - last_frame_ms) > LINK_TIMEOUT_MS))
+        {
+            Relay_Set(0);       /* 上位机彻底不说话了, 滚刷/水泵也断开 */
+        }
+#endif
 
         /* 轮速采样 + IMU */
         if ((g_tick_ms - last_odom_ms) >= ODOM_PERIOD_MS)

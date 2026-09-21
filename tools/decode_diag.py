@@ -185,6 +185,27 @@ def build_cmd(vx, wz):
     return bytes(f)
 
 
+def build_relay(mask):
+    """构造 11 字节**继电器**帧 (本工程自定义扩展, 和速度帧同头同尾同长度,
+    靠 f[1]=FUNC_RELAY 区分)。f[2] = 掩码: bit0 滚刷, bit1 水泵。
+
+    ★ 别把它当速度帧发: f[3..8] 会被解析成 vx/wz。STM32 那边先判 f[1], 所以
+      只要帧本身合法就不会误解析 —— 但第三方上位机不认识这条帧, 别指望它们发。
+
+    ★ 必须**持续发**: STM32 的断链保护(RELAY_OFF_ON_LINK_LOSS)在 800ms 收不到
+      任何合法帧时会把两个继电器都断开。所以"开滚刷"是"持续喂帧"而不是"发一次"。"""
+    f = bytearray(CMD_SIZE)
+    f[0] = CMD_HEAD
+    f[1] = 0x05                    # FUNC_RELAY
+    f[2] = mask & 0x03
+    bcc = 0
+    for x in f[:CMD_SIZE - 2]:
+        bcc ^= x
+    f[CMD_SIZE - 2] = bcc
+    f[CMD_SIZE - 1] = CMD_TAIL
+    return bytes(f)
+
+
 class Sender(threading.Thread):
     """后台线程: 按 SEND_HZ 持续发同一条速度命令。
     必须持续发 —— STM32 有 800ms 看门狗, 停发就自动刹车。"""
@@ -472,9 +493,52 @@ def main():
                     help="边看边下发速度命令 (m/s 与 rad/s), 20Hz 持续发。"
                          "台架测试用: 否则只能下令或看数据二选一, 因为"
                          "串口是独占的。退出时自动连发零速停车。")
+    ap.add_argument("--relay", type=int, metavar="MASK",
+                    help="继电器保持模式: 只发继电器帧、不发速度。"
+                         "1=滚刷 2=水泵 3=两个都开 0=都关。"
+                         "必须持续发 —— STM32 断链 800ms 会自己把继电器断开。"
+                         "Ctrl-C 退出时自动发 0 关掉。")
     args = ap.parse_args()
 
     stream, dump = open_stream(args)
+
+    # ---- 继电器保持模式: 只发继电器帧, 绝不发速度帧 ----
+    # 为什么只发继电器帧就够了、而且是**更好**的:
+    #   STM32 里有两条独立的看门狗(见 main.c) ——
+    #     运动看门狗: 800ms 没收到**速度帧** -> target 归零, 车停住;
+    #     链路看门狗: 800ms 没收到**任何合法帧** -> 断开两个继电器。
+    #   所以只发继电器帧的效果正好是"车停着、滚刷保持转", 不会误动车。
+    if args.relay is not None:
+        if args.file:
+            sys.exit("--relay 需要真实串口, 不能和 -f 一起用")
+        mask = args.relay & 0x03
+        label = {0: "两个都关", 1: "滚刷开", 2: "水泵开", 3: "滚刷+水泵都开"}[mask]
+        frame = build_relay(mask)
+        print("# 继电器保持模式: %s (mask=%d)" % (label, mask))
+        print("# 每 50ms 发一帧, 不发速度帧 -> 车保持停住。Ctrl-C 退出并关掉。")
+        try:
+            while True:
+                stream.write(frame)
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            pass
+        except Exception as exc:
+            print("!! 发送失败: %s" % exc)
+        finally:
+            try:
+                for _ in range(STOP_BURST):
+                    stream.write(build_relay(0))
+                    time.sleep(0.02)
+                print("# 已发 0, 两个继电器都断开", file=sys.stderr)
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
     sender = None
     # 只有 --drive 时才知道主机下发的理论目标, 才能把外环修正量还原出来
