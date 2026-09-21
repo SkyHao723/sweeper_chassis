@@ -1,0 +1,19 @@
+[Unit]
+Description=Wheeltec chassis watchdog (/odom 停发就重启底盘栈)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smart
+Group=smart
+Environment=ROS_DOMAIN_ID=5
+Environment=HOME=/home/smart
+ExecStart=/bin/bash /home/smart/chassis_tools/chassis_watchdog.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

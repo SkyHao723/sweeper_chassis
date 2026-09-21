@@ -173,7 +173,40 @@ _ros_source() {
 ```
 
 默认叠加 `smart_ws`、`robot_lidar_stack/ros2_ws`、`LY_inspect_ws`、`teb_ws`。
-`ROS_DOMAIN_ID=5`。
+
+### ★ ROS_DOMAIN_ID 必须处处一致（踩过，而且坑了很久）
+
+`ROS_DOMAIN_ID=5` **写在 `.bashrc` 里 —— 这是不够的**。
+
+`.bashrc` 顶部有：
+
+```bash
+case $- in
+    *i*) ;;
+      *) return;;
+esac
+```
+
+**非交互 shell 会直接 return**，所以通过 `ssh host '命令'`、脚本、
+systemd 服务跑的时候，`.bashrc` 里的 `export ROS_DOMAIN_ID=5` **根本不会执行**，
+用的是默认域 **0**。
+
+后果是 DDS 域不一致，**两边互相看不见对方的话题**：
+
+| 现象 | 真相 |
+|---|---|
+| 脚本报"收不到 /odom"，但节点明明活着 | 栈在域 5、检查在域 0 |
+| "节点卡死、进程活着但不发数据" | 同上，节点其实是好的 |
+| 用脚本 start 起来就正常，用户手动起就不行 | start 的启动和检查在同一个域 |
+| **节点崩溃循环、`serial port opened` 后立刻抛 SerialException** | 两份 launch 一个域 5 一个域 0 —— DDS 里不冲突，**但串口是独占的，两个进程在死磕** |
+
+**已修**：把 `ROS_DOMAIN_ID=5` 写进 `/etc/environment`（系统级，PAM 会给所有
+登录会话设上），`chassis_bringup.sh` 里也兜了一层。
+
+> 排查时的教训：`ros2 node list` 空、`ros2 topic echo` 报
+> "Could not determine the type for the passed topic"，**先别怀疑节点** ——
+> 先确认 `echo $ROS_DOMAIN_ID` 在**当前这个 shell** 里是多少。
+> （另外 daemon 缓存过期也会有类似症状，`ros2 daemon stop; ros2 daemon start`。）
 
 ### 踩过的坑：`setup.bash` 里有失效的父工作区链
 

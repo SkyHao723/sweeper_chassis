@@ -26,6 +26,23 @@ PORT=/dev/wheeltec_controller
 # 工作目录不对时会报"未找到命令"(踩过)
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 
+# ★ ROS_DOMAIN_ID 必须一致, 否则两边互相看不见对方的话题!
+#
+#   踩过的大坑: 这台车的 .bashrc 里写着 `export ROS_DOMAIN_ID=5`, 但 .bashrc
+#   顶部有 `case $- in *i*) ;; *) return;; esac` —— **非交互 shell 会直接
+#   return**, 所以通过 `ssh host 'cmd'` 或脚本跑的时候拿不到这个变量, 用的是
+#   默认域 0。于是:
+#     - 脚本在域 0 启动的栈, 用户在终端(域 5)看不见 -> 误报"收不到 /odom"
+#     - 两份额外的 launch 一个域 5 一个域 0, DDS 里不冲突,
+#       **但在串口上是死磕的** -> 节点崩溃循环
+#   排查了很久才发现是域不一致, 而不是节点有问题。
+#
+#   已经在 /etc/environment 里写了 ROS_DOMAIN_ID=5 (系统级, PAM 会给所有
+#   登录会话设上)。这里再兜一层, 保证脚本自己跑也一致。
+if [ -z "${ROS_DOMAIN_ID:-}" ]; then
+    export ROS_DOMAIN_ID=5
+fi
+
 # 环境: .bashrc 里已经配好, 但脚本是非交互 shell, 这里显式再 source 一次
 if [ -z "${ROS_DISTRO:-}" ]; then
     source /opt/ros/humble/setup.bash
