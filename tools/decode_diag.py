@@ -24,12 +24,15 @@
     python3 tools/decode_diag.py -p /dev/ttyUSB0 --dump raw.bin
     python3 tools/decode_diag.py -f raw.bin
 
-诊断帧布局 (32 字节, 多字节高字节在前):
+诊断帧布局 (36 字节, 多字节高字节在前):
     [0]     0x7E
     [1]     flags  bit0 曾收到命令 bit1 看门狗已停车 bit2 IMU有效 bit3 陀螺仪有效
+                   bit4 上次复位是 IWDG(主循环卡死过)
     [2-3]   车体 vx   mm/s          [4-5]  车体 wz   mrad/s
     [6-7]   左轮 实际 RPM           [8-9]  右轮 实际 RPM
-    [10-11] 左轮 目标 RPM           [12-13] 右轮 目标 RPM
+    [10-11] 左轮 最终命令 RPM       [12-13] 右轮 最终命令 RPM
+            ★ 这两个是**含外环修正**的最终命令, 不是主机下发的理论目标。
+              用 --drive 时本脚本知道理论目标, 会自动把修正量还原出来显示。
     [14-15] 1号驱动器 输出扭矩电流 A*10   [16-17] 2号驱动器 输出扭矩电流 A*10
     [18]    1号驱动器 故障码        [19]   2号驱动器 故障码
     [20]    1号驱动器 模式          [21]   2号驱动器 模式
@@ -104,6 +107,21 @@ CUR_EPS = 10         # = 1.0A。低于它认为驱动器没在使劲。
 
 # 协议规定的陀螺仪换算系数(±500dps 量程): rad/s = 原始值 * 0.00026644
 GYRO_RATIO = 0.00026644
+
+# 底盘几何 —— 必须和固件 main.c 里的一致, 否则还原出来的外环修正量是错的。
+# 用途: 固件上报的"目标"是**含外环修正的最终命令**, 拿这里算出的理论目标一减,
+# 就得到外环到底加了多少。见 main.c 的 Trim_Apply。
+WHEEL_DIAMETER_MM = 205.0
+TRACK_WIDTH_MM = 930.0
+WHEEL_CIRC_M = WHEEL_DIAMETER_MM / 1000.0 * 3.141592653589793
+TRACK_WIDTH_M = TRACK_WIDTH_MM / 1000.0
+
+
+def nominal_rpm(vx, wz):
+    """主机下发的 (vx, wz) -> 左右轮理论物理转速, 和固件 Drive_Apply 同一套公式。"""
+    v_l = vx - wz * TRACK_WIDTH_M * 0.5
+    v_r = vx + wz * TRACK_WIDTH_M * 0.5
+    return (v_l / WHEEL_CIRC_M * 60.0, v_r / WHEEL_CIRC_M * 60.0)
 
 
 def i16(b, i):
@@ -270,7 +288,7 @@ class Diag(object):
                                 % (tag, tgt, act, cur / 10.0)))
         return out
 
-    def line(self, bat_mv=0, gyro=None):
+    def line(self, bat_mv=0, gyro=None, nom=None):
         bat = (" bat=%.1fV" % (bat_mv / 1000.0)) if bat_mv else ""
         imu = IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st)
         if self.imu_st != 0:
@@ -282,15 +300,23 @@ class Diag(object):
             g = " gyro=(%+d,%+d,%+d)=%.3f,%.3f,%.3frad/s" % (
                 gyro[0], gyro[1], gyro[2],
                 gyro[0] * GYRO_RATIO, gyro[1] * GYRO_RATIO, gyro[2] * GYRO_RATIO)
+        # 上报的"目标"是含外环修正的最终命令; 知道主机下发的理论目标就能把它
+        # 还原出来。只在非零时显示, 免得占地方。
+        trim = ""
+        if nom is not None:
+            dl = int(round(self.tl - nom[0]))
+            dr = int(round(self.tr - nom[1]))
+            if dl or dr:
+                trim = " 外环修正%+d/%+d" % (dl, dr)
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
-                "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
+                "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
                 "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s"
                 % (self.seq, self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
-                   mode_name(self.m2), fault_name(self.f2),
+                   mode_name(self.m2), fault_name(self.f2), trim,
                    self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g))
 
 
@@ -419,6 +445,8 @@ def main():
     stream, dump = open_stream(args)
 
     sender = None
+    # 只有 --drive 时才知道主机下发的理论目标, 才能把外环修正量还原出来
+    nom = nominal_rpm(args.drive[0], args.drive[1]) if args.drive else None
     if args.drive:
         if args.file:
             sys.exit("--drive 需要真实串口, 不能和 -f 一起用")
@@ -428,6 +456,8 @@ def main():
         sender.start()
         print("# 正在下发 vx=%.3f m/s  wz=%.3f rad/s  (Ctrl-C 停止)"
               % (args.drive[0], args.drive[1]))
+        print("# 理论轮速目标: 左 %+.1f RPM  右 %+.1f RPM"
+              "  —— 固件上报的'目标'含外环修正, 相减就是修正量" % nom)
 
     t0 = time.time()
     last_diag = None
@@ -464,7 +494,7 @@ def main():
                 continue
 
             last_diag = d
-            print(d.line(bat_mv, gyro_raw))
+            print(d.line(bat_mv, gyro_raw, nom))
             for p in probs:
                 print("    !! " + p)
             if dropped:

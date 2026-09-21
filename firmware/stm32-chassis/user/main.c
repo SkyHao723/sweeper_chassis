@@ -226,6 +226,37 @@
 #define TELEMETRY_PERIOD_MS 50      /* 上报周期 (20Hz) */
 #define RPM_STALE_MS       200      /* 驱动器这么久没回码就认为转速无效 */
 
+/*------------------- 轮速闭环修正 (外环 trim) ----------------------
+ * 为什么需要:
+ *   驱动器自己的速度环在小误差下给出的电流不足以快速突破静摩擦。实测原地
+ *   转(2026-09): 第 0 秒只有目标的 1%~26% —— **即使目标高达 43 RPM 也一样**;
+ *   第 2 秒又过冲到 120%; 稳态则散在 85%~115%; 左右两轮还不一样。
+ *   而直线运动 0.07 秒就到 80%, 同一个轮速区间表现完全不同, 所以这不是
+ *   驱动器低速死区, 是原地转要克服轮胎刮擦/静摩擦。既然轮子是真的没转
+ *   (不是空转打滑), 那就把指令顶上去, 直到它真的转。
+ *   STM32 这边原来是**纯开环**: 算完目标轮速直接发, 从不回读实际转速。
+ *
+ * 做法: 只含积分的慢外环, 按驱动器回传的实际转速修目标值。
+ *   不做比例项 —— 比例项等于把驱动器那个环照抄一遍, 两个快环叠在一起容易
+ *   互相激振; 积分只修偏差的平均值, 不介入快速动态, 风险最低。
+ *   也不需要额外低通滤波器: 驱动器低速回码本身在抖, 而积分天然就是在取平均,
+ *   再加一级低通只会白白引入相位滞后。
+ *
+ * 安全性(按"绝不引入新的失控模式"设计):
+ *   1. 修正量硬限幅 ±TRIM_MAX_RPM, 最后整体再限到 ±MAX_RPM —— 输出永远落在
+ *      "普通全速命令"能到的范围内, 到不了开环命令到不了的转速。
+ *   2. 目标为 0(停车/刹车/单轮不动)时修正量立即清零, 不留历史, 否则下次
+ *      起步会带着上次攒的修正猛地一下冲出去。
+ *   3. 驱动器回码不新鲜时不积分(只保持) —— 拿掉线后的旧数据积分会把修正量
+ *      一路喂到限幅。
+ *   4. 修正量可从诊断帧推出(上报的"目标"是修正后的最终命令, 减去主机下发的
+ *      理论目标就是修正量), 它有没有在乱冲一看便知。
+ *=================================================================*/
+#define TRIM_ENABLE        1
+#define TRIM_KI            1.5f     /* 每秒、每 1 RPM 偏差攒多少 RPM 修正 */
+#define TRIM_MAX_RPM       30.0f    /* 单轮修正量上限 (RPM) */
+#define TRIM_DEADBAND_RPM  0.5f     /* 目标小于这个就当"不该动", 修正清零 */
+
 /*-------------------------- IMU --------------------------------*/
 /* IMU 读一次大概 1~3ms(位翻转 I2C), 和轮速一起按 ODOM_PERIOD_MS 采样。
  *
@@ -285,13 +316,17 @@ static uint8_t  can_error_count;
 static volatile uint8_t m1_fault, m2_fault;     /* DATA1 故障码, 见 FOC_FAULT_* */
 static volatile uint8_t m1_mode,  m2_mode;      /* DATA0 当前运行模式 0x05/0x06... */
 static volatile int16_t m1_rpm,   m2_rpm;       /* DATA2/3 实际转速 RPM */
-static volatile int16_t m1_cur,   m2_cur;       /* DATA4/5 输出扭矩电流, A x100 */
+static volatile int16_t m1_cur,   m2_cur;       /* DATA4/5 输出扭矩电流, A x10 */
 static uint32_t m1_rpm_ms, m2_rpm_ms;
 static volatile uint16_t battery_mv;
 
 /* 轮速计 */
 static int16_t  wheel_left_rpm, wheel_right_rpm;   /* 已按接线校准的物理轮速 */
+static uint8_t  wheel_left_fresh, wheel_right_fresh; /* 该轮回码是否新鲜 */
 static float    body_vx, body_wz;                  /* 轮速正解出的车体速度 */
+
+/* 外环修正量 (RPM, 物理轮速域) —— 见 TRIM_* 的说明 */
+static float    trim_l, trim_r;
 
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
@@ -828,12 +863,17 @@ static void Wheel_Update(void)
 {
     int16_t a = m1_rpm;
     int16_t b = m2_rpm;
+    uint8_t f1, f2;
     float v_left;
     float v_right;
 
-    /* 驱动器掉线时实际转速会一直停在最后一个值, 必须当成 0, 否则会飘 */
-    if ((g_tick_ms - m1_rpm_ms) > RPM_STALE_MS) a = 0;
-    if ((g_tick_ms - m2_rpm_ms) > RPM_STALE_MS) b = 0;
+    /* 驱动器掉线时实际转速会一直停在最后一个值, 必须当成 0, 否则会飘。
+       同时把"新鲜度"单独记下来 —— 外环积分必须知道这个数是真值还是残值,
+       拿残值积分会把修正量一路喂到限幅。 */
+    f1 = ((g_tick_ms - m1_rpm_ms) > RPM_STALE_MS) ? 0 : 1;
+    f2 = ((g_tick_ms - m2_rpm_ms) > RPM_STALE_MS) ? 0 : 1;
+    if (!f1) a = 0;
+    if (!f2) b = 0;
 
     /* 驱动器报的是"命令方向"上的转速, 按安装校准换算成物理方向 */
     if (MOTOR1_INVERT) a = (int16_t)(-a);
@@ -843,11 +883,15 @@ static void Wheel_Update(void)
     {
         wheel_left_rpm = a;
         wheel_right_rpm = b;
+        wheel_left_fresh  = f1;
+        wheel_right_fresh = f2;
     }
     else
     {
         wheel_left_rpm = b;
         wheel_right_rpm = a;
+        wheel_left_fresh  = f2;
+        wheel_right_fresh = f1;
     }
 
     /* 正向运动学: 左右轮线速度 -> 车体速度 (协议里上报的就是这个) */
@@ -857,6 +901,58 @@ static void Wheel_Update(void)
     body_wz = (v_right - v_left) / TRACK_WIDTH_M;
 }
 
+/*========================= 轮速外环修正 ============================
+ * 按实际轮速修目标轮速, 返回真正要发给驱动器的转速。
+ * 只含积分 —— 为什么不做比例项、为什么安全, 见 TRIM_* 上面那段。
+ *
+ * 注意 nominal 是主机下发的理论物理轮速, actual 是驱动器回传的实际物理轮速,
+ * 两者都在物理轮速域(已按接线校准), 所以可以直接相减。
+ *=================================================================*/
+static float Trim_Apply(float nominal, float actual, uint8_t fresh,
+                        float dt, float *trim)
+{
+    float out;
+
+#if TRIM_ENABLE
+    /* 不该动的时候立刻清零, 不留历史 */
+    if ((nominal > -TRIM_DEADBAND_RPM) && (nominal < TRIM_DEADBAND_RPM))
+    {
+        *trim = 0.0f;
+        return 0.0f;
+    }
+
+    /* 回码不新鲜就不积分, 只保持当前值 */
+    if (fresh)
+    {
+        *trim += TRIM_KI * (nominal - actual) * dt;
+        if (*trim >  TRIM_MAX_RPM) *trim =  TRIM_MAX_RPM;
+        if (*trim < -TRIM_MAX_RPM) *trim = -TRIM_MAX_RPM;
+    }
+
+    out = nominal + *trim;
+
+    /* 抗积分饱和: 输出顶到 MAX_RPM 时把修正量收回, 让它刚好不超 */
+    if (out > (float)MAX_RPM)
+    {
+        out = (float)MAX_RPM;
+        *trim = out - nominal;
+    }
+    else if (out < -(float)MAX_RPM)
+    {
+        out = -(float)MAX_RPM;
+        *trim = out - nominal;
+    }
+#else
+    (void)actual;
+    (void)fresh;
+    (void)dt;
+    *trim = 0.0f;
+    out = nominal;
+#endif
+
+    return out;
+}
+
 /*========================= 差速逆解 ================================
  * 车体 (vx, wz) -> 左右轮目标转速。差速车用不到 vy。
  *   v_left  = vx - wz * b/2
@@ -864,24 +960,44 @@ static void Wheel_Update(void)
  *=================================================================*/
 static void Drive_Apply(void)
 {
+    /* 外环积分用的真实周期。主循环里还夹着 IMU 读取(1~3ms)等开销, 实际周期
+       会比 CAN_PERIOD_MS 略大; 用固定值会让 TRIM_KI 的实际含义随负载漂移,
+       参数就没法标定了。异常值(第一次调用/计时器回绕/严重卡顿)兜底成标称值。 */
+    static uint32_t last_trim_ms = 0;
+    float dt = (float)(g_tick_ms - last_trim_ms) * 0.001f;
+
     float v_left = target_vx - target_wz * (TRACK_WIDTH_M * 0.5f);
     float v_right = target_vx + target_wz * (TRACK_WIDTH_M * 0.5f);
     float rpm_l = v_left / WHEEL_CIRC_M * 60.0f;
     float rpm_r = v_right / WHEEL_CIRC_M * 60.0f;
+    float cmd_l;
+    float cmd_r;
     int16_t m1;
     int16_t m2;
+
+    if ((dt <= 0.0f) || (dt > 0.2f)) dt = (float)CAN_PERIOD_MS * 0.001f;
+    last_trim_ms = g_tick_ms;
 
     rpm_l = ClampF(rpm_l, -(float)MAX_RPM, (float)MAX_RPM);
     rpm_r = ClampF(rpm_r, -(float)MAX_RPM, (float)MAX_RPM);
 
+    /* 外环修正: 用实际轮速去修目标轮速。原地转起步时轮子是真的没转, 这里会把
+       指令顶上去直到它真的转; 稳态偏高时又会把指令压回来。
+       ★ 目标为 0 时 Trim_Apply 恒定返回 0, 所以外环**不可能**在主机下令停车
+         的时候把车带着走 —— 这是这套做法敢上车的底线。 */
+    cmd_l = Trim_Apply(rpm_l, (float)wheel_left_rpm,  wheel_left_fresh,  dt, &trim_l);
+    cmd_r = Trim_Apply(rpm_r, (float)wheel_right_rpm, wheel_right_fresh, dt, &trim_r);
+
     /* 物理轮速 -> CAN 命令 (反向应用接线校准) */
-    if (MOTOR1_IS_LEFT) { m1 = (int16_t)rpm_l; m2 = (int16_t)rpm_r; }
-    else                { m1 = (int16_t)rpm_r; m2 = (int16_t)rpm_l; }
+    if (MOTOR1_IS_LEFT) { m1 = (int16_t)cmd_l; m2 = (int16_t)cmd_r; }
+    else                { m1 = (int16_t)cmd_r; m2 = (int16_t)cmd_l; }
     if (MOTOR1_INVERT) m1 = (int16_t)(-m1);
     if (MOTOR2_INVERT) m2 = (int16_t)(-m2);
 
-    target_left_rpm = (int16_t)rpm_l;      /* 上报给上位机的是物理轮速目标, */
-    target_right_rpm = (int16_t)rpm_r;     /* 不是电机命令, 免得左右概念混淆 */
+    /* 上报的是**最终真正发给驱动器**的物理轮速(含外环修正), 不是电机命令,
+       免得左右概念混淆。主机拿自己下发的理论目标去减, 就是外环修正量。 */
+    target_left_rpm  = (int16_t)cmd_l;
+    target_right_rpm = (int16_t)cmd_r;
 
     /*===================== 走 / 停 两态 =====================
      * 停车就是一条 STOP_CTRL 帧, 每个控制周期重发。
@@ -1099,8 +1215,8 @@ static void Send_DiagFrame(uart_port_t *p)
     PutI16(&f[8],  wheel_right_rpm);
     PutI16(&f[10], target_left_rpm);     /* 目标 */
     PutI16(&f[12], target_right_rpm);
-    PutI16(&f[14], m1_cur);              /* 1号驱动器 输出扭矩电流 A×100 */
-    PutI16(&f[16], m2_cur);              /* 2号驱动器 */
+    PutI16(&f[14], m1_cur);              /* 1号驱动器 输出扭矩电流 A×10 */
+    PutI16(&f[16], m2_cur);              /* 2号驱动器 输出扭矩电流 A×10 */
     f[18] = m1_fault;                    /* 1号故障码, 见 FOC_FAULT_* */
     f[19] = m2_fault;
     f[20] = m1_mode;                     /* 1号当前模式 0x05 速度 / 0x06 位置 */
