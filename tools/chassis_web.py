@@ -100,6 +100,23 @@ PUB_CHECK_EVERY = 1.0    # 多久查一次 /cmd_vel 上还有没有别的发布�
 VX_LIMIT_DEFAULT = 0.35  # m/s。实测工作包线 0.25~0.35 最好, >0.4 超速
 WZ_LIMIT_DEFAULT = 1.2   # rad/s
 
+# 历史每行的列序。**前 PAGE_N 列是页面画图用的, 顺序不能改** —— 前端按列号取值。
+# 后面的列只给导出用, 所以页面轮询时会被裁掉(见 payload), 免得白传一堆数。
+PAGE_N = 13
+EXPORT_HEADER = [
+    "时间(s)",
+    "命令vx(m/s)", "轮速vx(m/s)", "EKFvx(m/s)", "前进达成率(%)",
+    "命令wz(rad/s)", "轮速wz(rad/s)", "EKFwz(rad/s)", "转向达成率(%)",
+    "轮速x(m)", "轮速y(m)", "轮速偏航(deg)",
+    "EKFx(m)", "EKFy(m)", "EKF偏航(deg)",
+    "航向差(deg,相对本表首行)",
+    "陀螺x(rad/s)", "陀螺y(rad/s)", "陀螺z(rad/s)",
+    "加速度x(m/s2)", "加速度y(m/s2)", "加速度z(m/s2)",
+    "电池(V)",
+]
+# 导出里各数值保留几位小数由下面每列自己写, 不用表来配 —— 派生列夹在中间,
+# 配表反而更难对。见 export_csv()。
+
 # 版本标记。改控制逻辑时**顺手加一**, 这样"测试到底连的是哪份代码"一眼能看出来 ——
 # 曾经因为旧实例没杀干净, 测试连了旧代码, 报了一堆假 FAIL, 白查半天。
 BUILD_ID = "webctl-3"
@@ -220,8 +237,14 @@ class Collector(Node):
             l["odom_yaw"] = round(yaw_of(m.pose.pose.orientation), 4)
             self._tick("/odom")
 
-            # 一帧一行, 各条线共用同一时间轴
-            # [11][12] 两列偏航是给前端算"相对漂移"用的 —— 绝对差没意义, 见文件头
+            # 一帧一行, 各条线共用同一时间轴。
+            # 列序见 EXPORT_HEADER —— **前 13 列是页面画图要用的**, 顺序别动,
+            # 否则前端的列号就全错位了(见 PAGE_COLS)。
+            # IMU 也是 20Hz, 但和 /odom 不是同一时刻的回调, 所以这里取的是
+            # "这一帧 /odom 到达时最新的 IMU 值", 可能差几十毫秒。
+            # 电池只有 ~1.8Hz, 是**保持上一个值**(采样保持), 不是同一时刻采的。
+            g = l["gyro"] or [None, None, None]
+            a = l["accel"] or [None, None, None]
             self.hist.append([
                 round(time.time() - self.t0, 3),
                 l["cmd_vx"], l["odom_vx"], l["ekf_vx"],
@@ -229,6 +252,9 @@ class Collector(Node):
                 l["odom_x"], l["odom_y"],
                 l["ekf_x"], l["ekf_y"],
                 l["odom_yaw"], l["ekf_yaw"],
+                g[0], g[1], g[2],
+                a[0], a[1], a[2],
+                l["bat"],
             ])
 
     def cb_imu(self, m):
@@ -360,8 +386,13 @@ class Collector(Node):
             ages = {t: self._age(t) for t in
                     ("/odom", "/odom_combined", "/imu/data_raw",
                      "/cmd_vel", "/PowerVoltage")}
-            hist = list(self.hist)[-WINDOW:]
-            n_total = len(self.hist)
+            full = list(self.hist)
+            # 只把前 PAGE_N 列发给页面(画图够用), 后面的 IMU/电池列留给导出,
+            # 免得 5Hz 轮询白传一堆数
+            hist = [list(r[:PAGE_N]) for r in full[-WINDOW:]]
+            n_total = len(full)
+            # 缓冲区里到底攒了多久 —— 导出前让用户知道能拿到多少, 别以为是"永久"
+            span = round(full[-1][0] - full[0][0], 1) if len(full) > 1 else 0.0
 
             ctrl = {
                 "allow": self.allow_control,     # 服务端是否允许控制(--no-control)
@@ -409,9 +440,64 @@ class Collector(Node):
             "ages": ages,
             "hist": hist,
             "hist_total": n_total,
+            "hist_span": span,
+            "hist_max": HIST_MAX,
             "ctrl": ctrl,
             "range_names": [c for c in "ABCDEF"],
         }
+
+    # ---------------- 导出 ----------------
+    def export_csv(self):
+        """把最近 HIST_MAX 帧(≈30 秒 @20Hz)导成 CSV。
+
+        为什么是 CSV + UTF-8 BOM:
+          - `.csv` 双击就进 Excel / WPS / LibreOffice, 不用装任何库;
+          - **BOM 一个字节都不能省** —— 不带的话 Windows 版 Excel 会按本地代码页
+            解, 中文表头直接变乱码。这就是"能打开"和"打开是一堆问号"的区别。
+          - 行尾用 CRLF, 也是给 Excel 面子。
+        """
+        import math as _m
+        with self.lock:
+            rows = list(self.hist)
+
+        def f(v, nd):
+            return "" if v is None else ("%.*f" % (nd, v))
+
+        # 相对航向差的基准 = 本表第一行, 和页面上"相对打开页面时"是同一口径
+        base_o = rows[0][11] if rows else None
+        base_e = rows[0][12] if rows else None
+
+        out = ["\ufeff" + ",".join(EXPORT_HEADER)]
+        for r in rows:
+            ratio_vx = None
+            if r[1] is not None and r[2] is not None and abs(r[1]) >= 0.02:
+                ratio_vx = r[2] / r[1] * 100.0
+            ratio_wz = None
+            if r[4] is not None and r[5] is not None and abs(r[4]) >= 0.05:
+                ratio_wz = r[5] / r[4] * 100.0
+            ydiff = None
+            if (base_o is not None and base_e is not None
+                    and r[11] is not None and r[12] is not None):
+                ydiff = _m.degrees((r[12] - base_e) - (r[11] - base_o))
+                while ydiff > 180.0:
+                    ydiff -= 360.0
+                while ydiff < -180.0:
+                    ydiff += 360.0
+
+            out.append(",".join([
+                f(r[0], 3),
+                f(r[1], 4), f(r[2], 4), f(r[3], 4), f(ratio_vx, 1),
+                f(r[4], 4), f(r[5], 4), f(r[6], 4), f(ratio_wz, 1),
+                f(r[7], 4), f(r[8], 4),
+                "" if r[11] is None else f(_m.degrees(r[11]), 2),
+                f(r[9], 4), f(r[10], 4),
+                "" if r[12] is None else f(_m.degrees(r[12]), 2),
+                f(ydiff, 2),
+                f(r[13], 4), f(r[14], 4), f(r[15], 4),
+                f(r[16], 3), f(r[17], 3), f(r[18], 3),
+                f(r[19], 2),
+            ]))
+        return "\r\n".join(out) + "\r\n"
 
 
 NODE = None
@@ -445,6 +531,24 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:                      # 别让一个异常打死服务
                 body = json.dumps({"ok": False, "err": str(e)}).encode("utf-8")
             self._send(200, body, "application/json; charset=utf-8")
+            return
+        if p == "/api/export.csv":
+            try:
+                body = NODE.export_csv().encode("utf-8")
+            except Exception as e:
+                self._send(500, ("导出失败: %s" % e).encode("utf-8"),
+                           "text/plain; charset=utf-8")
+                return
+            # 文件名带时间戳, 连续导出几次不互相覆盖
+            fn = "chassis_%s.csv" % time.strftime("%Y%m%d_%H%M%S")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Disposition",
+                             'attachment; filename="%s"' % fn)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
             return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 

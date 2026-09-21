@@ -601,7 +601,11 @@ def main():
                 print("    !! " + p)
 
             # 每 1 秒报一次加速度峰峰值 —— 用来判断轮速抖动是真是假
-            if accel is not None:
+            # ★ 必须丢掉"不可能"的样本: 真实加速度计永远读到重力, 模长不可能接近 0。
+            #   STM32 刚上电还没读到 IMU 时会发全 0, 那几帧会把峰峰值污染成 9.7,
+            #   于是**每一次**开头的峰峰值都误报"车在一窜一窜"。实测被它骗过。
+            #   用 L1 范数就够(判断"是不是接近 0"), 不必引入 math。
+            if accel is not None and (abs(accel[0]) + abs(accel[1]) + abs(accel[2])) > 1.0:
                 acc_hist.append(accel)
             n_diag += 1
             if n_diag % 20 == 0 and len(acc_hist) >= 20:

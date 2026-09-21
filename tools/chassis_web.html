@@ -86,6 +86,8 @@
   <span class="dim" id="status">连接中…</span>
   <span class="pill" id="uptime">—</span>
   <span class="dim" id="stamp"></span>
+  <span class="pill" id="histInfo" style="margin-left:auto">—</span>
+  <button class="btn" id="btnExport" title="导出缓冲区里最近约 30 秒的逐帧数据 (CSV, 带 BOM, Excel 直接打开不乱码)">导出前 30 s（CSV）</button>
 </header>
 
 <main>
@@ -325,6 +327,10 @@ async function tick() {
   $("status").innerHTML = '<span class="ok">已连接</span>';
   $("uptime").textContent = "运行 " + d.uptime.toFixed(0) + " 秒";
   $("stamp").textContent = new Date().toLocaleTimeString();
+  // 让用户知道导出的其实是"缓冲区里有多少", 不是"永久全部" ——
+  // 刚打开页面时可能还没攒够 30 秒
+  $("histInfo").textContent = "缓冲 " + d.hist_span.toFixed(1) + " s / " +
+                              d.hist_total + " 帧";
 
   const L = d.latest;
   const h = d.hist;
@@ -613,6 +619,13 @@ window.addEventListener("beforeunload", () => {
 
 $("btnArm").addEventListener("click", toggleArm);
 $("btnStop").addEventListener("click", estop);
+
+/* 导出: 直接跳到这个地址就行 —— 服务端带了 Content-Disposition: attachment,
+   浏览器会"下载"而不是"导航走", 而且文件名是服务端给的带时间戳的那个。
+   不用 blob/fetch 自己拼: 那样反而拿不到服务端的文件名, 还得自己处理 BOM。 */
+$("btnExport").addEventListener("click", () => {
+  window.location.href = "/api/export.csv";
+});
 
 /* ---- 心跳 10Hz。只在"真的在操作"时发, 免得平时白刷 ----
    服务端 0.5s 收不到就自己发 0 —— 所以浏览器崩了/网断了车也会停。 */
