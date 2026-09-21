@@ -434,6 +434,10 @@ bash ~/chassis_tools/check_ekf_yaml.sh
 
 # 同一工况连跑几次看可复现性 —— 驱动器低速环本身在抖, 单次结果不可信
 for i in 1 2 3; do python3 ~/chassis_tools/chassis_check.py --turn-only --dur 3; done
+
+# 数据网页 (只读; 局域网浏览器直接开 http://192.168.5.17:8080)
+systemctl status chassis-web
+journalctl -u chassis-web -f
 ```
 
 ---

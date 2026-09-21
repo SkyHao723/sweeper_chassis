@@ -1,0 +1,20 @@
+[Unit]
+Description=底盘数据网页 (只读, 局域网 http://<车IP>:8080)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=smart
+Group=smart
+Environment=ROS_DOMAIN_ID=5
+Environment=HOME=/home/smart
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/bash /home/smart/chassis_tools/chassis_web.sh
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

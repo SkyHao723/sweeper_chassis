@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>底盘数据</title>
+<style>
+  :root{
+    --bg:#12151a; --card:#1b2028; --card2:#232a34; --line:#2e3742;
+    --fg:#e6edf3; --dim:#8b97a6; --accent:#4fa3ff;
+    --ok:#3ecf8e; --warn:#ffb454; --bad:#ff6b6b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+       font:14px/1.5 -apple-system,"Segoe UI","Noto Sans CJK SC",sans-serif}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+         padding:14px 18px;border-bottom:1px solid var(--line)}
+  h1{font-size:17px;margin:0;font-weight:600}
+  .dim{color:var(--dim)}
+  .mono{font-family:ui-monospace,Consolas,"DejaVu Sans Mono",monospace}
+  main{padding:16px 18px 40px;max-width:1500px;margin:0 auto}
+  .row{display:grid;gap:14px;margin-bottom:14px}
+  .hero{grid-template-columns:repeat(3,1fr)}
+  .two{grid-template-columns:1fr 1fr}
+  .three{grid-template-columns:repeat(3,1fr)}
+  @media(max-width:900px){.hero,.two,.three{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+  .card h2{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--dim);
+           letter-spacing:.04em;text-transform:uppercase}
+  .big{font-size:42px;font-weight:650;line-height:1.05}
+  .big small{font-size:16px;font-weight:400;color:var(--dim);margin-left:4px}
+  .sub{color:var(--dim);font-size:12px;margin-top:6px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:right;padding:5px 6px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left;color:var(--dim)}
+  th{font-weight:600;color:var(--dim);font-size:12px}
+  canvas{width:100%;display:block;background:var(--card2);border-radius:6px}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin-top:8px;font-size:12px;color:var(--dim)}
+  .legend i{display:inline-block;width:10px;height:3px;margin-right:5px;vertical-align:middle}
+  .bars{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;margin-top:4px}
+  .bar{background:var(--card2);border-radius:6px;padding:8px;text-align:center}
+  .bar .v{font-size:17px;font-weight:600}
+  .bar .n{font-size:11px;color:var(--dim);margin-top:2px}
+  .pill{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;
+        background:var(--card2);color:var(--dim)}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <h1>底盘数据</h1>
+  <span class="dim" id="status">连接中…</span>
+  <span class="pill" id="uptime">—</span>
+  <span class="dim" id="stamp"></span>
+</header>
+
+<main>
+  <!-- 这三个是首页主角: 达成率回答"车有没有照我说的做",
+       航向差回答"EKF 到底有没有在纠偏" -->
+  <div class="row hero">
+    <div class="card">
+      <h2>前进达成率</h2>
+      <div class="big" id="ratioVx">—</div>
+      <div class="sub" id="ratioVxSub">/odom 实测 ÷ /cmd_vel 命令</div>
+    </div>
+    <div class="card">
+      <h2>转向达成率</h2>
+      <div class="big" id="ratioWz">—</div>
+      <div class="sub" id="ratioWzSub">/odom 实测 ÷ /cmd_vel 命令</div>
+    </div>
+    <div class="card">
+      <h2>航向差（相对打开页面时）</h2>
+      <div class="big" id="yawDiff">—</div>
+      <div class="sub" id="yawDiffSub">EKF 与轮速里程计分开了多少 —— 几乎不动 = IMU 没起作用</div>
+    </div>
+  </div>
+
+  <div class="row two">
+    <div class="card">
+      <h2>命令 vs 实测</h2>
+      <table>
+        <tr><th>量</th><th>命令</th><th>/odom 轮速</th><th>/odom_combined</th></tr>
+        <tr><td>vx (m/s)</td><td class="mono" id="tCmdVx">—</td>
+            <td class="mono" id="tOdomVx">—</td><td class="mono" id="tEkfVx">—</td></tr>
+        <tr><td>wz (rad/s)</td><td class="mono" id="tCmdWz">—</td>
+            <td class="mono" id="tOdomWz">—</td><td class="mono" id="tEkfWz">—</td></tr>
+        <tr><td>位置 (m)</td><td class="dim">—</td>
+            <td class="mono" id="tOdomPos">—</td><td class="mono" id="tEkfPos">—</td></tr>
+        <tr><td>偏航 (°)</td><td class="dim">—</td>
+            <td class="mono" id="tOdomYaw">—</td><td class="mono" id="tEkfYaw">—</td></tr>
+      </table>
+      <div class="sub" id="cmdAge"></div>
+    </div>
+    <div class="card">
+      <h2>IMU 与电池</h2>
+      <table>
+        <tr><th>量</th><th>x</th><th>y</th><th>z</th></tr>
+        <tr><td>陀螺 (rad/s)</td><td class="mono" id="gx">—</td>
+            <td class="mono" id="gy">—</td><td class="mono" id="gz">—</td></tr>
+        <tr><td>加速度 (m/s²)</td><td class="mono" id="ax">—</td>
+            <td class="mono" id="ay">—</td><td class="mono" id="az">—</td></tr>
+      </table>
+      <div class="sub" style="margin-top:10px">
+        电池 <span class="mono big" style="font-size:24px" id="bat">—</span>
+        <span class="dim">V</span>
+        <span class="dim" id="batAge"></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row two">
+    <div class="card">
+      <h2>前进速度 (m/s)</h2>
+      <canvas id="cvVx" height="200"></canvas>
+      <div class="legend">
+        <span><i style="background:#4fa3ff"></i>命令</span>
+        <span><i style="background:#3ecf8e"></i>/odom 轮速</span>
+        <span><i style="background:#ffb454"></i>/odom_combined</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>转向角速度 (rad/s)</h2>
+      <canvas id="cvWz" height="200"></canvas>
+      <div class="legend">
+        <span><i style="background:#4fa3ff"></i>命令</span>
+        <span><i style="background:#3ecf8e"></i>/odom 轮速</span>
+        <span><i style="background:#ffb454"></i>/odom_combined</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="row two">
+    <div class="card">
+      <h2>轨迹 (俯视, 上=车头朝向的起点)</h2>
+      <canvas id="cvXY" height="260"></canvas>
+      <div class="legend">
+        <span><i style="background:#3ecf8e"></i>/odom 轮速</span>
+        <span><i style="background:#ffb454"></i>/odom_combined (EKF)</span>
+        <span class="dim">点 = 当前位置</span>
+      </div>
+    </div>
+    <div class="card">
+      <h2>超声波 (m)</h2>
+      <div class="bars" id="ranges"></div>
+      <div class="sub" style="margin-top:12px">空 = 没量到(inf/0), 不是 0 米</div>
+
+      <h2 style="margin-top:18px">话题健康</h2>
+      <table>
+        <tr><th>话题</th><th>频率</th><th>最后收到</th></tr>
+        <tbody id="health"></tbody>
+      </table>
+    </div>
+  </div>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+
+/* ---------- 小工具 ---------- */
+const fmt = (v, n = 3) => (v === null || v === undefined) ? "—" : Number(v).toFixed(n);
+const deg = r => r === null || r === undefined ? null : r * 180 / Math.PI;
+
+function color(el, v, good, warnLo, warnHi) {
+  el.className = "big";
+  if (v === null || v === undefined) return;
+  if (v >= good) el.classList.add("ok");
+  else if (v >= warnLo && v <= warnHi) el.classList.add("warn");
+  else if (v < warnLo) el.classList.add("bad");
+}
+
+/* 画折线。series: [{pts:[[x,y],…], color, width}] */
+function lineChart(cv, series, opts) {
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== w * dpr || cv.height !== h * dpr) {
+    cv.width = w * dpr; cv.height = h * dpr;
+  }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  const pad = {l: 44, r: 8, t: 8, b: 18};
+
+  // 求范围
+  let xs = [], ys = [];
+  for (const s of series) for (const p of s.pts) { xs.push(p[0]); ys.push(p[1]); }
+  if (!xs.length) return;
+  let x0 = Math.min(...xs), x1 = Math.max(...xs);
+  let y0 = Math.min(...ys), y1 = Math.max(...ys);
+  if (opts && opts.zeroY) { y0 = Math.min(y0, 0); y1 = Math.max(y1, 0); }
+  if (opts && opts.equalXY) {
+    const c = [(x0 + x1) / 2, (y0 + y1) / 2];
+    const r = Math.max(x1 - x0, y1 - y0, 0.1) / 2 * 1.1;
+    x0 = c[0] - r; x1 = c[0] + r; y0 = c[1] - r; y1 = c[1] + r;
+    const ar = (w - pad.l - pad.r) / (h - pad.t - pad.b);
+    const rx = (x1 - x0) / 2, ry = (y1 - y0) / 2;
+    if (rx / ry > ar) { const ny = rx / ar; y0 = c[1] - ny; y1 = c[1] + ny; }
+    else { const nx = ry * ar; x0 = c[0] - nx; x1 = c[0] + nx; }
+  }
+  if (y1 - y0 < 1e-6) { y1 += 0.5; y0 -= 0.5; }
+  if (x1 - x0 < 1e-6) { x1 += 0.5; x0 -= 0.5; }
+  const padY = (y1 - y0) * 0.1; y0 -= padY; y1 += padY;
+
+  const X = v => pad.l + (v - x0) / (x1 - x0) * (w - pad.l - pad.r);
+  const Y = v => h - pad.b - (v - y0) / (y1 - y0) * (h - pad.t - pad.b);
+
+  // 网格 + y 轴刻度
+  g.strokeStyle = "#2e3742"; g.fillStyle = "#8b97a6";
+  g.font = "10px ui-monospace,monospace"; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = y0 + (y1 - y0) * i / 4, y = Y(v);
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+    g.textAlign = "right"; g.textBaseline = "middle";
+    g.fillText(v.toFixed(Math.abs(y1 - y0) < 1 ? 2 : 1), pad.l - 4, y);
+  }
+  // 零线
+  if (y0 < 0 && y1 > 0) {
+    g.strokeStyle = "#3c4756"; g.beginPath();
+    g.moveTo(pad.l, Y(0)); g.lineTo(w - pad.r, Y(0)); g.stroke();
+  }
+  // 折线
+  for (const s of series) {
+    if (!s.pts.length) continue;
+    g.strokeStyle = s.color;
+    g.lineWidth = s.width || 1.6;
+    g.beginPath();
+    s.pts.forEach((p, i) => i ? g.lineTo(X(p[0]), Y(p[1]))
+                              : g.moveTo(X(p[0]), Y(p[1])));
+    g.stroke();
+    // 当前点
+    const last = s.pts[s.pts.length - 1];
+    g.fillStyle = s.color;
+    g.beginPath(); g.arc(X(last[0]), Y(last[1]), s.dot || 2.6, 0, 7); g.fill();
+  }
+  // x 轴时间标注
+  g.fillStyle = "#8b97a6"; g.textAlign = "left"; g.textBaseline = "top";
+  g.fillText((x1 - x0).toFixed(0) + " s", pad.l + 2, h - 14);
+}
+
+/* ---------- 主循环 ---------- */
+const COL = {cmd: "#4fa3ff", odom: "#3ecf8e", ekf: "#ffb454"};
+let fails = 0;
+
+async function tick() {
+  let d;
+  try {
+    const r = await fetch("/api/data", { cache: "no-store" });
+    d = await r.json();
+    if (!d.ok) throw new Error(d.err || "服务端报错");
+  } catch (e) {
+    fails++;
+    $("status").innerHTML = '<span class="bad">连接不上</span> (' + fails + ') ' + e;
+    return;
+  }
+  fails = 0;
+  $("status").innerHTML = '<span class="ok">已连接</span>';
+  $("uptime").textContent = "运行 " + d.uptime.toFixed(0) + " 秒";
+  $("stamp").textContent = new Date().toLocaleTimeString();
+
+  const L = d.latest;
+  const h = d.hist;
+
+  /* 主角: 达成率 */
+  const rv = L.ratio_vx, rw = L.ratio_wz;
+  const pct = v => v === null || v === undefined ? "—" : (v * 100).toFixed(0) + "%";
+  $("ratioVx").textContent = pct(rv);
+  color($("ratioVx"), rv === null ? null : rv * 100, 90, 70, 130);
+  $("ratioVxSub").textContent = (L.cmd_vx === null || Math.abs(L.cmd_vx) < 0.02)
+    ? "（命令太小, 不算达成率）"
+    : "命令 " + fmt(L.cmd_vx, 3) + " → 实测 " + fmt(L.odom_vx, 3) + " m/s";
+
+  $("ratioWz").textContent = pct(rw);
+  color($("ratioWz"), rw === null ? null : rw * 100, 90, 70, 130);
+  $("ratioWzSub").textContent = (L.cmd_wz === null || Math.abs(L.cmd_wz) < 0.05)
+    ? "（命令太小, 不算达成率）"
+    : "命令 " + fmt(L.cmd_wz, 3) + " → 实测 " + fmt(L.odom_wz, 3) + " rad/s";
+
+  /* 航向差: **必须用变化量, 而且必须先确认车真的动过**。
+     两个坑:
+       1. 两路位姿的原点不同(各自从自己的初始位姿起算), 实测绝对差能到 173° ——
+          那不是"EKF 纠了 173°", 那是坐标系不一样。所以只能比"变化量"。
+       2. **车停着时相对漂移必然是 0**, 那不代表"IMU 没起作用"。所以要先看这 10 秒
+          里车有没有真的动过(路程 > 0.3m 或转过 > 8°), 没动就不给结论。 */
+  const wrapPi = a => { while (a > Math.PI) a -= 2 * Math.PI;
+                        while (a < -Math.PI) a += 2 * Math.PI; return a; };
+  let ydDeg = null, moved = false, path = 0, turned = 0;
+  const withYaw = h.filter(r => r[11] !== null && r[12] !== null);
+  if (withYaw.length >= 2) {
+    const a = withYaw[0], b = withYaw[withYaw.length - 1];
+    const rel = wrapPi((b[12] - a[12]) - (b[11] - a[11]));
+    ydDeg = rel * 180 / Math.PI;
+    for (let i = 1; i < withYaw.length; i++) {
+      turned += Math.abs(wrapPi(withYaw[i][11] - withYaw[i - 1][11]));
+      if (withYaw[i][7] !== null && withYaw[i - 1][7] !== null) {
+        const dx = withYaw[i][7] - withYaw[i - 1][7];
+        const dy = withYaw[i][8] - withYaw[i - 1][8];
+        path += Math.hypot(dx, dy);
+      }
+    }
+    moved = (path > 0.3) || (turned > 0.15);
+  }
+  $("yawDiff").textContent = ydDeg === null ? "—" : ydDeg.toFixed(2) + "°";
+  $("yawDiff").className = "big";
+  if (ydDeg === null) {
+    $("yawDiffSub").textContent = "还没有足够数据";
+  } else if (!moved) {
+    // 中性色 —— 静止时 0 漂移是正常的, 不该报警也不该判好
+    $("yawDiffSub").textContent = "这 10 秒里车基本没动（路程 " + path.toFixed(2) +
+      " m, 转过 " + (turned * 180 / Math.PI).toFixed(1) + "°）→ 这个数先不算";
+  } else {
+    const abs = Math.abs(ydDeg);
+    $("yawDiff").classList.add(abs < 0.3 ? "bad" : (abs < 1 ? "warn" : "ok"));
+    $("yawDiffSub").textContent = "已动 " + path.toFixed(2) + " m / " +
+      (turned * 180 / Math.PI).toFixed(0) + "°，EKF 与轮速分开 " + abs.toFixed(2) +
+      "°" + (abs < 0.3 ? " ⚠ 几乎不动, IMU 可能没被用上"
+                       : "（分开也可能只是 IMU 自己在漂）");
+  }
+
+  /* 表格 */
+  $("tCmdVx").textContent = fmt(L.cmd_vx, 3);
+  $("tOdomVx").textContent = fmt(L.odom_vx, 3);
+  $("tEkfVx").textContent = fmt(L.ekf_vx, 3);
+  $("tCmdWz").textContent = fmt(L.cmd_wz, 3);
+  $("tOdomWz").textContent = fmt(L.odom_wz, 3);
+  $("tEkfWz").textContent = fmt(L.ekf_wz, 3);
+  $("tOdomPos").textContent = L.odom_x === null ? "—"
+    : L.odom_x.toFixed(2) + ", " + L.odom_y.toFixed(2);
+  $("tEkfPos").textContent = L.ekf_x === null ? "—"
+    : L.ekf_x.toFixed(2) + ", " + L.ekf_y.toFixed(2);
+  $("tOdomYaw").textContent = L.odom_yaw === null ? "—" : deg(L.odom_yaw).toFixed(1);
+  $("tEkfYaw").textContent = L.ekf_yaw === null ? "—" : deg(L.ekf_yaw).toFixed(1);
+  $("cmdAge").textContent = L.cmd_age === null
+    ? "还没收到过 /cmd_vel（没人发速度就是正常的）"
+    : "上次 /cmd_vel 在 " + L.cmd_age.toFixed(2) + " 秒前";
+
+  /* IMU / 电池 */
+  const g = L.gyro || [null, null, null], a = L.accel || [null, null, null];
+  $("gx").textContent = fmt(g[0], 3); $("gy").textContent = fmt(g[1], 3);
+  $("gz").textContent = fmt(g[2], 3);
+  $("ax").textContent = fmt(a[0], 2); $("ay").textContent = fmt(a[1], 2);
+  $("az").textContent = fmt(a[2], 2);
+  $("bat").textContent = L.bat === null ? "—" : L.bat.toFixed(1);
+  $("batAge").textContent = L.bat_age === null ? "" : "（" + L.bat_age.toFixed(0) + "s 前）";
+
+  /* 超声波 */
+  if (!$("ranges").dataset.built) {
+    $("ranges").innerHTML = d.range_names.map((n, i) =>
+      '<div class="bar"><div class="v mono" id="rg' + i + '">—</div>' +
+      '<div class="n">' + n + '</div></div>').join("");
+    $("ranges").dataset.built = "1";
+  }
+  L.ranges.forEach((v, i) => {
+    const el = $("rg" + i);
+    if (el) { el.textContent = v === null ? "—" : v.toFixed(2);
+              el.style.color = v === null ? "" : (v < 0.4 ? "var(--bad)" : ""); }
+  });
+
+  /* 话题健康 */
+  const order = ["/odom", "/odom_combined", "/imu/data_raw", "/cmd_vel", "/PowerVoltage"];
+  $("health").innerHTML = order.map(t => {
+    const hz = d.rates[t], age = d.ages[t];
+    let cls = "", txt = "—";
+    if (age !== null && age !== undefined) {
+      txt = age < 1 ? age.toFixed(2) + "s" : age.toFixed(1) + "s";
+      cls = age > 3 ? "bad" : (age > 1 ? "warn" : "ok");
+    }
+    return "<tr><td>" + t + "</td><td class='mono " + (hz ? "" : "dim") + "'>" +
+      (hz === undefined ? "—" : hz.toFixed(1) + " Hz") +
+      "</td><td class='mono " + cls + "'>" + txt + "</td></tr>";
+  }).join("");
+
+  /* 曲线 */
+  const P = (col) => h.map(r => [r[0], r[col]]).filter(p => p[1] !== null);
+  lineChart($("cvVx"), [
+    { pts: P(1), color: COL.cmd },
+    { pts: P(2), color: COL.odom },
+    { pts: P(3), color: COL.ekf },
+  ], { zeroY: true });
+  lineChart($("cvWz"), [
+    { pts: P(4), color: COL.cmd },
+    { pts: P(5), color: COL.odom },
+    { pts: P(6), color: COL.ekf },
+  ], { zeroY: true });
+  lineChart($("cvXY"), [
+    { pts: h.map(r => [r[7], r[8]]).filter(p => p[0] !== null), color: COL.odom },
+    { pts: h.map(r => [r[9], r[10]]).filter(p => p[0] !== null), color: COL.ekf },
+  ], { equalXY: true, zeroY: false });
+}
+
+window.addEventListener("resize", () => { for (const id of ["cvVx","cvWz","cvXY"]) {
+  const c = $(id); c.width = 0;   // 逼它重算尺寸
+}});
+
+tick();
+setInterval(tick, 200);
+</script>
+</body>
+</html>
