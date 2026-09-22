@@ -30,7 +30,10 @@ sweeper_chassis/
 ├── docs/
 │   ├── wiring.md                         完整接线总表（先看这个）
 │   ├── ros-integration.md                接入 ROS 2 的状态/启动/还缺什么
+│   ├── ★ nav2-reference.md               **给做 Nav2 定位/导航的同事**：接口契约、
+│   │                                     TF 树、实测精度、速度包线、故障模式
 │   ├── chassis-serial-protocol.md        底盘串口协议说明（Wheeltec 那套）
+│   ├── pos-mode.md                       位置模式实验（在 pos-mode 分支上）
 │   └── foc-driver-protocol-v1.2.pdf      FOC 驱动器通讯协议原始文档
 ├── tools/
 │   ├── decode_diag.py                    解码扩展诊断帧（查"轮子有没有劲"）
