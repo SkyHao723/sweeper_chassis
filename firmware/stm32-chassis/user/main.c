@@ -122,6 +122,31 @@
  *-----------------------------------------------------------------*/
 #define STOP_CTRL           CTRL_BRAKE
 
+/*================= 位置模式 (pos-mode 分支的实验特性) =================
+ * 为什么要试它: 驱动器内部那个速度环欠阻尼 —— 阶跃下去过冲到 138%(实测),
+ * 约 3 秒才落回, 而且协议不暴露它的 PID。位置环是另一套: 位置误差小到 0.1°
+ * 也会出力, 没有速度环那种"误差小就没劲"的死区, 所以**低速和定位理论上会更准**。
+ *
+ * 语义假设: `data[2..3] = 目标位置(度)`, 与回码 DATA6/7 **同一个参考系**
+ * (即驱动器自己的多圈计数)。这类 FOC 驱动器通常都是绝对值语义。
+ *
+ * ★ 进入位置模式的第一帧, 目标位置**用驱动器实测位置播种**(pos = m_pos),
+ *   不用我们自己的累加器。上次"位置锁位"失控的机制就是"死守一路陈旧的绝对
+ *   位置目标" —— 一进位置模式就命令一个离当前实际位置很远的绝对角, 驱动器
+ *   会以最大电流冲过去。播种从根上消掉这一条, 而且只花一行。
+ *
+ * 跟随误差限幅: 目标位置领先实测位置超过 POS_ERR_MAX_DEG 就不再往前走。
+ *   轮子被堵住时目标不能无限跑掉, 否则障碍一松开车会窜出去。这是任何位置
+ *   伺服都要有的, 不是额外谨慎。
+ *
+ * ★ 位置模式下**停车 = 保持当前位置**(驱动器位置环自己锁住), 这是位置模式自然
+ *   的待机行为, 也正好是当初想要的"没命令时轮子锁死"。代价是**不会再切回速度
+ *   模式** —— 一进一出正是上次多出来的那个变量。
+ *=====================================================================*/
+#define DRIVE_MODE_POSITION   1         /* 1 = 位置模式; 0 = 原来的速度模式 */
+#define POS_ERR_MAX_DEG       90.0f     /* 跟随误差上限(度) */
+#define POS_DEG_PER_RPM       6.0f      /* 1 RPM = 360/60 = 6 度/秒 */
+
 /*---------------------- 串口 / 看门狗 ----------------------------
  *   只有一个上位机: USART1 (PA9/PA10) -> CH340 / RK3588。
  *   LINK_TIMEOUT_MS: 上位机这么久不发命令就自动停车(看门狗)。
@@ -220,7 +245,7 @@
 #define TEL_FRAME_SIZE     24
 #define TEL_HEAD           0x7B
 #define TEL_TAIL           0x7D
-#define DIAG_FRAME_SIZE    36
+#define DIAG_FRAME_SIZE    40       /* pos-mode 分支: 36 -> 40, 加了左右位置(度) */
 #define DIAG_HEAD          0x7E
 #define DIAG_TAIL          0x7D
 
@@ -394,6 +419,8 @@ static volatile uint8_t m1_fault, m2_fault;     /* DATA1 故障码, 见 FOC_FAUL
 static volatile uint8_t m1_mode,  m2_mode;      /* DATA0 当前运行模式 0x05/0x06... */
 static volatile int16_t m1_rpm,   m2_rpm;       /* DATA2/3 实际转速 RPM */
 static volatile int16_t m1_cur,   m2_cur;       /* DATA4/5 输出扭矩电流, A x10 */
+static volatile int16_t m1_pos,   m2_pos;       /* DATA6/7 当前位置(度), 需 DLC>=8 */
+static uint8_t  pos_seen_mask;                  /* bit0/1 = 收到过该路位置字段 */
 static uint32_t m1_rpm_ms, m2_rpm_ms;
 static volatile uint16_t battery_mv;
 
@@ -414,6 +441,12 @@ typedef struct
 static wheel_trim_t trim_w[2];      /* [0] = 左轮, [1] = 右轮 */
 #define TRIM_IDX_LEFT   0
 #define TRIM_IDX_RIGHT  1
+
+/* 位置模式的状态。★ 注意这两个是**驱动器参考系**的绝对角度(度), 不是物理轮角 ——
+ * 它们由驱动器实测位置(tx DATA6/7)播种, 之后按"实际发给驱动器的转速"积分推进。
+ * 用驱动器自己的参考系, 就不用去猜它的零点在哪、也不用管 MOTOR*_INVERT 怎么映射。 */
+static float   pos_t_m1, pos_t_m2;  /* 目标位置(度), 驱动器参考系 */
+static uint8_t pos_seeded;          /* 0 = 还没用实测位置播种 */
 
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
@@ -605,6 +638,8 @@ static void CAN1_SendMotorCmd(uint32_t id, uint8_t mode, uint8_t ctrl, int16_t v
 
 #define CAN1_SendSpeed(id, rpm)  CAN1_SendMotorCmd((id), MODE_SPEED, CTRL_ENABLE, (rpm))
 #define CAN1_SendStop(id)        CAN1_SendMotorCmd((id), MODE_SPEED, STOP_CTRL,   0)
+/* 位置模式: 设定值是**目标位置(度)**, 和回码 DATA6/7 同一个参考系 */
+#define CAN1_SendPosition(id, deg) CAN1_SendMotorCmd((id), MODE_POSITION, CTRL_ENABLE, (deg))
 
 static void CAN1_Poll(void)
 {
@@ -618,10 +653,14 @@ static void CAN1_Poll(void)
 
         /* 控制帧回码 ...E601:
              DATA0=当前运行模式  DATA1=故障码  DATA2/3=实际转速
-             DATA4/5=当前输出扭矩电流(A x100)  DATA6/7=当前位置(度)
+             DATA4/5=当前输出扭矩电流(A x10)  DATA6/7=当前位置(度)
            DATA4/5 是判断"这个轮子到底出没出力"唯一的客观指标:
            目标转速不等于实际转速时, 看电流就知道是驱动器没给力(电流≈0)
-           还是给了力但被堵住/拖住了(电流很大)。 */
+           还是给了力但被堵住/拖住了(电流很大)。
+
+           ★ DATA6/7(位置) 需要 DLC>=8, 以前从来没解析过。做位置模式必须先看到它。
+             上次"位置锁位"失控的机制是"死守一路陈旧的绝对位置目标", 而当时我们
+             对这个位置计数器的语义(参考系/零点/回绕)并没有实测确认。 */
         if ((id == MOTOR1_REPLY_ID) && (rx.DLC >= 4))
         {
             m1_mode  = rx.Data[0];
@@ -632,6 +671,11 @@ static void CAN1_Poll(void)
             if (rx.DLC >= 6)
             {
                 m1_cur = (int16_t)(((uint16_t)rx.Data[4] << 8) | rx.Data[5]);
+            }
+            if (rx.DLC >= 8)
+            {
+                m1_pos = (int16_t)(((uint16_t)rx.Data[6] << 8) | rx.Data[7]);
+                pos_seen_mask |= 0x01;      /* 确实收到过位置字段 */
             }
         }
         else if ((id == MOTOR2_REPLY_ID) && (rx.DLC >= 4))
@@ -644,6 +688,11 @@ static void CAN1_Poll(void)
             if (rx.DLC >= 6)
             {
                 m2_cur = (int16_t)(((uint16_t)rx.Data[4] << 8) | rx.Data[5]);
+            }
+            if (rx.DLC >= 8)
+            {
+                m2_pos = (int16_t)(((uint16_t)rx.Data[6] << 8) | rx.Data[7]);
+                pos_seen_mask |= 0x02;
             }
         }
         /* 定时上报帧 ...E603: DATA4/5=电源输入电压(放大10倍) -> mV */
@@ -1142,6 +1191,26 @@ static uint8_t Drive_Ready(void)
     return 1;
 }
 
+/*=============== 位置模式的角回绕工具 ==============================
+ * 位置指令和回码都是 int16 **度**, 也就是 ±32767°(约 ±91 圈)之后回绕。
+ * 0.3m/s 时轮子 167°/s, 约 196 秒就会走到边界 —— 跑久一点必然遇到。
+ *
+ * 回绕本身不可怕(双方一起回绕就没事), 可怕的是**跨越回绕点的那一帧**: 直接
+ * 相减会得到 ±65534° 的假误差, 跟随误差限幅会把它当成"严重落后"从而乱放行
+ * 或乱刹车。所以差值必须折回 ±32768° 再比较。
+ *=================================================================*/
+static float WrapDeg(float d)
+{
+    while (d >  32767.0f) d -= 65536.0f;
+    while (d < -32768.0f) d += 65536.0f;
+    return d;
+}
+
+static float WrapDiff(float a, float b)     /* a - b, 折回 ±32768° */
+{
+    return WrapDeg(a - b);
+}
+
 /*========================= 差速逆解 ================================
  * 车体 (vx, wz) -> 左右轮目标转速。差速车用不到 vy。
  *   v_left  = vx - wz * b/2
@@ -1176,6 +1245,7 @@ static void Drive_Apply(void)
         trim_w[TRIM_IDX_RIGHT].trim = 0.0f;
         trim_w[TRIM_IDX_LEFT].kick_until  = 0;
         trim_w[TRIM_IDX_RIGHT].kick_until = 0;
+        pos_seeded = 0;         /* 位置模式: 停过之后要重新用实测位置播种 */
         target_left_rpm  = 0;
         target_right_rpm = 0;
         CAN1_SendStop(MOTOR1_CAN_ID);
@@ -1207,7 +1277,45 @@ static void Drive_Apply(void)
     target_left_rpm  = (int16_t)cmd_l;
     target_right_rpm = (int16_t)cmd_r;
 
-    /*===================== 走 / 停 两态 =====================
+#if DRIVE_MODE_POSITION
+    /*===================== 位置模式 =====================
+     * 把速度指令积分成位置目标, 下发**位置**, 让驱动器的位置环去追。
+     *
+     * 两个要点(理由见 DRIVE_MODE_POSITION 上面那段):
+     *   - 第一帧用驱动器**实测位置**播种, 绝不命令一个远处的绝对角;
+     *   - 跟随误差限幅: 目标领先实测超过 POS_ERR_MAX_DEG 就不再放行。
+     * 停车 = 保持当前位置(位置环自己锁住), 不切模式、不发刹车 ——
+     * 一进一出正是上次多出来的那个变量。
+     *===================================================*/
+    if ((pos_seeded == 0) && ((pos_seen_mask & 0x03) == 0x03))
+    {
+        pos_t_m1 = (float)m1_pos;       /* ★ 播种: 从驱动器实测位置开始 */
+        pos_t_m2 = (float)m2_pos;
+        pos_seeded = 1;
+    }
+
+    if (pos_seeded == 0)
+    {
+        /* 还没拿到两路位置回码: 什么都别发, 保持刹车 */
+        CAN1_SendStop(MOTOR1_CAN_ID);
+        CAN1_SendStop(MOTOR2_CAN_ID);
+        return;
+    }
+
+    /* 目标按"实际发给驱动器的转速"推进 (1 RPM = 6 度/秒) */
+    pos_t_m1 = WrapDeg(pos_t_m1 + (float)m1 * POS_DEG_PER_RPM * dt);
+    pos_t_m2 = WrapDeg(pos_t_m2 + (float)m2 * POS_DEG_PER_RPM * dt);
+
+    /* 跟随误差限幅(用回绕感知的差值, 否则跨 ±32767° 时会误判成巨大误差) */
+    pos_t_m1 = (float)m1_pos + ClampF(WrapDiff(pos_t_m1, (float)m1_pos),
+                                      -POS_ERR_MAX_DEG, POS_ERR_MAX_DEG);
+    pos_t_m2 = (float)m2_pos + ClampF(WrapDiff(pos_t_m2, (float)m2_pos),
+                                      -POS_ERR_MAX_DEG, POS_ERR_MAX_DEG);
+
+    CAN1_SendPosition(MOTOR1_CAN_ID, (int16_t)pos_t_m1);
+    CAN1_SendPosition(MOTOR2_CAN_ID, (int16_t)pos_t_m2);
+#else
+    /*===================== 走 / 停 两态 (速度模式) =====================
      * 停车就是一条 STOP_CTRL 帧, 每个控制周期重发。
      * 不切模式、不记忆状态、不引用位置 —— 出问题只可能出在电机或接线,
      * 不可能出在这几行逻辑上。这是上一版"位置锁位"失控后刻意保留的简单。
@@ -1222,6 +1330,7 @@ static void Drive_Apply(void)
         CAN1_SendStop(MOTOR1_CAN_ID);
         CAN1_SendStop(MOTOR2_CAN_ID);
     }
+#endif
 }
 
 /*======================= IMU (YbImu) ==============================
@@ -1415,6 +1524,7 @@ static void Send_DiagFrame(uart_port_t *p)
     if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪自开机以来读到过非零 */
     if (reset_by_iwdg)    flags |= 0x10;    /* 上次复位是看门狗引起的(主循环卡死过) */
     if (!Drive_Ready())   flags |= 0x20;    /* 有驱动器没回码/掉线: 此时只发刹车 */
+    if ((pos_seen_mask & 0x03) == 0x03) flags |= 0x40;  /* 两路位置回码都收到过 */
 
     f[0] = DIAG_HEAD;
     f[1] = flags;
@@ -1441,7 +1551,9 @@ static void Send_DiagFrame(uart_port_t *p)
     f[30] = imu_probe_flags;             /* 各功能块活没活 */
     f[31] = imu_ver_major;               /* 模块版本号 */
     PutI16(&f[32], imu_euler_yaw_crad);  /* 模块自己融合的偏航角 0.01rad */
-    /* f[34] = BCC, f[35] = 0x7D 下面填 */
+    PutI16(&f[34], m1_pos);              /* 1号驱动器实测位置 (度), DATA6/7 */
+    PutI16(&f[36], m2_pos);              /* 2号驱动器实测位置 (度) */
+    /* f[38] = BCC, f[39] = 0x7D 下面填 */
 
     for (i = 0; i < DIAG_FRAME_SIZE - 2; i++) bcc ^= f[i];
     f[DIAG_FRAME_SIZE - 2] = bcc;

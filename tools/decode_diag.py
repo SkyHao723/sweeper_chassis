@@ -24,7 +24,7 @@
     python3 tools/decode_diag.py -p /dev/ttyUSB0 --dump raw.bin
     python3 tools/decode_diag.py -f raw.bin
 
-诊断帧布局 (36 字节, 多字节高字节在前):
+诊断帧布局 (pos-mode 分支: 40 字节, 多字节高字节在前):
     [0]     0x7E
     [1]     flags  bit0 曾收到命令 bit1 看门狗已停车 bit2 IMU有效 bit3 陀螺仪有效
                    bit4 上次复位是 IWDG(主循环卡死过)
@@ -45,7 +45,9 @@
                                 bit3 四元数 bit4 欧拉角
     [31]    IMU 版本号(主)
     [32-33] IMU 内部融合的偏航角 int16 0.01rad
-    [34]    BCC                     [35]   0x7D
+    [34-35] 1号驱动器 实测位置 int16 度   (pos-mode 分支新增, 来自回码 DATA6/7)
+    [36-37] 2号驱动器 实测位置 int16 度
+    [38]    BCC                     [39]   0x7D
 """
 
 import argparse
@@ -62,7 +64,7 @@ CMD_TAIL = 0x7D
 TEL_HEAD = 0x7B
 DIAG_HEAD = 0x7E
 TEL_SIZE = 24
-DIAG_SIZE = 36
+DIAG_SIZE = 40          # pos-mode 分支: 36 -> 40 (+ 左右驱动器实测位置 各 int16 度)
 SEND_HZ = 20          # 和 STM32 的 CAN_PERIOD_MS 对齐, 上位机一般也是这个量级
 STOP_BURST = 15       # 退出前连发几帧零速, 保证车真的停下
 
@@ -271,6 +273,8 @@ class Diag(object):
         self.probe = b[30]          # 各功能块活没活
         self.imu_ver = b[31]
         self.euler_yaw = i16(b, 32) / 100.0    # rad
+        # pos-mode 分支新增: 驱动器**实测位置**(度), 来自回码 DATA6/7
+        self.pos_l, self.pos_r = i16(b, 34), i16(b, 36)
 
     def probe_text(self):
         """把 IMU 体检标志位翻成人话 —— 陀螺仪恒 0 时靠它定位问题。
@@ -353,15 +357,20 @@ class Diag(object):
             dr = int(round(self.tr - nom[1]))
             if dl or dr:
                 trim = " 目标-理论%+d/%+d(含助推)" % (dl, dr)
+        # pos-mode 分支: 驱动器实测位置。这是位置模式的**唯一反馈**,
+        # 所以只要非零就显示 —— 它同时告诉我们"位置回码到底通不通、分辨率多少"。
+        pos = ""
+        if self.pos_l or self.pos_r:
+            pos = " pos=%+d/%+d°" % (self.pos_l, self.pos_r)
         return ("seq=%-3d vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
-                "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
+                "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s%s | "
                 "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s"
                 % (self.seq, self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
-                   mode_name(self.m2), fault_name(self.f2), trim,
+                   mode_name(self.m2), fault_name(self.f2), trim, pos,
                    self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a))
 
 
@@ -382,6 +391,9 @@ def flags_text(f):
     if f & 0x20:
         # 继电器刚合闸, 驱动器还在上电初始化 -> 这段时间只发刹车, 车不动是正常的
         out.append("驱动器未就绪(等回码, 车被刹住)")
+    if f & 0x40:
+        # pos-mode 分支: 两路驱动器都回过位置字段(DLC>=8), 位置模式才能用
+        out.append("驱动器位置回码OK")
     return "/".join(out)
 
 
@@ -476,6 +488,8 @@ def open_stream(args):
 
 
 def main():
+    global DIAG_SIZE        # ★ 必须在任何引用之前声明, 否则 Python 报语法错误
+
     ap = argparse.ArgumentParser(
         description="解码 STM32 扩展诊断帧 (0x7E)",
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -498,7 +512,14 @@ def main():
                          "1=滚刷 2=水泵 3=两个都开 0=都关。"
                          "必须持续发 —— STM32 断链 800ms 会自己把继电器断开。"
                          "Ctrl-C 退出时自动发 0 关掉。")
+    ap.add_argument("--diag-size", type=int, default=DIAG_SIZE, metavar="N",
+                    help="诊断帧长度 (默认 %d = pos-mode 分支; main 分支是 36)。"
+                         "帧长对不上时症状是'收不到任何诊断帧', 和串口坏了长得"
+                         "一模一样, 所以留了这个开关。" % DIAG_SIZE)
     args = ap.parse_args()
+
+    # 帧长随固件分支不同, 允许命令行覆盖(见 --diag-size 的说明)
+    DIAG_SIZE = args.diag_size
 
     stream, dump = open_stream(args)
 
@@ -634,7 +655,10 @@ def main():
             print("没有收到任何诊断帧。检查:\n"
                   "  - 底盘节点是不是还占着串口 (占着就收不到数据)\n"
                   "  - 设备名对不对 (/dev/wheeltec_controller)\n"
-                  "  - STM32 固件里 Send_DiagFrame 有没有被调用")
+                  "  - STM32 固件里 Send_DiagFrame 有没有被调用\n"
+                  "  ★ 如果你烧的是另一条分支的固件, 帧长可能不一样 ——\n"
+                  "    本脚本默认按 %d 字节解析(pos-mode 分支), main 分支是 36 字节。\n"
+                  "    试: --diag-size 36" % DIAG_SIZE)
         if dump:
             dump.close()
         try:
