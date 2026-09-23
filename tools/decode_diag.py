@@ -28,7 +28,9 @@
     [0]     0x7E
     [1]     flags  bit0 曾收到命令 bit1 看门狗已停车 bit2 IMU有效 bit3 陀螺仪有效
                    bit4 上次复位是 IWDG(主循环卡死过)
-                   bit5 驱动器未就绪(继电器刚合闸, 在等回码, 此时只发刹车)
+                   bit5 驱动器未就绪(在等回码, 此时只发刹车)
+                   bit6 起步助推正在加力(轮子还没转起来)
+                   bit7 助推加到上限还不转(轮子被顶住? 已进入给/歇循环, 直到目标归零才清)
     [2-3]   车体 vx   mm/s          [4-5]  车体 wz   mrad/s
     [6-7]   左轮 实际 RPM           [8-9]  右轮 实际 RPM
     [10-11] 左轮 最终命令 RPM       [12-13] 右轮 最终命令 RPM
@@ -39,7 +41,7 @@
     [20]    1号驱动器 模式          [21]   2号驱动器 模式
     [22]    CAN 错误计数            [23]   UART 坏帧
     [24]    UART 有效命令           [25]   UART 溢出
-    [26]    继电器 bit0电机 bit1水泵  [27]  IMU 诊断码
+    [26]    继电器 bit0滚刷 bit1水泵  [27]  IMU 诊断码
     [28]    IMU I2C 地址            [29]   帧序号
     [30]    IMU 寄存器体检标志位: bit0 版本 bit1 陀螺仪 bit2 磁力计
                                 bit3 四元数 bit4 欧拉角
@@ -308,6 +310,12 @@ class Diag(object):
                         "IMU 读取异常: %s（体检: %s）"
                         % (IMU_STATUS.get(self.imu_st, "?%d" % self.imu_st),
                            self.probe_text())))
+        if self.flags & 0x80:
+            out.append(("booststuck",
+                        "起步助推已经加到上限(KICK_MAX_RPM)还是没转起来 -> 固件"
+                        "进入'给 3 秒 / 歇 2 秒'的循环(不是永久放弃), 并锁存了这个"
+                        "标志(直到目标归零才清)。轮子被东西顶住, 或者驱动器根本没"
+                        "使上劲 —— 对比电流: 电流大=真堵转, 电流小=驱动器没给力"))
         for tag, tgt, act, cur, flt in (
                 ("1号", self.tl, self.wl, self.c1, self.f1),
                 ("2号", self.tr, self.wr, self.c2, self.f2)):
@@ -315,16 +323,21 @@ class Diag(object):
                 out.append(("fault" + tag,
                             "%s驱动器报故障: %s" % (tag, fault_name(flt))))
             elif abs(tgt) > RPM_CMD_EPS and abs(act) < RPM_ACT_EPS:
+                # 命令里含助推量, 所以"助推在给还不动"就是最硬的静摩擦/堵转证据
+                boost = ""
+                if self.flags & 0x40:
+                    boost = ("（这一帧固件正在给起步助推, 说明它已经知道轮子没转 "
+                             "—— 是起步门槛/堵转, 不是命令没送到）")
                 if abs(cur) < CUR_EPS:
                     out.append(("weak" + tag,
                                 "%s 命令 %+d RPM 但实际 %+d RPM 且电流仅 %.2fA"
-                                " -> 驱动器没给力(查故障码/使能/接线)"
-                                % (tag, tgt, act, cur / 10.0)))
+                                " -> 驱动器没给力(查故障码/使能/接线)%s"
+                                % (tag, tgt, act, cur / 10.0, boost)))
                 else:
                     out.append(("stall" + tag,
                                 "%s 命令 %+d RPM 但实际 %+d RPM 而电流 %.2fA"
-                                " -> 给了力却被堵住/拖住"
-                                % (tag, tgt, act, cur / 10.0)))
+                                " -> 给了力却被堵住/拖住%s"
+                                % (tag, tgt, act, cur / 10.0, boost)))
         return out
 
     def line(self, bat_mv=0, gyro=None, nom=None, accel=None):
@@ -346,7 +359,9 @@ class Diag(object):
         # ★ 这里显示的是 目标 - 主机理论目标, 也就是"修正 + 助推"的合计,
         #   不是积分的修正量本身。实测踩过: 看到 "+13" 以为积分已经顶到
         #   比例限幅(±13.95)了, 其实其中 12 是助推, 积分只剩 1 —— 判断完全
-        #   反了。想分开看只能改协议(诊断帧没有空余字节), 暂时按合计显示。
+        #   反了。诊断帧没有空余字节放助推量, 所以固件在 flags bit6 上给了一个
+        #   "助推正在加力"的位: **想知道这 +13 里有多少是助推, 看 bit6 就行了**
+        #   (bit6 置位 = 这一帧的差值里包含助推; 没置位 = 全是外环积分)。
         trim = ""
         if nom is not None:
             dl = int(round(self.tl - nom[0]))
@@ -380,8 +395,15 @@ def flags_text(f):
         # 这条最重要: IWDG 不会无缘无故触发, 触发过就说明主循环卡死过
         out.append("**上次复位是看门狗(主循环卡死过!)**")
     if f & 0x20:
-        # 继电器刚合闸, 驱动器还在上电初始化 -> 这段时间只发刹车, 车不动是正常的
+        # 驱动器还没回码 -> 只发刹车, 车不动是正常的(不是故障)
         out.append("驱动器未就绪(等回码, 车被刹住)")
+    if f & 0x40:
+        # ★ 起步助推正在加力。这是"小转向命令愣在原地"和"转向太敏感"这两个
+        #   症状共同的现场证据: 助推在给 = 轮子还没转起来。
+        out.append("起步助推中")
+    if f & 0x80:
+        # 助推加到上限、KICK_MAX_MS 内轮子仍然没转 -> 被东西顶住/驱动器没使上劲
+        out.append("**助推加到上限还不转(轮子被顶住?)**")
     return "/".join(out)
 
 

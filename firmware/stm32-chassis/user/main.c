@@ -59,14 +59,17 @@
  *   [1]     flags  bit0 曾收到命令  bit1 看门狗已停车  bit2 IMU 加速度有效
  *                  bit3 IMU 陀螺仪自开机以来读到过非零
  *                  bit4 上次复位是 IWDG 引起的(说明主循环卡死过, 要查!)
+ *                  bit5 驱动器未就绪(有驱动器没回码, 此时只发刹车)
+ *                  bit6 起步助推正在加力(轮子还没转起来)
+ *                  bit7 助推加到上限还不转(轮子被顶住?), 锁存到目标归零
  *   [2-3]   int16 BE 车体 vx   mm/s     (轮速正解)
  *   [4-5]   int16 BE 车体 wz   mrad/s
  *   [6-7]   int16 BE 左轮 实际转速 RPM
  *   [8-9]   int16 BE 右轮 实际转速 RPM
  *   [10-11] int16 BE 左轮 目标转速 RPM
  *   [12-13] int16 BE 右轮 目标转速 RPM
- *   [14-15] int16 BE 1号驱动器 输出扭矩电流  A×100
- *   [16-17] int16 BE 2号驱动器 输出扭矩电流  A×100
+ *   [14-15] int16 BE 1号驱动器 输出扭矩电流  A×10
+ *   [16-17] int16 BE 2号驱动器 输出扭矩电流  A×10
  *   [18]    1号驱动器 故障码   (见 FOC_FAULT_*)
  *   [19]    2号驱动器 故障码
  *   [20]    1号驱动器 当前运行模式  (0x05 速度 / 0x06 位置 ...)
@@ -296,7 +299,8 @@
  *   c. **权限 ±50% -> ±20%**: 就算还有残余振荡, 幅度也被限在 ±20% 而不是
  *      ±50%(实测振幅就是限幅值本身)。稳态残差通常只有几个百分点, ±20% 够用。
  *
- * 助推(KICK)不动 —— 它只在起步 400ms 内起作用, 不在这个 0.25Hz 环里。 */
+ * 助推(KICK)当时没动 —— 它只在起步那一小段起作用, 不在这个 0.25Hz 环里。
+ * (助推后来在第四版改掉了, 见下面 KICK_* 那一段。) */
 #define TRIM_ENABLE        1
 #define TRIM_KI            0.3f     /* 每秒、每 1 RPM 偏差攒多少 RPM 修正 */
 #define TRIM_UP_K          0.2f     /* 正向修正最多 +20% 名义值 */
@@ -305,21 +309,96 @@
 #define TRIM_LIN_BAND_RPM  5.0f     /* ★ 误差超过它就不积分(见上面第 a 条) */
 #define TRIM_DEADBAND_RPM  0.5f     /* 目标小于这个就当"不该动", 全部清零 */
 
-/* 起步助推: 目标从"不动"变成"要动"的瞬间, 额外给一段速度。
- * 专门用来突破静摩擦 —— 这是积分做不好也不该做的事(见上面第 c 条)。
- * 幅度取固定值而不是按名义值缩放: 要突破的是**摩擦力矩**, 它和你要跑多快
- * 没关系, 所以固定的一脚在低速档反而相对更有力, 正是需要的。
+/* ★ 第三版(2026-09)【判据已被第四版取代, 这里只留下"为什么要动它"的来龙去脉】:
+ *   助推从"一次性定时"改成"**卡住就给**"(带迟滞)。
  *
- * ★ 助推必须"轮子一转起来就撤", 不能只靠定时。实测踩到: 助推只做了定时
- *   (固定 400ms), 结果原地转(真需要助推)没问题, 但**直线运动被助推害了** ——
- *   直线没有静摩擦问题, 轮子 0.06 秒就起来了, 此时还在助推就是纯超速:
- *   `decode --drive 0.30 0` 对应的稳态从 103% 变成 144%, 而 144% ≈ 名义值+助推,
- *   对得上。助推是给"卡住"用的, 所以判据应该是"轮子还没转起来", 不是"时间没到"。
- * 想 A/B 就把 KICK_RPM 改成 0。 */
-#define KICK_RPM           12.0f    /* 助推幅度 (RPM) */
-#define KICK_MS            400      /* 助推的硬上限时长(轮子一直没起来才用满) */
-#define KICK_RELEASE_K     0.6f     /* 实际轮速达到名义值的这个比例就撤掉助推 */
-#define KICK_REARM_MS      300      /* 目标归零后要静止这么久才允许再次助推 */
+ * 为什么必须改 —— 实车报的"发小一点的转向命令, 车会愣在原地不动"就是这个:
+ *   小原地转的单轮目标可能只有 8~13 RPM(对应 wz 0.2~0.3), 本来就在驱动器死区
+ *   (~14~18 RPM)之下。旧逻辑靠助推把它顶到 20+ 破静摩擦, **但助推只有 400ms**,
+ *   一到就撤; 撤掉后轮子掉回死区又卡住, 而助推**不会重新武装**(目标从没回到 0)
+ *   -> 车就永远愣在原地。助推本来是为了解决"起步没劲", 结果在小命令上反而
+ *   造了一个新故障。
+ *
+ * 第三版的判据(**已被第四版换掉, 因为它按名义值比例判定, 见下**):
+ *     实际轮速 < 名义值 × 0.2   -> 给
+ *     实际轮速 > 名义值 × 0.6   -> 撤
+ *     中间                      -> 保持上一状态
+ * 好处: 一直卡着就一直有助推(自愈, 不需要"重新武装"); 一旦真转起来立刻撤,
+ * 过冲也被压小 —— 旧逻辑固定给满 400ms, 命令越大过冲越大。
+ *
+ * ★ 迟滞不能省: 单阈值会让助推在阈值附近按 20Hz 来回开关 -> 轮子嗡嗡抖。
+ *
+ * ★★ 助推必须是**两轮共享的一次判决**, 不能每轮各判一次(Boost_Decide)。
+ *    助推是**加性**大增量, 在小命令下相当于把指令翻好几倍。若按各自转速独立
+ *    判决, 转弯/起步时总有一个轮子先转起来、先撤掉助推, 另一个还在加 ——
+ *    两轮指令瞬间差十几 RPM, 车就会"歪一下"。旧版是固定 400ms 定时, 两边
+ *    同时给同时撤, 天然对称; 改成"卡住就给"之后必须显式做成共享, 否则等于
+ *    凭空引入一个偏航源(而且它只在起步那一下出现, 最难查)。
+ *    共享判据: **任一有效轮没转起来 -> 给; 两个有效轮都转起来了 -> 撤。**
+ *
+ * ==================================================================
+ * 第四版(2026-09, 现在): 第三版那套"名义值比例"判据还是不对, 改成
+ * **绝对转速判据 + 按缺口给量 + 给不动就加力**。原因是实车又报了两个症状,
+ * 而它们是**同一条曲线的两端**:
+ *     小命令(|名义| < ~15 RPM, 即 wz < 0.35)  -> 推不动, 一直愣在原地;
+ *     稍大一点                                 -> 一下子窜出去, "转向太敏感"。
+ * 这正是**静摩擦(起步门槛)**的特征, 而且 ★关键: 门槛是**起步**门槛, 不是
+ * 速度死区 —— 实测转起来之后 6 RPM 也能维持(wz=0.30 的原地转测到 49%,
+ * 也就是 6.4 RPM 真的在转)。所以"给一下就撤"是对的, "一直给"是错的。
+ *
+ * 第二版那套的两个毛病正好一人对应一个症状:
+ *   a. 判据按**名义值比例**: 名义值只有 10 RPM 时, "转起来"的门槛是 6 RPM,
+ *      而驱动器其实要 15 才动 —— 助推被判定为"已经转起来了"而提前撤掉,
+ *      轮子掉回静止, 然后又"没跟上"再给, 于是在静止附近反复抖, 平均还是不动。
+ *      (症状: 愣在原地)
+ *   b. 助推量**固定 +12 RPM**, 而且**按各自名义方向加**。这一条对原地转的
+ *      影响被严重低估了 —— 加性助推让右轮 +12、左轮 -12, 换算成偏航角速率:
+ *          ω_rpm = wz × 43.26  (每轮名义转速 = wz 的 43.26 倍)
+ *          所以助推 b 等效于把 wz 抬高 b / 43.26 rad/s
+ *          b=12 -> **+0.28 rad/s**
+ *      也就是原地转**起步那段时间真实 wz 比命令值高出约 0.28 rad/s**:
+ *      wz=0.30 的命令实际是 0.58(192%), wz=0.50 的实际是 0.78(155%)。
+ *      (症状: 转向太敏感 —— 而且这也解释了为什么**稳态**测出来是 100~102%
+ *       却仍然手感"贼": 助推是暂态, 稳态数据里看不到它, 人却每次起步都能感到。
+ *       旧版是固定 400ms 定时, 所以这个"窜"每次转向都准时出现 400ms。)
+ *
+ * 第四版三条:
+ *   1. **绝对转速判"动没动"**(KICK_STILL_RPM / KICK_MOVING_RPM), 不看比例。
+ *      要破的是静摩擦, "轮子转没转"这件事跟命令多大无关。
+ *      副产物: 判据与命令大小无关 -> 大命令上不会过度助推, 也不会抖。
+ *   2. **按缺口给量**(KICK_BASE_RPM):
+ *          助推 = clamp(KICK_BASE_RPM - 最小|名义值|, 0, KICK_MAX_RPM)
+ *      名义值本身就超过起步门槛 -> 助推 = 0 -> **正常行驶完全没有助推**:
+ *        · 直行 0.30 m/s 名义 27.9 RPM -> 助推 0, 起步那一下的过冲消失;
+ *        · 原地转 wz >= 15/43.26 = 0.35 -> 助推 0, **那 +0.28 rad/s 没有了**;
+ *        · wz=0.30(名义 13 RPM) -> 助推 2 RPM   -> 额外 wz +0.05 (15%);
+ *        · wz=0.25(名义 10.8)   -> 助推 4.2 RPM -> 额外 wz +0.10 (39%)。
+ *      小命令上的超调仍然存在, 但它是**破静摩擦的物理代价**, 而且**只在
+ *      |实际| < 6 RPM 的这段时间里存在**(一到 6 RPM 立刻撤, 见 KICK_MOVING_RPM)。
+ *   3. **给不动就逐级加力**(KICK_STEP_*): 补到门槛还不动, 每 KICK_STEP_MS
+ *      再加 KICK_STEP_RPM, 直到动起来或到 KICK_MAX_RPM。这样"到底要多大劲
+ *      才动得起来"是**实测量出来的**, 不靠我猜的 KICK_BASE_RPM —— 它只是起点。
+ *
+ *   4. **加到上限还不转就"给一会儿歇一会儿"**(KICK_MAX_MS / KICK_COOL_MS):
+ *      轮子被东西顶住时不能无限加力(会烤电机和驱动器), 所以加满上限还不动
+ *      就先歇 KICK_COOL_MS, 再接着试, 并把 flags bit7 置位让上位机看得见。
+ *      ★★ 这里**绝对不能做成"永久放弃"**。第一版的毛病就是"超时之后再也不给",
+ *         于是小命令永远愣在原地 —— 如果这台车破静摩擦真的需要比 KICK_MAX_RPM
+ *         更大的劲, 一次放弃就等于把那个故障原样造回来。占空比
+ *         (3s 给 / 2s 歇) 已经能把堵转发热砍掉一大半, 而车最终还能脱困。
+ *         目标归零时这个"歇"也一并清掉, 等于上层显式重下命令就重新给足机会。
+ *
+ * ★ 撤回判据用绝对值还有一个原因: 助推必须留到轮子进入"能自持"的转速
+ *   (≈6 RPM) 才能撤。若按名义值的比例撤, 名义值 4 RPM 时会要求"转到 2.4
+ *   才算转起来", 那时命令一撤回 4 RPM 轮子立刻又停 —— 助推变成振铃。 */
+#define KICK_BASE_RPM      15.0f    /* 起步门槛估计: 助推把命令补到这个轮速 */
+#define KICK_MAX_RPM       20.0f    /* 助推上限(含逐级加力) */
+#define KICK_STEP_RPM      4.0f     /* 给不动 -> 每 KICK_STEP_MS 再加这么多 */
+#define KICK_STEP_MS       200      /* 加力间隔 */
+#define KICK_STILL_RPM     2.0f     /* |实际| 低于它 = 还是静止 */
+#define KICK_MOVING_RPM    6.0f     /* |实际| 高于它 = 转起来了, 撤助推 */
+#define KICK_MAX_MS        3000     /* 加到上限还不动, 先给这么久就歇一下(防卡死) */
+#define KICK_COOL_MS       2000     /* ★ 歇多久再试。**不能永久放弃**, 见下面说明 */
 
 /*-------------------------- IMU --------------------------------*/
 /* IMU 读一次大概 1~3ms(位翻转 I2C), 和轮速一起按 ODOM_PERIOD_MS 采样。
@@ -406,14 +485,26 @@ static float    body_vx, body_wz;                  /* 轮速正解出的车体�
 typedef struct
 {
     float    trim;          /* 积分修正量, RPM */
-    uint32_t kick_until;    /* 起步助推的截止时刻 */
-    uint32_t zero_since;    /* 目标从何时起为 0 (0 = 还没开始记) */
-    uint8_t  armed;         /* 助推是否已武装 (1 = 下次目标非零时助推) */
 } wheel_trim_t;
 
 static wheel_trim_t trim_w[2];      /* [0] = 左轮, [1] = 右轮 */
 #define TRIM_IDX_LEFT   0
 #define TRIM_IDX_RIGHT  1
+
+/* 助推的状态 —— ★ 这几个是**两轮共享**的, 不是每轮一份。
+ *
+ * 为什么必须共享: 助推是**加性**大增量(起步时相当于把命令翻好几倍)。如果按
+ * 各自的实际转速独立决定, 一个轮子先转起来就会先撤掉助推 -> 两轮指令差出十几
+ * RPM -> **起步时车会歪一下**。旧版是固定 400ms 定时, 两边同时给同时撤, 天然
+ * 对称; 改成"没转起来就给"之后必须显式做成共享, 否则等于凭空引入一个偏航源。
+ *
+ * 判据(共享): 任一有效轮还没转起来 -> 给; 两个有效轮都转起来了 -> 撤。 */
+static uint8_t  boost_on;           /* 助推这一轮是否开着 (带迟滞, 见 KICK_* 的说明) */
+static float    boost_amt;          /* 当前助推量 RPM (会逐级加力, 见 KICK_STEP_*) */
+static uint16_t boost_ms;           /* 本轮已连续助推了多久, 用于防卡死保护 */
+static uint16_t boost_step_ms;      /* 距上次加力多久 */
+static uint16_t boost_cool_ms;      /* 防卡死"歇一会儿"的剩余时间, 见 KICK_COOL_MS */
+static uint8_t  boost_stuck;        /* 加满上限还不转 -> 锁存。目标归零才清 */
 
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
@@ -618,7 +709,7 @@ static void CAN1_Poll(void)
 
         /* 控制帧回码 ...E601:
              DATA0=当前运行模式  DATA1=故障码  DATA2/3=实际转速
-             DATA4/5=当前输出扭矩电流(A x100)  DATA6/7=当前位置(度)
+             DATA4/5=当前输出扭矩电流(A x10)  DATA6/7=当前位置(度)
            DATA4/5 是判断"这个轮子到底出没出力"唯一的客观指标:
            目标转速不等于实际转速时, 看电流就知道是驱动器没给力(电流≈0)
            还是给了力但被堵住/拖住了(电流很大)。 */
@@ -995,20 +1086,219 @@ static void Wheel_Update(void)
     body_wz = (v_right - v_left) / TRACK_WIDTH_M;
 }
 
+/*========================= 起步助推判决 ============================
+ * 两轮**共享**的一次判决, 返回这一周期要叠加的助推量 RPM。
+ * 为什么必须共享、不能每轮各判, 见上面 KICK_* 说明里那一段。
+ *
+ * 判据(绝对转速 + 迟滞):
+ *   任一"有效轮" |实际| < KICK_STILL_RPM    -> 给
+ *   两个"有效轮" |实际| > KICK_MOVING_RPM   -> 撤
+ *   其余(在迟滞带里 / 反馈不新鲜)           -> 保持上一状态
+ * 所谓"有效轮" = |名义值| >= TRIM_DEADBAND_RPM 的那一轮。原地转时两轮名义值
+ * 大小一样; 混合了 vx 的转弯里两轮可能一大一小, 只要**小的那个**卡住就得给。
+ *
+ * ★ 反馈不新鲜时**倾向于不撤**(保持当前状态): 没有观测就不敢做结论。
+ *   注意 Drive_Ready() 已经保证走到这里时两路回码都是新鲜的, 这条只是兜底。
+ *
+ * ★ 目标全归零 -> 状态全清, 包括"卡住过"的锁存标志。这样"停一下再走"能
+ *   重新获得完整的加力过程, 而停在地上的车不会带着历史。
+ *
+ * ★ 助推量怎么定(见 KICK_BASE_RPM / KICK_STEP_*):
+ *     起始量 = clamp(KICK_BASE_RPM - 最小有效|名义值|, 0, KICK_MAX_RPM)
+ *     还不动 -> 每 KICK_STEP_MS 再加 KICK_STEP_RPM, 到 KICK_MAX_RPM 封顶
+ *   用**最小**的那个名义值算, 因为要救的是"命令最小、最容易卡住"的那个轮子。
+ *
+ * ★ 助推对 (vx, wz) 的影响 —— 这一点很容易想错, 必须写清楚:
+ *   助推是**按各自名义方向**加的, 所以影响取决于两轮名义值**同号还是异号**:
+ *     · 原地转(wz≠0, vx=0): 两轮名义值**异号** -> 助推把两轮往相反方向推 ->
+ *       差分 D = ω_r - ω_l 增加 2×助推 -> **偏航被抬高**, Δwz = 助推/43.26。
+ *       这就是"转向太敏感"的来源, 也是第四版要在 |wz|≥0.35 上把助推压到 0
+ *       的原因。
+ *     · 边走边转(vx 足够大, 两轮名义值**同号**): 助推给两轮加的是**同一个
+ *       方向** -> 差分**完全不变** -> **偏航一点没变**, 只是车临时多往前冲了
+ *       助推那么多。此时 wz 是诚实的, 不需要担心"转向变敏感"。
+ *       (比如 vx=0.30 + wz=0.50: 左轮 6.3 RPM、右轮 49.5 RPM, 助推 8.7 会
+ *        让两轮都 +8.7, wz 不变, 只有 vx 短暂偏高 —— 而 vx 偏高正是我们要的
+ *        "破静摩擦", 外环积分随后会把两轮一起收回来。)
+ *=================================================================*/
+static float Boost_Decide(float nom_l, float nom_r,
+                          float act_l, float act_r,
+                          uint8_t fresh_l, uint8_t fresh_r, float dt)
+{
+#if TRIM_ENABLE
+    float mag_l = fabsf(nom_l);
+    float mag_r = fabsf(nom_r);
+    float smallest = 0.0f;      /* 最小的有效名义值 —— 决定起始助推量 */
+    uint8_t any_valid = 0;
+    uint8_t give = 0;           /* 有轮子还静止 */
+    uint8_t all_moving = 1;     /* 所有有效轮都确认转起来了 */
+    uint8_t still_all = 1;      /* 所有有效轮都还静止(决定要不要继续加力) */
+    uint16_t dms;
+
+    /*---- 全零: 状态清干净, 不留历史 ----*/
+    if ((mag_l < TRIM_DEADBAND_RPM) && (mag_r < TRIM_DEADBAND_RPM))
+    {
+        boost_on      = 0;
+        boost_amt     = 0.0f;
+        boost_ms      = 0;
+        boost_step_ms = 0;
+        boost_cool_ms = 0;      /* 上层显式重下命令 -> "歇"也清掉, 重新给足机会 */
+        boost_stuck   = 0;      /* 目标归零 -> 清掉"卡住过"的锁存标志 */
+        return 0.0f;
+    }
+
+    if (mag_l >= TRIM_DEADBAND_RPM)
+    {
+        any_valid = 1;
+        smallest  = mag_l;
+        if (fresh_l)
+        {
+            float a = fabsf(act_l);
+            if (a < KICK_STILL_RPM)   give = 1;
+            if (a <= KICK_MOVING_RPM) all_moving = 0;
+            if (a >= KICK_STILL_RPM)  still_all = 0;
+        }
+        else
+        {
+            all_moving = 0;     /* 没观测 -> 不撤 */
+            still_all  = 0;     /* 没观测 -> 也不加力 */
+        }
+    }
+    if (mag_r >= TRIM_DEADBAND_RPM)
+    {
+        any_valid = 1;
+        if ((mag_r < smallest) || (smallest <= 0.0f)) smallest = mag_r;
+        if (fresh_r)
+        {
+            float a = fabsf(act_r);
+            if (a < KICK_STILL_RPM)   give = 1;
+            if (a <= KICK_MOVING_RPM) all_moving = 0;
+            if (a >= KICK_STILL_RPM)  still_all = 0;
+        }
+        else
+        {
+            all_moving = 0;
+            still_all  = 0;
+        }
+    }
+
+    if (!any_valid)
+    {
+        boost_on      = 0;      /* 理论上到不了这里, 兜底 */
+        boost_amt     = 0.0f;
+        boost_ms      = 0;
+        boost_step_ms = 0;
+        boost_cool_ms = 0;
+        return 0.0f;
+    }
+
+    /*---- 状态机: 给 / 撤 / 保持 ----*/
+    if (give)
+    {
+        if (!boost_on)
+        {
+            /* 刚开: 按"补到起步门槛"算起始量; 名义值已经够大就是 0 ——
+               正常行驶(直行 0.30 m/s 名义 27.9 RPM)从这里开始就完全没有助推,
+               旧版那个固定 +12 造成的起步过冲随之消失。 */
+            boost_on      = 1;
+            boost_amt     = KICK_BASE_RPM - smallest;
+            if (boost_amt < 0.0f)          boost_amt = 0.0f;
+            if (boost_amt > KICK_MAX_RPM)  boost_amt = KICK_MAX_RPM;
+            boost_ms      = 0;
+            boost_step_ms = 0;
+        }
+    }
+    else if (all_moving)
+    {
+        boost_on      = 0;      /* 转起来了 -> 立刻撤 */
+        boost_amt     = 0.0f;
+        boost_ms      = 0;
+        boost_step_ms = 0;
+        boost_cool_ms = 0;
+    }
+    /* 其余情况保持上一状态(迟滞带防抖) */
+
+    if (!boost_on)
+    {
+        return 0.0f;
+    }
+
+    /* 计时。dt 极小(卡顿后立刻恢复)时至少算 1ms, 否则计时永远不动,
+       防卡死保护就失效了。 */
+    dms = (uint16_t)(dt * 1000.0f + 0.5f);
+    if (dms == 0) dms = 1;
+    boost_ms = (uint16_t)(boost_ms + dms);
+
+    /*---- 防卡死"歇一会儿"中: 这一周期不给力 ----*/
+    if (boost_cool_ms > 0)
+    {
+        boost_cool_ms = (boost_cool_ms > dms) ? (uint16_t)(boost_cool_ms - dms) : 0;
+        return 0.0f;
+    }
+
+    /*---- 逐级加力: 只在"都还静止"时加 ----
+       已经在迟滞带里(有一个轮子转起来一点了)就保持当前量, 不加也不撤。 */
+    if (still_all)
+    {
+        if ((boost_amt >= KICK_MAX_RPM) && (boost_ms >= KICK_MAX_MS))
+        {
+            /* 防卡死保护: 已经顶到上限 push 满 KICK_MAX_MS 还一直不动, 说明
+               轮子被东西顶住了 —— 再给下去要烤电机和驱动器。歇 KICK_COOL_MS
+               再接着试(★ 不是永久放弃, 理由见 KICK_COOL_MS 上面那段),
+               并**锁存** flags bit7 让上位机看得见。 */
+            boost_stuck   = 1;
+            boost_ms      = 0;
+            boost_step_ms = 0;
+            boost_cool_ms = KICK_COOL_MS;
+            return 0.0f;
+        }
+
+        boost_step_ms = (uint16_t)(boost_step_ms + dms);
+        if ((boost_step_ms >= KICK_STEP_MS) && (boost_amt < KICK_MAX_RPM))
+        {
+            boost_step_ms = 0;
+            boost_amt += KICK_STEP_RPM;
+            if (boost_amt > KICK_MAX_RPM) boost_amt = KICK_MAX_RPM;
+        }
+    }
+    else
+    {
+        boost_step_ms = 0;      /* 不是全静止就不加力 */
+    }
+
+    return boost_amt;
+#else
+    (void)nom_l; (void)nom_r; (void)act_l; (void)act_r;
+    (void)fresh_l; (void)fresh_r; (void)dt;
+    boost_stuck = 0;        /* 诊断帧读它, 所以这条路径也必须赋值 */
+    /* ★ A/B 路径里助推整段不编译, 这几个状态没有任何读者。显式吃掉,
+       否则 TRIM_ENABLE=0 的构建会多几条 550-D 警告(不是错误, 但会遮住
+       别的真警告)。 */
+    (void)boost_on;
+    (void)boost_amt;
+    (void)boost_ms;
+    (void)boost_step_ms;
+    (void)boost_cool_ms;
+    return 0.0f;
+#endif
+}
+
 /*========================= 轮速外环修正 ============================
  * 按实际轮速修目标轮速, 返回真正要发给驱动器的转速。
- * 两部分: 慢积分修稳态偏差 + 定时助推破静摩擦。
+ * 两部分: 慢积分修稳态偏差 + 助推破静摩擦。
  * 为什么这么分、第一版错在哪, 见上面 TRIM_* / KICK_* 那一大段。
  *
  * nominal / actual 都在物理轮速域(已按接线校准), 可以直接相减。
+ * boost 由 Boost_Decide() 在 Drive_Apply 里**算一次给两轮共享**(理由见那里),
+ * 本函数只负责"按名义方向把它加上去"。
+ *
  *★ 输出保证: 落在 [1-TRIM_DOWN_K, 1+TRIM_UP_K] 倍名义值之内(助推另加),
  *  且**方向永远和名义值一致** —— 修正不可能把车修成倒着走。
  *=================================================================*/
 static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
-                        uint8_t fresh, float dt)
+                        uint8_t fresh, float dt, float boost)
 {
     float out;
-    float kick = 0.0f;
 
 #if TRIM_ENABLE
     float mag;
@@ -1017,55 +1307,12 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
 
     mag = fabsf(nominal);
 
-    /*---- 不该动: 修正、助推、计时全部清零, 不留任何历史 ----*/
+    /*---- 不该动: 修正清零, 不留任何历史 ----
+       (助推/计时的清零在 Boost_Decide 里, 因为它是共享的) */
     if (mag < TRIM_DEADBAND_RPM)
     {
         w->trim = 0.0f;
-        w->kick_until = 0;
-
-        /* 静止够久才重新武装助推。没这一条的话, 目标在 0 附近抖动
-           (比如主机反复发 0.001 m/s) 会不停触发助推, 车一窜一窜的。 */
-        if (w->armed == 0)
-        {
-            if (w->zero_since == 0)
-            {
-                w->zero_since = g_tick_ms;
-            }
-            else if ((g_tick_ms - w->zero_since) >= KICK_REARM_MS)
-            {
-                w->armed = 1;
-                w->zero_since = 0;
-            }
-        }
         return 0.0f;
-    }
-
-    /*---- 目标从"不动"变成"要动": 起一次助推 ----*/
-    if (w->armed)
-    {
-        w->armed = 0;
-        w->zero_since = 0;
-        w->kick_until = g_tick_ms + KICK_MS;
-    }
-
-    /*---- 助推的撤销: 轮子一旦真的转起来就立刻撤, 时间到只是兜底 ----
-       原地转的轮子会被刮擦卡住(实际转速远低于名义值), 助推就一直给到超时;
-       直线运动的轮子 0.06 秒就起来了, 助推马上就被撤掉, 不会造成超速。
-       撤掉之后由积分接手, 不需要助推再参与。 */
-    if (w->kick_until != 0)
-    {
-        if (fresh && (fabsf(actual) >= (mag * KICK_RELEASE_K)))
-        {
-            w->kick_until = 0;                      /* 已经转起来了 */
-        }
-        else if ((int32_t)(g_tick_ms - w->kick_until) >= 0)
-        {
-            w->kick_until = 0;                      /* 超时兜底 */
-        }
-        else
-        {
-            kick = KICK_RPM;
-        }
     }
 
     /*---- 慢积分: 只修稳态偏差 ----
@@ -1096,17 +1343,18 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
 
     out = nominal + w->trim;
 
-    /* 助推按名义方向叠加 */
-    if (kick > 0.0f)
+    /* 助推按名义方向叠加 —— boost 是 Boost_Decide 给的两轮共享值, 这里无脑加,
+       不再各自判决(每轮各判会让两轮指令差 12 RPM, 起步车会歪) */
+    if (boost > 0.0f)
     {
-        out += (nominal > 0.0f) ? kick : -kick;
+        out += (nominal > 0.0f) ? boost : -boost;
     }
 #else
     (void)actual;
     (void)fresh;
     (void)dt;
+    (void)boost;            /* A/B 路径里助推整段不编译, 这里显式吃掉免警告 */
     w->trim = 0.0f;
-    w->kick_until = 0;
     out = nominal;
 #endif
 
@@ -1161,6 +1409,7 @@ static void Drive_Apply(void)
     float rpm_r = v_right / WHEEL_CIRC_M * 60.0f;
     float cmd_l;
     float cmd_r;
+    float boost;
     int16_t m1;
     int16_t m2;
 
@@ -1174,8 +1423,12 @@ static void Drive_Apply(void)
     {
         trim_w[TRIM_IDX_LEFT].trim  = 0.0f;
         trim_w[TRIM_IDX_RIGHT].trim = 0.0f;
-        trim_w[TRIM_IDX_LEFT].kick_until  = 0;
-        trim_w[TRIM_IDX_RIGHT].kick_until = 0;
+        boost_on      = 0;  /* 停过之后助推状态也清干净 */
+        boost_amt     = 0.0f;
+        boost_ms      = 0;
+        boost_step_ms = 0;
+        boost_cool_ms = 0;
+        boost_stuck   = 0;
         target_left_rpm  = 0;
         target_right_rpm = 0;
         CAN1_SendStop(MOTOR1_CAN_ID);
@@ -1186,15 +1439,21 @@ static void Drive_Apply(void)
     rpm_l = ClampF(rpm_l, -(float)MAX_RPM, (float)MAX_RPM);
     rpm_r = ClampF(rpm_r, -(float)MAX_RPM, (float)MAX_RPM);
 
+    /* 起步助推: **一次判决, 两轮共用**(见 KICK_* 最后一段)。必须放在两次
+       Trim_Apply 之前, 而且只调一次 —— 每轮各判一次会让两轮指令差 12 RPM。 */
+    boost = Boost_Decide(rpm_l, rpm_r,
+                         (float)wheel_left_rpm, (float)wheel_right_rpm,
+                         wheel_left_fresh, wheel_right_fresh, dt);
+
     /* 外环修正: 用实际轮速去修目标轮速。原地转起步时轮子是真的没转, 这里会把
        指令顶上去直到它真的转; 稳态偏高时又会把指令压回来。
        ★ 目标为 0 时 Trim_Apply 恒定返回 0, 而且它保证输出方向和名义值一致,
          所以外环**不可能**在主机下令停车的时候把车带着走, 也不可能把某个轮子
          修成倒转 —— 这是这套做法敢上车的底线。 */
     cmd_l = Trim_Apply(&trim_w[TRIM_IDX_LEFT], rpm_l,
-                       (float)wheel_left_rpm, wheel_left_fresh, dt);
+                       (float)wheel_left_rpm, wheel_left_fresh, dt, boost);
     cmd_r = Trim_Apply(&trim_w[TRIM_IDX_RIGHT], rpm_r,
-                       (float)wheel_right_rpm, wheel_right_fresh, dt);
+                       (float)wheel_right_rpm, wheel_right_fresh, dt, boost);
 
     /* 物理轮速 -> CAN 命令 (反向应用接线校准) */
     if (MOTOR1_IS_LEFT) { m1 = (int16_t)cmd_l; m2 = (int16_t)cmd_r; }
@@ -1415,6 +1674,9 @@ static void Send_DiagFrame(uart_port_t *p)
     if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪自开机以来读到过非零 */
     if (reset_by_iwdg)    flags |= 0x10;    /* 上次复位是看门狗引起的(主循环卡死过) */
     if (!Drive_Ready())   flags |= 0x20;    /* 有驱动器没回码/掉线: 此时只发刹车 */
+    if (boost_on && (boost_amt > 0.5f) && (boost_cool_ms == 0))
+        flags |= 0x40;                       /* 正在给起步助推(叠加了 boost_amt RPM) */
+    if (boost_stuck)      flags |= 0x80;    /* 加到上限还不转, 已进入"给一会歇一会" */
 
     f[0] = DIAG_HEAD;
     f[1] = flags;
