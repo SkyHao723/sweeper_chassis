@@ -11,6 +11,7 @@
  *   CAN1    PA12(TX)/ PA11(RX)  -->  两台 FOC 驱动器          500 kbps 扩展帧
  *   PB10/PB11                   <->  亚博 YbImu (软件 I2C)
  *   PB0 / PB1                   -->  滚刷继电器 / 水泵继电器
+ *   PB9                         -->  状态灯 (上电后 2Hz 闪烁, 心跳/主循环活着)
  *
  * 只有一个上位机(RK3588)。**定位不在本板做**: 卡尔曼滤波在上位机跑,
  * 本板只出运动学、CAN 下发、看门狗、继电器和状态上报。PA2/PA3 空着。
@@ -161,6 +162,31 @@
 #define RELAY_PORT          GPIOB
 #define RELAY_ACTIVE_LOW    1               /* 1=低电平触发(实测) 0=高电平触发 */
 #define RELAY_OFF_ON_LINK_LOSS  1
+/*=============================================================*/
+
+/*-------------------------- 状态灯 (PB9) ---------------------------
+ * 上电后就一直在 PB9 上"亮-灭-亮-灭"地闪, 当心跳灯用。
+ *
+ * ★ PB9 的选择: 全片查过没有冲突 —— CAN1 走的是 PA11/PA12(没重映射, 所以
+ *   PB8/PB9 空着), USART1 走 PA9/PA10, IMU 软件 I2C 走 PB10/PB11, 继电器是
+ *   PB0/PB1。PB9 也不是 JTAG 脚(JTAG 是 PA13/14/15 + PB3/PB4), 所以不需要
+ *   任何重映射就能直接当普通 IO 用。
+ *
+ * ★ 这个灯是**翻转式**的, 不是延时式: 在主循环里按 g_tick_ms 到点翻转, 没有
+ *   任何阻塞。所以它顺带还是一个"主循环还活着"的指示 —— 主循环一旦卡死,
+ *   灯就定住不动了(而 IWDG 会在 1 秒后复位, 复位后又开始闪)。
+ *
+ * ★ LED_ON_LEVEL: 点亮电平。**点亮是指"给高"还是"给低"完全取决于你的模块**,
+ *   我这边看不到实物, 所以做成一个宏:
+ *     1 = 高电平点亮(引脚->电阻->LED->GND, 最常见)
+ *     0 = 低电平点亮(3.3V->LED->电阻->引脚, 或模块标了 L/低电平触发)
+ *   接反了不会烧, 只是"亮灭颠倒", 把 0/1 对调即可。
+ *-----------------------------------------------------------------*/
+#define LED_ENABLE          1
+#define LED_PORT            GPIOB
+#define LED_PIN             GPIO_Pin_9
+#define LED_ON_LEVEL        1               /* ★ 亮灭反了就改这个 */
+#define LED_BLINK_MS        250             /* 半周期 ms: 亮 250 / 灭 250 = 2Hz */
 /*=============================================================*/
 
 /*-------------------------- 物理换算 ------------------------------*/
@@ -899,6 +925,64 @@ static void Relay_Init(void)
     GPIO_Init(RELAY_PORT, &gpio);
 
     Relay_Set(0);       /* 上电先全部断开, 不要一通电就抽水 */
+}
+
+/*========================== 状态灯 (PB9) ==========================
+ * 见上面 LED_* 那一大段的说明。这里只有两件事:
+ *   LED_Init: 配成推挽输出, 并**明确写一次初始电平** —— 不写的话上电瞬间
+ *             引脚是浮空的, 灯会先闪一下或者微亮, 看着像故障。
+ *   LED_Tick: 到点翻转, 不阻塞。
+ *
+ * ★ 灯相关的状态和 LED_Apply 都包在 #if LED_ENABLE 里 —— 这个文件里凡是
+ *   "平时不编译的那条路"都踩过"改了这边忘了那边"的坑(见 TRIM_ENABLE 的注释),
+ *   而 ARMCC 对没被引用的 file-scope 变量/函数会报 177-D。两条路都必须是
+ *   0 Error 0 Warning, 否则真警告会被淹掉。
+ *=================================================================*/
+#if LED_ENABLE
+static uint32_t led_last_ms;
+static uint8_t  led_on;
+
+static void LED_Apply(uint8_t on)
+{
+#if LED_ON_LEVEL
+    if (on) GPIO_SetBits(LED_PORT, LED_PIN);
+    else    GPIO_ResetBits(LED_PORT, LED_PIN);
+#else
+    if (on) GPIO_ResetBits(LED_PORT, LED_PIN);
+    else    GPIO_SetBits(LED_PORT, LED_PIN);
+#endif
+}
+#endif  /* LED_ENABLE */
+
+static void LED_Init(void)
+{
+#if LED_ENABLE
+    GPIO_InitTypeDef gpio;
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+
+    gpio.GPIO_Pin = LED_PIN;
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(LED_PORT, &gpio);
+
+    led_on = 0;
+    led_last_ms = g_tick_ms;
+    LED_Apply(0);       /* 先明确灭掉 */
+#endif
+}
+
+/* 在 main 循环里每圈调一次。找不到到点条件就直接返回, 代价可以忽略。 */
+static void LED_Tick(void)
+{
+#if LED_ENABLE
+    if ((g_tick_ms - led_last_ms) >= LED_BLINK_MS)
+    {
+        led_last_ms = g_tick_ms;
+        led_on = (uint8_t)(led_on ? 0 : 1);
+        LED_Apply(led_on);
+    }
+#endif
 }
 
 /*======================== 命令帧 (11字节) ==========================
@@ -1737,6 +1821,7 @@ int main(void)
 
     USART1_Init();          /* PA9/PA10 -> CH340 / RK3588, 唯一的上位机口 */
     Relay_Init();
+    LED_Init();             /* PB9 状态灯, 上电后一直闪 */
 
     /* 独立看门狗。放在初始化后面开 —— 前面这些初始化是确定性的、不会卡,
        真正的风险在主循环里(见 IWDG_Init 的说明)。 */
@@ -1760,6 +1845,10 @@ int main(void)
     while (1)
     {
         IWDG_ReloadCounter();       /* 喂狗: 主循环还在转就说明没卡死 */
+
+        LED_Tick();                 /* PB9 心跳灯, 非阻塞。放在循环最前面:
+                                       下面的任何一段一旦卡住, 灯就停住不动 ——
+                                       这本身就是"主循环卡在哪"的现场指示 */
 
         Port_ProcessCommands(&ports[PORT_MAIN]);
         CAN1_Poll();
