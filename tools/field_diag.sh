@@ -11,7 +11,11 @@
 #   D. 执行层:      ★ 最容易被忽略的一层 —— 驱动器没上电/CAN 不通,
 #                   固件会**只发刹车**(就绪联锁), 车当然不动, 而遥测/IMU 一切正常。
 #                   这时看 /odom、/imu 全是好的, 会让人以为是"软件问题"。
-set -u
+# ★ 不要加 set -u (nounset)!
+#   ROS 的 setup.bash 第 8 行就引用了未绑定的 AMENT_TRACE_SETUP_FILES, 在 set -u 下
+#   `source` 会把整个脚本**直接打死** —— 症状是"一条输出都没有, 退出码 1", 极难查。
+#   这个坑本仓库已踩过三次(chassis_bringup.sh / chassis_watchdog.sh / chassis_web.sh
+#   里都有同样的警告), 2026-10 又踩了一次(本文件和 zero_stop_probe.sh)。
 PORT=/dev/wheeltec_controller
 DO_SERIAL=0
 [ "${1:-}" = "--read-serial" ] && DO_SERIAL=1
