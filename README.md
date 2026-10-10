@@ -452,6 +452,30 @@ python3 tools/decode_diag.py -p /dev/wheeltec_controller --drive 0 -0.30 --secon
 Nav2 的 `controller_server` 按控制频率发（默认 20 Hz），没问题；
 但自己写的脚本发一条就退出，车只会动 0.8 秒。
 
+**零速命令是"一等公民"，不会被当成没命令。** 收到 `vx=0, wz=0` 的速度帧时，
+STM32 会：喂运动看门狗、**把 `failsafe_latched`（`flags` bit1）清掉**、然后按
+20 ms 周期发 `CTRL_BRAKE` 刹车帧。所以：
+
+| | 收到零速帧 | 静默 800 ms |
+|---|---|---|
+| 电机动作 | 刹车帧 @20 Hz | 刹车帧 @20 Hz |
+| `flags` bit1 看门狗停车 | **清 0** | **置 1 并锁存** |
+| 滚刷/水泵 | 保持 | 断开 |
+
+也就是说"显式停车"和"上位机掉线"**在电机上一样、在语义上完全不同**，
+而且**发零速帧还能把上一次的锁存解除掉**（想让车老实停住，就持续发零速）。
+单个零速帧长这样（BCC 恰好等于帧头）：
+
+```
+7B 00 00 00 00 00 00 00 00 7B 7D
+```
+
+> ⚠️ 但有个陷阱：如果 `/chassis_security` 或 `/robot_recharge_flag` 被置成非 0，
+> 厂商节点会把这两个标志塞进每条速度帧的 `f[1]`/`f[2]`，STM32 就会把**所有**
+> 速度帧（包括零速）当成功能帧丢掉 —— 表现为 `/cmd_vel` 在发、遥测正常、**车
+> 完全不动**，而且 800 ms 后 `flags` bit1 会置位。详见
+> [chassis-serial-protocol.md 6.3.1](docs/chassis-serial-protocol.md)。
+
 **★ 用键盘 teleop 会因此变得很难开，这是实测过的坑：**
 
 车上装的 `teleop_twist_keyboard` 2.4.1 在 Linux 下是**阻塞**读一个字符
