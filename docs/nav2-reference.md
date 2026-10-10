@@ -266,9 +266,9 @@ IMU 的 `angular_velocity_covariance[8]` = **2.5e-3** —— **IMU 权重是轮�
 
 | 发布者 | 数量 | 什么时候发 |
 |---|---|---|
-| `controller_server` | 1 | **跟着路径走的时候，按控制频率持续发（~20 Hz）** |
+| `controller_server` | 1 | **跟着路径走的时候，按控制频率持续发（~20 Hz）** ⚠ 这是 Nav2 的标准行为，本次**没有实测到**（当时没有 active goal，20 秒里一条消息都没有） |
 | `behavior_server` | 3 | 恢复行为（spin/backup/drive_on_heading） |
-| `stop_all_services` | 1 | 收到 `/ly_nav/stop_all` 时**只发 2 帧 0**（间隔 0.3 s） |
+| `stop_all_services` | 1 | 收到 `/ly_nav/stop_all` 时**只发 2 帧 0**（间隔 0.3 s）—— 源码里就这么写的 |
 
 ROS 2 里多条消息都送到同一个订阅者，**谁最后到谁算数**。所以：
 
