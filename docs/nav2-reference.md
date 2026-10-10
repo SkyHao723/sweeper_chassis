@@ -266,16 +266,26 @@ IMU 的 `angular_velocity_covariance[8]` = **2.5e-3** —— **IMU 权重是轮�
 
 | 发布者 | 数量 | 什么时候发 |
 |---|---|---|
-| `controller_server` | 1 | **跟着路径走的时候，按控制频率持续发（~20 Hz）** ⚠ 这是 Nav2 的标准行为，本次**没有实测到**（当时没有 active goal，20 秒里一条消息都没有） |
+| `controller_server` | 1 | **跟着路径走的时候，按 `controller_frequency` 持续发**。本车加载的是自定义插件 **`sweeper_stanley_controller`**（`LY_sweep_ws/LY_sweeper/nav2_stanley_controller`，Stanley 路径跟踪 + costmap 避障），所以这条 `cmd_vel` 是**它**在往外推 |
 | `behavior_server` | 3 | 恢复行为（spin/backup/drive_on_heading） |
 | `stop_all_services` | 1 | 收到 `/ly_nav/stop_all` 时**只发 2 帧 0**（间隔 0.3 s）—— 源码里就这么写的 |
+
+> ⚠ 两条**没有实测到**的：①"跟路径走时持续发"是 Nav2 的机制（当时没有 active goal，
+> 20 秒里一条消息都没有），②发多快取决于 `controller_frequency`。
+> 参数快照里写的是 **10.0**（注释：RK3588 满载时 20 Hz 会持续 miss，2026-09-22 降到 10），
+> 但那是 `runtime_logs` 里的旧快照，**要以实际 launch 的值为准**：
+> `ros2 param get /controller_server controller_frequency`。
+>
+> 这条**很关键**：如果它在 10 Hz，那么"自己发 0"至少要发得比它快才有机会，
+> 而且即使 20 Hz 对 10 Hz，也只有 2/3 的帧是你的 0 —— 车会**一顿一顿地慢慢挪**，
+> 不会干净地停住。**所以真正让车停下的是"取消目标"，不是"发 0"。**
 
 ROS 2 里多条消息都送到同一个订阅者，**谁最后到谁算数**。所以：
 
 ```
 你的 1~2 帧 0        ──┐
                        ├─► wheeltec_robot ─► STM32
-controller_server     ──┘   20 Hz 非零, 50 ms 内就把 0 覆盖掉
+controller_server     ──┘   10~20 Hz 非零, 50~100 ms 内就把 0 覆盖掉
 ```
 
 **只发一两帧 0 在原理上就不可能停车**，只要还有别的节点在发。
@@ -287,25 +297,91 @@ controller_server     ──┘   20 Hz 非零, 50 ms 内就把 0 覆盖掉
 
 **修法**（按推荐顺序）：
 
-1. **让"停"先去停源头。** `stop_all_services.py` 现在的顺序是
-   "发 2 帧 0 → 0.3 s 后再发 1 帧 → 跑 `reset_ros.sh` 杀进程"。
-   在 `controller_server` 被杀掉之前它一直在发非零，所以那 2 帧 0 等于没发。
-   正确顺序：**先取消 Nav2 goal / 把 `controller_server` 失活 → 再以 ≥20 Hz
-   持续发 0 共 0.5~1 秒 → 最后才杀进程**。
-2. **加一个速度仲裁**（`twist_mux`，或自己写一个几十行的优先级 mux）：
-   急停/遥操走高优先级输入，Nav2 走低优先级；高优先级有 0.5 s 超时后自动让位。
-   Nav2 侧改成发 `/cmd_vel_nav`，mux 输出 `/cmd_vel`。**这是架构上正确的做法**，
-   以后加遥控器、加急停都不会再打这个架。
-   本机**没装** `twist_mux`（`ros2 pkg prefix twist_mux` → not found），
-   要 `sudo apt install ros-humble-twist-mux`，或直接写一个（推荐，
-   因为需求很简单，而且和现有 `mid360_nav_bridge` 放一起最好维护）。
-3. 想临时手动停车，**先停 Nav2 再发 0**，或者直接 `reset_ros.sh`。
+**0. 立刻可用：`tools/cmd_vel_guard.py`（本仓库提供，不用改同事的 Nav2 配置）**
+
+```bash
+python3 tools/cmd_vel_guard.py &        # 起一个 /chassis_stop 服务
+ros2 service call /chassis_stop std_srvs/srv/Trigger
+```
+
+它按**正确顺序**做三件事：
+
+1. **先取消全部导航目标**（直接调 `/navigate_to_pose`、`/navigate_through_poses`、
+   `/follow_path`、`/spin`、`/backup` 的 `_action/cancel_goal` 服务，`goal_info`
+   全 0 = 取消所有目标）—— **这一步才是真正让车停下来的**，因为源头不闭嘴，
+   发多少帧 0 都是白搭。
+2. 再以 **20 Hz 持续发 0 共 1 秒**，让停车**立刻**生效，而不用等 STM32 那 800 ms。
+3. **量给你看**：读 `/odom` 的车体速度，把"停没停"变成可验证的结论。还在动就
+   **不再跟 Nav2 抢**（对着 20 Hz 发只会让车一抖一抖），直接返回失败 + 实测速度。
+
+> **★ 为什么不用 `rclpy` 的 `ActionClient` 取消**：Humble 的 `ActionClient` **没有**
+> 公开的 cancel-all 方法（实测 `dir(ActionClient)` 里只有私有的 `_cancel_goal` /
+> `_cancel_goal_async`），而且它只能取消**自己发出的**目标。我们不是发目标的人，
+> 所以走 action 底层的 `cancel_goal` 服务 —— 这是 ROS 2 给"非发起方要求取消"留的通道。
+>
+> **★ 一个 rclpy 的坑（这次踩了两个小时）**：不指定 `callback_group` 时，所有回调
+> 都落在节点的**默认回调组，而默认是 `MutuallyExclusive`** —— 同一个组里的回调
+> **永远不会并发**，哪怕你用的是 `MultiThreadedExecutor`。后果非常隐蔽：
+> `/chassis_stop` 一阻塞（要发 1 秒的 0），`/odom` 回调就**一帧都收不到**，
+> `cancel_goal` 的响应也永远处理不了（取消报 `none`）。**停车判定因此全是瞎的**，
+> 而表面上看节点运行得好好的。必须把订阅/服务/客户端都放进
+> `ReentrantCallbackGroup`。
+
+**实测（2026-10-10，车静止，只发 0 不会让车动）**：
+
+```
+success = True
+message = 已停车 (前 vx=0.000 wz=0.000 -> 后 vx=0.000 wz=0.000,
+          取消目标=ok:/navigate_to_pose(rc=0),/navigate_through_poses(rc=0),
+                    /spin(rc=0),/backup(rc=0),
+          20 帧 0, 期间 /odom 30 帧)
+```
+
+⚠ **还没验证的是真正要紧的那一种**：车正在被 Nav2 驱动着的时候调用它。
+那需要跑一次真导航（车会动、而且是 200+ kg），要有空旷场地和人在旁边。
+复现顺序见 §5.2。
+
+**1. 改 `stop_all_services.py` 的顺序。** 它现在是"发 2 帧 0 → 0.3 s 后再发 1 帧
+→ 跑 `reset_ros.sh` 杀进程"。在 `controller_server` 被杀掉之前它一直在发非零，
+那 2 帧等于没发。正确顺序：**先取消目标（或让 `controller_server` 失活）→ 再以
+≥20 Hz 持续发 0 共 0.5~1 秒 → 最后才杀进程**。
+
+**2. 加一个速度仲裁**（`twist_mux`，或自己写一个几十行的优先级 mux）：
+急停/遥操走高优先级输入，Nav2 走低优先级；高优先级有 0.5 s 超时后自动让位。
+Nav2 侧改成发 `/cmd_vel_nav`（改 `sweeper_stanley_controller` 的
+`controller_server` 参数里的话题名），mux 输出 `/cmd_vel`。**这是架构上正确的
+做法**，以后加遥控器、加急停都不会再打这个架。本机**没装** `twist_mux`
+（`ros2 pkg prefix twist_mux` → not found）。
+
+**3. 临时手动停车**：先取消目标/停 Nav2，再发 0；或者直接 `reset_ros.sh`。
 
 > 顺带一个已知隐患：本仓库给 `wheeltec_robot` 打的滚刷/水泵补丁里，
 > `Relay_Hold_Timer`（200 ms）会在 **`Relay_Mask != 0`** 时调用
 > `Send_Relay_Frame()`，而它和 `Cmd_Vel_Callback` **共用同一个
 > `Send_Data.tx[]` 缓冲且没有加锁**。滚刷/水泵关着时不会触发；一旦开着，
 > 理论上存在"速度帧和继电器帧交错"的竞争。要开滚刷时留意这一条。
+
+### 5.2 复现"发 0 停不下来"（车上，人在旁边）
+
+```bash
+# 0) 空旷场地, 人站在急停旁边。先确认底盘栈和 Nav2 都在跑
+ros2 lifecycle get /controller_server          # active 才行
+ros2 param get /controller_server controller_frequency   # 记下这个值
+
+# 1) 先只读地看清楚 /cmd_vel 上有谁
+bash tools/zero_stop_probe.sh
+
+# 2) 起 guard, 让它把"取消目标 + 持续发 0 + 实测确认"一条龙做掉
+python3 tools/cmd_vel_guard.py --hold 1.0 &    # 另开一个终端
+# 3) 发一个导航目标让车跑起来, 然后在另一个终端:
+ros2 service call /chassis_stop std_srvs/srv/Trigger
+#    看返回: success=true 且 message 里"后 vx=..."接近 0 = 干净停住
+#    若 success=false, message 会告诉你取消目标成没成、期间 /odom 收了多少帧
+
+# 4) 对照实验(证明"只发一帧 0"没用):
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0}}"
+#    预期: 车几乎不停(1 帧在 50~100ms 内被覆盖)
+```
 
 ---
 
