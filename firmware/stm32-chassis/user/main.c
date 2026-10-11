@@ -86,6 +86,8 @@
  *   [29]    帧序号(自增), 上位机据此发现丢帧
  *   [30]    IMU 寄存器体检标志位: bit0 版本号 bit1 陀螺仪 bit2 磁力计
  *                               bit3 四元数 bit4 欧拉角  (1 = 该块读到非零数据)
+ *           ★ bit5-6 = 车型号 (1=扫地机 2=洗地机), 见"车型选择"
+ *           ★ bit7   = 上电自检"两轮都没转" (见 SELFTEST_* 说明)
  *   [31]    IMU 版本号(主版本)
  *   [32-33] IMU 内部融合的偏航角, int16, 单位 0.01 rad
  *   [34]    BCC = XOR([0..33])
@@ -200,6 +202,42 @@
  *   现在的停车路径是**无状态**的: 每个控制周期重发同一条帧, 不记忆、不切换。
  *-----------------------------------------------------------------*/
 #define STOP_CTRL           CTRL_BRAKE
+
+/*====================== 上电自检点动 (PB9 之外唯一的"自己会动") ==========
+ * 上电 **延迟 3 秒** 后, 自己往前点动一下再停。用途是**自检**:
+ * 证明 驱动器/CAN/电机/接线方向 这一整条链是好的 —— 动一下就说明都通,
+ * 不动就说明有问题(配合诊断帧看 flags bit5 和驱动器故障码能定位到具体哪一环)。
+ *
+ * ★★ 这是全固件**唯一**一处"不等上位机命令就自己动"。所以边界写死:
+ *
+ *   1. **延迟 3 秒再走**(SELFTEST_DELAY_MS)。开机瞬间旁边可能有人、车可能贴着墙,
+ *      给一个明确的"要先躲开"的窗口。板子一上电 PB9 就开始闪, 所以这 3 秒不是
+ *      静默的 —— 看到灯在闪就知道板子活了、接下来会动一下。
+ *   2. **等两个驱动器都回过码**(Drive_Ready)。没就绪就只刹车、不动 ——
+ *      否则差速车单轮出力 = 原地打转。
+ *   3. **上位机一旦开始发指令, 立刻让位**(ever_linked)。绝不自检和主人抢车。
+ *      副作用: 如果 RK3588 比这 3 秒先起来并发帧, 自检就直接跳过 —— 这是对的。
+ *   4. **看门狗复位过就跳过**(reset_by_iwdg)。IWDG 复位意味着"刚才在跑的时候
+ *      主循环卡死过", 车可能正贴着墙/在人旁边; 这种复位绝不能再往前窜一下。
+ *   5. 有独立超时(SELFTEST_ABORT_MS): 到点不管走到哪都收手。
+ *
+ * ★ "10cm"只是**名义值**, 不是承诺: 命令 0.25 m/s × 300ms = 7.5cm, 但停车后
+ *   还会滑(本车没有保持力, 见 docs/nav2-reference.md §5.1.1), 所以实际距离
+ *   大约是 洗地机 ~12cm / 扫地机 ~16cm。**要更接近 10cm 就把 SELFTEST_MS 调小**
+ *   (经验: 每减 100ms 少走约 2.5cm)。真要精确 10cm 得在上位机用 EKF 里程计闭环,
+ *   这条开环点动做不到, 也没打算做。
+ *
+ * ★ 自检"没转"会被记下来(诊断帧 f[30] bit7), 因为"动了一下"是操作员肉眼判断的,
+ *   而"到底哪个轮子没转"得看数据。
+ *------------------------------------------------------------------------*/
+#define SELFTEST_ENABLE     1
+#define SELFTEST_DELAY_MS   3000    /* ★ 上电后先等这么久再动 */
+#define SELFTEST_VX         0.25f   /* 点动速度 m/s。必须明显高于起步门槛
+                                       (洗地机 0.12 / 扫地机 0.22 m/s), 否则
+                                       静摩擦推不动, 自检会误报"没转" */
+#define SELFTEST_MS         300     /* 点动时长 ms (名义 0.25 × 0.30 = 7.5cm) */
+#define SELFTEST_READY_MS   2000    /* 延迟到了但驱动器还没就绪, 再等这么久 */
+#define SELFTEST_ABORT_MS   3000    /* 开动之后的硬上限, 到点必停 */
 
 /*---------------------- 串口 / 看门狗 ----------------------------
  *   只有一个上位机: USART1 (PA9/PA10) -> CH340 / RK3588。
@@ -1558,6 +1596,150 @@ static uint8_t Drive_Ready(void)
     return 1;
 }
 
+/*========================= 上电自检点动 ============================
+ * 见上面 SELFTEST_* 那一大段(边界、为什么不能做成精确 10cm)。
+ *
+ * 状态机故意做成**非阻塞**的、挂在主循环上, 原因有三个:
+ *   1. 主循环照常喂 IWDG、照常发遥测 —— 操作员能在 /odom 上看到这次点动,
+ *      比"阻塞式 Delay 里偷偷动一下"可验证得多;
+ *   2. 上位机一插话就能立刻让位(每圈都查 ever_linked);
+ *   3. 复用 Drive_Apply 的整套安全(就绪联锁、目标归零就发刹车)。
+ *
+ * 点动期间本函数**自己当指挥官**: 保持 target 并把 last_cmd_ms 刷新, 否则
+ * 800ms 运动看门狗会把这次点动中途掐掉(SELFTEST_MS 目前 300ms 掐不到, 但
+ * 一旦有人把它调到 800 以上就会莫名其妙走一半 —— 所以这里显式喂狗)。
+ *=================================================================*/
+#if SELFTEST_ENABLE
+static uint8_t  st_state;           /* 见下面的 ST_* */
+static uint32_t st_t0_ms;           /* 进入当前状态的时刻 */
+static int16_t  st_peak_l;          /* 点动期间左轮见过的最大 |实际转速| */
+static int16_t  st_peak_r;
+#endif
+/* ★ 这个放在 #if 外面: 诊断帧要读它(bit7)。整段关掉时它恒为 0 = "没查出问题",
+   语义上正好是"没做自检所以没发现问题", 不会误导。 */
+static uint8_t  selftest_no_move;   /* 点动期间两轮都没转 -> 自检没过 */
+
+#define ST_DELAY    0       /* 上电先等 SELFTEST_DELAY_MS */
+#define ST_READY    1       /* 等两个驱动器回码(最多 SELFTEST_READY_MS) */
+#define ST_RUN      2       /* 正在点动 */
+#define ST_DONE     3       /* 结束(或放弃), 再也不动 */
+
+static void SelfTest_Init(void)
+{
+#if SELFTEST_ENABLE
+    st_state  = ST_DELAY;
+    st_t0_ms  = g_tick_ms;
+    st_peak_l = 0;
+    st_peak_r = 0;
+
+    /* ★ 看门狗复位过就**跳过自检**。
+       IWDG 复位意味着"刚才主循环卡死过", 而刚才车是在跑的 —— 可能正贴着墙、
+       正停在人旁边。这种复位之后再自己往前窜 7~16cm 是纯粹的风险, 没有任何
+       自检价值(自检是给"刚上电"用的)。注意本函数是在 main 里读完 RCC_CSR
+       之后才调的, reset_by_iwdg 已经是最终值。 */
+    if (reset_by_iwdg)
+    {
+        st_state = ST_DONE;
+    }
+#endif
+}
+
+/* 挂在主循环里每圈调一次。只在自检还没结束时干活, 结束后开销为 0。 */
+static void SelfTest_Tick(void)
+{
+#if SELFTEST_ENABLE
+    uint32_t elapsed;
+    int16_t  a;
+
+    if (st_state == ST_DONE) return;
+
+    /* ★ 上位机开始指挥了 -> 立刻让位, 把状态收干净走人。
+       绝不自检和主人抢车。注意 Cmd_Apply 已经把 target 写成上位机的值了,
+       这里只负责不再覆盖它。 */
+    if (ever_linked)
+    {
+        st_state = ST_DONE;
+        return;
+    }
+
+    elapsed = g_tick_ms - st_t0_ms;
+
+    switch (st_state)
+    {
+    case ST_DELAY:
+        /* ★ 上电后先等这 3 秒: 让旁边的人有时间躲开, 也给驱动器上电时间。
+           这期间**什么都不做** -> target 保持 0 -> Drive_Apply 一直发刹车帧。 */
+        if (elapsed >= SELFTEST_DELAY_MS)
+        {
+            st_state = ST_READY;
+            st_t0_ms = g_tick_ms;
+        }
+        break;
+
+    case ST_READY:
+        if (Drive_Ready())
+        {
+            st_state = ST_RUN;
+            st_t0_ms = g_tick_ms;
+            st_peak_l = 0;
+            st_peak_r = 0;
+        }
+        else if (elapsed >= SELFTEST_READY_MS)
+        {
+            /* 驱动器一直没回码 -> 不做自检。车保持刹车, 什么都不动。
+               这时候"为什么不动"由诊断帧回答(flags bit5 + 驱动器故障码)。 */
+            st_state = ST_DONE;
+        }
+        break;
+
+    case ST_RUN:
+        /* 记录两轮见过的峰值, 用来判断"到底转没转" —— 只看结束那一拍的
+           瞬时值是碰运气(可能正好落在 0 附近)。 */
+        a = wheel_left_rpm;  if (a < 0) a = (int16_t)(-a);
+        if (a > st_peak_l) st_peak_l = a;
+        a = wheel_right_rpm; if (a < 0) a = (int16_t)(-a);
+        if (a > st_peak_r) st_peak_r = a;
+
+        /* 硬上限: 不管因为什么, 到点必停(正常 300ms 就结束了) */
+        if (elapsed >= SELFTEST_ABORT_MS)
+        {
+            target_vx = 0.0f;
+            target_wz = 0.0f;
+            st_state = ST_DONE;
+            break;
+        }
+
+        if (elapsed >= SELFTEST_MS)
+        {
+            /* 点动结束: 目标交回 0, 下一拍 Drive_Apply 就发刹车帧。
+               起点和终点都归零是刻意的 —— 自检不该给系统留下任何状态。 */
+            target_vx = 0.0f;
+            target_wz = 0.0f;
+
+            if ((st_peak_l == 0) && (st_peak_r == 0))
+            {
+                selftest_no_move = 1;   /* 一点没转: 驱动/CAN/电机这条链有问题 */
+            }
+            st_state = ST_DONE;
+            break;
+        }
+
+        /* 点动中 */
+        target_vx = SELFTEST_VX;
+        target_wz = 0.0f;
+        last_cmd_ms = g_tick_ms;        /* 喂运动看门狗, 见函数头说明 */
+        break;
+
+    default:
+        st_state = ST_DONE;
+        break;
+    }
+#else
+    /* A/B 路径: 整段不编译。函数体留空, 但被 main 引用, 所以不会报未引用。 */
+    (void)0;
+#endif
+}
+
 /*========================= 差速逆解 ================================
  * 车体 (vx, wz) -> 左右轮目标转速。差速车用不到 vy。
  *   v_left  = vx - wz * b/2
@@ -1868,11 +2050,17 @@ static void Send_DiagFrame(uart_port_t *p)
     f[27] = imu_status;                  /* YBIMU_ST_* */
     f[28] = imu_found_addr;              /* 0 = 没扫到 */
     f[29] = seq++;                       /* 帧序号, 上位机据此发现丢帧 */
-    /* bit0-4 = IMU 各功能块活没活; bit5-6 = **车型号**(1 扫地机 / 2 洗地机)。
+    /* bit0-4 = IMU 各功能块活没活; bit5-6 = **车型号**(1 扫地机 / 2 洗地机);
+       bit7 = **上电自检没转**(点动期间两个轮子实际转速一直是 0)。
        车型塞在这里是因为 ARMCC5 不支持 #pragma message, 编译日志里留不下记号,
        而"这块板烧的是哪辆车的几何"必须能被查出来 —— 选错的后果是转向增益
-       差 2.19 倍。decode_diag.py 会把这两位的值印出来。bit7 留着没用。 */
-    f[30] = (uint8_t)(imu_probe_flags | (uint8_t)(VEHICLE_SEL << 5));
+       差 2.19 倍。bit7 是自检的结论, 因为"动了一下"是操作员肉眼看的, 而
+       "到底转没转"得看数据。decode_diag.py 会把车型和这一位都印出来。
+       ★ bit7 = 0 有歧义: 可能是"自检通过", 也可能是"自检没跑"(驱动器没就绪
+         时放弃、上位机已接管、看门狗复位后跳过)。要区分得加位, 而这里只剩
+         1 个空位; 目前靠"上电 3 秒内有没有看到车动一下"来判。 */
+    f[30] = (uint8_t)(imu_probe_flags | (uint8_t)(VEHICLE_SEL << 5) |
+                      (uint8_t)(selftest_no_move ? 0x80 : 0x00));
     f[31] = imu_ver_major;               /* 模块版本号 */
     PutI16(&f[32], imu_euler_yaw_crad);  /* 模块自己融合的偏航角 0.01rad */
     /* f[34] = BCC, f[35] = 0x7D 下面填 */
@@ -1930,6 +2118,11 @@ int main(void)
     last_tel_ms = g_tick_ms;
     last_cmd_ms = g_tick_ms;
 
+    SelfTest_Init();        /* ★★ 上电自检: 延迟 3 秒后往前点动一下。
+                               必须在读过 RCC_CSR 之后调 —— 它要看 reset_by_iwdg
+                               决定跳不跳(看门狗复位过就绝不再自己动)。
+                               整段由 SELFTEST_ENABLE 控制, 详见 SELFTEST_* 说明。 */
+
     while (1)
     {
         IWDG_ReloadCounter();       /* 喂狗: 主循环还在转就说明没卡死 */
@@ -1940,6 +2133,11 @@ int main(void)
 
         Port_ProcessCommands(&ports[PORT_MAIN]);
         CAN1_Poll();
+
+        /* 上电自检点动。放在读命令**之后**: 这样"上位机这一拍发了帧"能立刻
+           被看到(ever_linked), 自检当拍就让位, 不会和上位机抢一拍。
+           放在看门狗**之前**: 点动期间它自己刷 last_cmd_ms, 免得被死手掐掉。 */
+        SelfTest_Tick();
 
         /*--------------------- 看门狗 (两件事, 必须分开) ---------------------
          * 以前只有一条 last_cmd_ms, 把两件事混在一起了, 结果**继电器帧不算喂狗**,

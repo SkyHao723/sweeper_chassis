@@ -260,7 +260,7 @@ class Diag(object):
     __slots__ = ("flags", "vx", "wz", "wl", "wr", "tl", "tr",
                  "c1", "c2", "f1", "f2", "m1", "m2", "can_err",
                  "bad", "ok", "ovf", "relay", "imu_st", "imu_addr", "seq",
-                 "probe", "imu_ver", "euler_yaw", "vehicle")
+                 "probe", "imu_ver", "euler_yaw", "vehicle", "selftest_nomove")
 
     def __init__(self, b):
         self.flags = b[1]
@@ -275,10 +275,11 @@ class Diag(object):
         self.imu_st, self.imu_addr = b[27], b[28]
         self.seq = b[29]
         self.probe = b[30] & 0x1F     # IMU 体检位, **只取低 5 位**
-        # ★ 高两位是车型号。必须在这里掩掉: 否则下面 probe_text() 的
+        # ★ 高三位是别的用途, 必须在这里掩掉: 否则下面 probe_text() 的
         #   `if self.probe == 0: return "没做体检"` 永远不成立(车型号恒 >=1),
         #   "没做体检"这个真实状态会被吃掉。
-        self.vehicle = (b[30] >> 5) & 0x03
+        self.vehicle = (b[30] >> 5) & 0x03          # bit5-6 车型
+        self.selftest_nomove = (b[30] >> 7) & 0x01  # bit7 上电自检没转
         self.imu_ver = b[31]
         self.euler_yaw = i16(b, 32) / 100.0    # rad
 
@@ -376,11 +377,12 @@ class Diag(object):
             dr = int(round(self.tr - nom[1]))
             if dl or dr:
                 trim = " 目标-理论%+d/%+d(含助推)" % (dl, dr)
-        return ("seq=%-3d %s vx=%+5d wz=%+5d | "
+        return ("seq=%-3d %s%s vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
                 "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s"
-                % (self.seq, vehicle_text(self.vehicle), self.vx, self.wz,
+                % (self.seq, vehicle_text(self.vehicle),
+                   selftest_text(self.selftest_nomove), self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
@@ -397,6 +399,16 @@ def vehicle_text(v):
       所以只能靠诊断帧上报 —— 上车前先看这一项。"""
     return {0: "未标(旧固件)", 1: "扫地机205/930", 2: "洗地机150/425"}.get(
         v, "未知%d" % v)
+
+
+def selftest_text(nomove):
+    """诊断帧 [30] 的 bit7: 上电自检(延迟3秒后往前点动)的结果。
+
+    ★ bit7 = 0 **有歧义**: 可能是"自检通过(动了一下)", 也可能是"压根没跑" ——
+      驱动器没就绪时放弃、上位机先接管了(ever_linked)、或者上次是看门狗复位
+      所以故意跳过。只有一个空位, 分不出这三种。实际判断办法是"上电 3 秒内
+      有没有看到车往前动一下"。"""
+    return "★上电自检:两轮都没转!" if nomove else ""
 
 
 def flags_text(f):
