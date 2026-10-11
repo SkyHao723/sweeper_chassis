@@ -36,5 +36,29 @@ echo "===== 4. 装了哪些 udev 规则 ====="
 grep -rn 'wheeltec\|1a86\|ttyUSB' /etc/udev/rules.d/ 2>/dev/null | head -20
 
 echo
-echo "===== 5. 最近有没有掉线/重新枚举 ====="
+echo "-- ★ 有几条规则在抢同一个软链接(多于 1 条就是隐患: 谁最后命中谁赢) --"
+for L in wheeltec_controller wheeltec_lidar wheeltec_IMU; do
+  n=$(grep -l "SYMLINK+=\"$L\"" /etc/udev/rules.d/*.rules 2>/dev/null | wc -l)
+  printf "  %-22s %s 条\n" "$L" "$n"
+done
+
+echo
+echo "===== 5. 这台内核到底能不能驱动 CH343(1a86:55d4)? ====="
+echo "★ 换 CH343 之前必须先过这一关: 内核不认 -> 插上根本不出 tty, 直接不能用。"
+if modinfo ch341 2>/dev/null | grep -qi '55d4'; then
+  echo "  ch341 认 CH343 -> 插上应该能出 /dev/ttyCH343USB* 或 ttyUSB*"
+else
+  echo "  ★ ch341.ko 的 alias 里**没有 55d4** -> 内核自带驱动不认 CH343"
+fi
+echo -n "  是否装了 WCH 的 out-of-tree 驱动: "
+if find /lib/modules -iname '*ch343*' 2>/dev/null | grep -q .; then
+  find /lib/modules -iname '*ch343*' 2>/dev/null | head -3
+else
+  echo "没找到(没有 ch343.ko, 也没有 dkms)"
+fi
+echo "  当前存在的 tty: $(ls /dev/ttyUSB* /dev/ttyCH343USB* /dev/ttyACM* 2>/dev/null | tr '\n' ' ')"
+
+
+echo
+echo "===== 6. 最近有没有掉线/重新枚举 ====="
 dmesg 2>/dev/null | grep -iE 'ch341|usb .*disconnect|ttyUSB' | tail -12
