@@ -45,6 +45,10 @@
     [28]    IMU I2C 地址            [29]   帧序号
     [30]    IMU 寄存器体检标志位: bit0 版本 bit1 陀螺仪 bit2 磁力计
                                 bit3 四元数 bit4 欧拉角
+                                ★ bit5-6 = **车型号** (1=扫地机 2=洗地机)
+                                  几何选错 -> 转向增益差 2.19 倍, 所以固件把它
+                                  报出来; ARMCC5 不支持 #pragma message, 编译
+                                  日志里留不下记号, 只能走这里
     [31]    IMU 版本号(主)
     [32-33] IMU 内部融合的偏航角 int16 0.01rad
     [34]    BCC                     [35]   0x7D
@@ -256,7 +260,7 @@ class Diag(object):
     __slots__ = ("flags", "vx", "wz", "wl", "wr", "tl", "tr",
                  "c1", "c2", "f1", "f2", "m1", "m2", "can_err",
                  "bad", "ok", "ovf", "relay", "imu_st", "imu_addr", "seq",
-                 "probe", "imu_ver", "euler_yaw")
+                 "probe", "imu_ver", "euler_yaw", "vehicle")
 
     def __init__(self, b):
         self.flags = b[1]
@@ -270,7 +274,11 @@ class Diag(object):
         self.ovf, self.relay = b[25], b[26]
         self.imu_st, self.imu_addr = b[27], b[28]
         self.seq = b[29]
-        self.probe = b[30]          # 各功能块活没活
+        self.probe = b[30] & 0x1F     # IMU 体检位, **只取低 5 位**
+        # ★ 高两位是车型号。必须在这里掩掉: 否则下面 probe_text() 的
+        #   `if self.probe == 0: return "没做体检"` 永远不成立(车型号恒 >=1),
+        #   "没做体检"这个真实状态会被吃掉。
+        self.vehicle = (b[30] >> 5) & 0x03
         self.imu_ver = b[31]
         self.euler_yaw = i16(b, 32) / 100.0    # rad
 
@@ -368,16 +376,27 @@ class Diag(object):
             dr = int(round(self.tr - nom[1]))
             if dl or dr:
                 trim = " 目标-理论%+d/%+d(含助推)" % (dl, dr)
-        return ("seq=%-3d vx=%+5d wz=%+5d | "
+        return ("seq=%-3d %s vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
                 "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s"
-                % (self.seq, self.vx, self.wz,
+                % (self.seq, vehicle_text(self.vehicle), self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2), trim,
                    self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a))
+
+
+def vehicle_text(v):
+    """诊断帧 [30] 的 bit5-6: 固件是按哪辆车的几何编的。
+
+    ★ 这个必须一眼看得见: 几何选错时, 转向增益会错 2.19 倍(扫地机 930mm 的
+      固件烧到 425mm 的洗地机上 -> 转得过头一倍多), 里程计偏航也会同样错,
+      导航会直接跑飞。ARMCC5 不支持 #pragma message, 编译日志留不下记号,
+      所以只能靠诊断帧上报 —— 上车前先看这一项。"""
+    return {0: "未标(旧固件)", 1: "扫地机205/930", 2: "洗地机150/425"}.get(
+        v, "未知%d" % v)
 
 
 def flags_text(f):
