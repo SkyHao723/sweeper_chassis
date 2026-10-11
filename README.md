@@ -33,9 +33,11 @@ sweeper_chassis/
 │   ├── ros-integration.md                接入 ROS 2 的状态/启动/还缺什么
 │   ├── ★ nav2-reference.md               **给做 Nav2 定位/导航的同事**：接口契约、
 │   │                                     TF 树、实测精度、速度包线、故障模式
-│   ├── chassis-serial-protocol.md        底盘串口协议说明（Wheeltec 那套）
+│   ├── chassis-serial-protocol.md        底盘串口协议说明（Wheeltec 那套，RK3588↔STM32）
+│   ├── ★ foc-can-protocol.md             **FOC 驱动器 CAN 协议（STM32↔驱动器）**，
+│   │                                     经厂家资料核对；模式/控制字/回码/上报/故障码
 │   ├── pos-mode.md                       位置模式实验（在 pos-mode 分支上）
-│   └── foc-driver-protocol-v1.2.pdf      FOC 驱动器通讯协议原始文档
+│   └── foc-driver-protocol-v1.2.pdf      FOC 驱动器通讯协议原始文档（厂家 PDF）
 ├── tools/
 │   ├── decode_diag.py                    解码扩展诊断帧（查"轮子有没有劲"）
 │   └── chassis_check.py                  底盘验收（命令值 vs /odom 实测）
@@ -413,9 +415,16 @@ rm /tmp/chassis_watchdog.pause
 **能治它的只有两条路**（也就是本文档早先那句"要么找厂家调，要么在 STM32 上用
 扭矩模式自己做速度环"）：
 1. 找厂家调 / 关掉驱动器内部的速度环参数 —— 协议不暴露这些寄存器。
+   **2026-10-11 已用厂家资料核实过，确认没有任何参数读写通路**
+   （CAN/串口/BLE 都没有，见 [`docs/foc-can-protocol.md`](docs/foc-can-protocol.md) §6），
+   所以这条路**只能找厂家**，我们调不了。
 2. **STM32 切扭矩模式，自己做速度环。** FOC 的扭矩指令是平滑的，这样也不再有
    第二个环跟它打架。代价是安全性模型变了：**扭矩模式下"指令卡住"= 持续加速**
    （速度模式只是匀速跑），必须配电流限幅，并依赖 IWDG + 上电刹车帧兜底。
+   ★ **这条路现在是通的**：核实确认**扭矩模式 `0x04` 确实存在**
+   （单位 A、量程 ±10.0 A、值 = 电流×10），我们之前"0x04 不存在"的判断是**错的** ——
+   详情与出处见 [`docs/foc-can-protocol.md`](docs/foc-can-protocol.md) §2.1 与 §7。
+   ⚠️ 但它在**我们这台**驱动器上能否动作仍是 ❓ 未实测。
 
 ---
 
