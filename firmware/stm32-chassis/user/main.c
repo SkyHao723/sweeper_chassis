@@ -119,7 +119,15 @@
 #define VEHICLE_SWEEPER     1       /* 扫地机: 轮径 205mm / 轮距 930mm */
 #define VEHICLE_SCRUBBER    2       /* 洗地机: 轮径 150mm / 轮距 425mm */
 
-#define VEHICLE_SEL         VEHICLE_SCRUBBER    /* ★★★ 烧录前确认这一行! ★★★ */
+/* ★ 优先级: **工程 target 里的 -D 定义 > 下面这个默认值**。
+   工程里已经建好两个 Keil target(sweeper / scrubber), 各自带
+   `-DVEHICLE_SEL=1` / `-DVEHICLE_SEL=2` —— 所以在 Keil 里**选 target 就够了,
+   不用改源码**, 而且两个 target 产出的 hex 文件名也不同(sweeper.hex /
+   scrubber.hex), 不会编完分不清哪个是哪个。
+   下面这个默认值只在"没有 -D"时生效(命令行直接编、或新加 target 忘了带 -D)。 */
+#ifndef VEHICLE_SEL
+  #define VEHICLE_SEL       VEHICLE_SCRUBBER
+#endif
 
 #if VEHICLE_SEL == VEHICLE_SWEEPER
   #define VEHICLE_NAME        "sweeper(扫地机)"

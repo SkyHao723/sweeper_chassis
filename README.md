@@ -76,7 +76,7 @@ EKF（配合网页画轨迹），ESP32 退场时一起删了，需要的话在 g
 | PB9 心跳灯 | **2 Hz** | **5 Hz** |
 
 ```c
-#define VEHICLE_SEL   VEHICLE_SCRUBBER   /* ★ 烧录前确认这一行 */
+#define VEHICLE_SEL   VEHICLE_SCRUBBER   /* 默认值; 正常走 Keil target 选车型 */
 ```
 
 **★ 选错是安全级错误**：把扫地机固件烧到洗地机上，转向增益变成
@@ -108,12 +108,40 @@ EKF（配合网页画轨迹），ESP32 退场时一起删了，需要的话在 g
 
 ### 编译烧录 STM32
 
-```
-firmware/stm32-chassis/stm32-chassis.uvprojx
-```
+工程：`firmware/stm32-chassis/stm32-chassis.uvprojx`
 
-Keil MDK 打开它，用 **ST-Link (SWD)** 烧录。SWD 占用 PA13/PA14，和串口不冲突。
-产出 `Objects/stm32-chassis.hex`。目前 Code ≈ 10400 B / 0 Error / 0 Warning。
+**★ 工程里有三个 target，第一个就是"选车型"—— 不用改源码：**
+
+| Keil target | 车型 | 几何 | PB9 心跳灯 | 产出的 hex |
+|---|---|---|---|---|
+| `sweeper` | 扫地机 | 205 / 930 mm | **2 Hz** | `Objects/sweeper.hex` |
+| `scrubber` | 洗地机 | 150 / 425 mm | **5 Hz** | `Objects/scrubber.hex` |
+
+两个 target 的唯一差别就是编译宏 `-DVEHICLE_SEL=1/2`，源码是同一份。
+
+**烧录步骤：**
+
+1. Keil 打开 `stm32-chassis.uvprojx`
+2. 工具栏 target 下拉框选 **`sweeper`** 或 **`scrubber`**　← ★ 这一步就是在选车型
+3. `F7` 编译（产物就落在 `Objects/<车型>.hex`，文件名自带车型，不会搞混）
+4. ST-Link (SWD) 接上，`F8` Download
+5. 烧完**看一眼 PB9 的灯**：2 Hz = 扫地机，5 Hz = 洗地机，对上了再上车
+
+SWD 占用 PA13/PA14，和串口不冲突。目前 Code ≈ 12972 B / RO 268 / RW 160，
+两条 target 都是 **0 Error 0 Warning**。
+
+> ⚠ 改双 target **之前**那个 `Objects/stm32-chassis.hex` 已经删掉了 ——
+> 它的文件名不带车型，分不清是哪辆车，别再烧它。
+>
+> `VEHICLE_SEL` 没定义时会落到 `main.c` 里的默认值（现在是洗地机），
+> 但**别依赖这个默认值**：命令行直接编、或者以后新加 target 忘了带宏，就会落到
+> 它上面。所以正常流程一律走"选 target"。
+>
+> 命令行编译要**显式带 target**：`UV4 -r stm32-chassis.uvprojx -t scrubber -o log`。
+> 不带 `-t` 编的是列表里**第一个**（现在是 `sweeper`），不是源码默认值 —— 别混。
+>
+> 以后要再加车型（第三个底盘）：`python tools/add_keil_targets.py <uvprojx>`
+> （幂等，已经加过会拒绝并提示）。
 
 ---
 
