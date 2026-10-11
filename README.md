@@ -715,10 +715,50 @@ KERNEL=="ttyUSB*", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", \
   MODE:="0777", GROUP:="dialout", SYMLINK+="wheeltec_controller"
 ```
 
-普通 CH340 **没有唯一序列号**（`ID_SERIAL=1a86_USB_Serial`），只能按 VID:PID 匹配。
-以后要是加第二个 CH340，改成用 `KERNELS=="3-1.2"` 指定 USB 物理口。
-
 生效后 `/dev/wheeltec_controller -> ttyUSB*`，厂商的 launch 文件不用改。
+
+#### 为什么必须自己写这条规则（"芯片 ID"）
+
+"芯片 ID"就是 **USB 的 VID:PID**（厂商 ID:产品 ID）。厂商那套 udev 规则是靠
+**序列号**认设备的，而**普通 CH340 没有唯一序列号** —— 实测它的 USB 属性是：
+
+```
+ID_VENDOR_ID=1a86   ID_MODEL_ID=7523          # CH340 (沁恒/WCH)
+ID_SERIAL=1a86_USB_Serial                     # ★ 所有普通 CH340 都是这个字符串
+```
+
+对比厂商支持的那两种（**有**唯一序列号，所以厂商规则能按 `serial` 区分）：
+
+| 芯片 | VID:PID | 序列号 | 厂商规则认得吗 |
+|---|---|---|---|
+| CP2102 | `10c4:ea60` | `0001`~`0005` | ✅ 按 `ATTRS{serial}` |
+| CH343 | `1a86:55d4` | `0001`~`0005` | ✅ 按 `ATTRS{serial}` |
+| **CH340（本车）** | **`1a86:7523`** | **无（同一个串）** | ❌ **必须按 VID:PID 自己写** |
+
+⚠ **两个隐患，别踩：**
+
+1. **`1a86:7523` 认不出"哪一个" CH340。** 现在车上只插了一个，所以能工作。
+   但**我们现在有两辆车，就是两个一模一样的 CH340** —— 同时插到同一台
+   RK3588 上（或者插拔换车）时，`/dev/wheeltec_controller` 会指向**最后枚举的
+   那一个**，也就是**可能给错的车发指令**。正确做法是按**USB 物理口**钉死：
+
+   ```udev
+   # 按物理口区分(CH340 没有序列号可用, 只能这样)。
+   # 车上的底盘 CH340 在 usb1 的 1-1 口(直插 RK3588, 不经 hub)。
+   KERNEL=="ttyUSB*", KERNELS=="1-1", ATTRS{idVendor}=="1a86", \
+     ATTRS{idProduct}=="7523", MODE:="0777", GROUP:="dialout", \
+     SYMLINK+="wheeltec_controller"
+   ```
+   物理口用 `udevadm info -a -n /dev/ttyUSBx | grep -m2 'KERNELS=='` 查；
+   或者 `bash tools/check_usbserial.sh` 一次看全。
+
+2. **同一个软链接有 4 条规则在抢**（实测）：
+   `wheeltec_controller_ch340.rules`(CH340)、`wheeltec_controller.rules`(CP2102
+   serial=0002)、`wheeltec_controller2.rules`(CH343 ttyCH343USB serial=0002)、
+   `wheeltec_controller3.rules`(CH343 ttyACM serial=0002)。
+   现在只插了 CH340，所以只有第一条命中；**一旦插上带 `serial=0002` 的
+   CP2102/CH343，两边的规则都会触发，软链接归谁就不确定了。**
+   不用的话把多余那几条删掉/改后缀禁掉最省事。
 
 ---
 
