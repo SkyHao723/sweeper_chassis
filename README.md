@@ -116,21 +116,62 @@ EKF（配合网页画轨迹），ESP32 退场时一起删了，需要的话在 g
 
 | Keil target | 车型 | 几何 | PB9 心跳灯 | 产出的 hex |
 |---|---|---|---|---|
-| `sweeper` | 扫地机 | 205 / 930 mm | **2 Hz** | `Objects/sweeper.hex` |
-| `scrubber` | 洗地机 | 150 / 425 mm | **5 Hz** | `Objects/scrubber.hex` |
+| `sweeper` | 扫地机 | 205 / 930 mm | **2 Hz** | `Objects/sweeper/sweeper.hex` |
+| `scrubber` | 洗地机 | 150 / 425 mm | **5 Hz** | `Objects/scrubber/scrubber.hex` |
 
 两个 target 的唯一差别就是编译宏 `-DVEHICLE_SEL=1/2`，源码是同一份。
+**每个 target 有自己独立的输出目录**（`Objects/sweeper/` 与 `Objects/scrubber/`）——
+这一点是必须的，理由见下面那个坑。
 
 **烧录步骤：**
 
 1. Keil 打开 `stm32-chassis.uvprojx`
 2. 工具栏 target 下拉框选 **`sweeper`** 或 **`scrubber`**　← ★ 这一步就是在选车型
-3. `F7` 编译（产物就落在 `Objects/<车型>.hex`，文件名自带车型，不会搞混）
+3. `F7` 编译（产物落在 `Objects/<车型>/<车型>.hex`，**路径和文件名都自带车型**）
 4. ST-Link (SWD) 接上，`F8` Download
 5. 烧完**看一眼 PB9 的灯**：2 Hz = 扫地机，5 Hz = 洗地机，对上了再上车
+6. 上位机起来后再核一次（最硬的证据）：`python tools/decode_diag.py --port ...`
+   看 **车型=** 那一栏是不是 `扫地机205/930`
 
 SWD 占用 PA13/PA14，和串口不冲突。目前 Code ≈ 12972 B / RO 268 / RW 160，
 两条 target 都是 **0 Error 0 Warning**。
+
+> ### ★★ 2026-10-12 的坑：烧错固件（已修，务必知道）
+>
+> **症状**：target 明明选的是 `sweeper`，但 PB9 **灯闪得很快**（= 5 Hz），
+> 同事反馈**导航不对**。Keil 编译日志是干净的 0 Error 0 Warning，完全看不出来。
+>
+> **根因**：加双 target 时是用文本复制 `<Target>` 块做的，把原来的
+> `.\Objects\` 一起复制了过去 —— **两个 target 共用同一个输出目录**，
+> 而 `.o` 是按**源文件名**命名的，于是**全工程只有一个 `main.o`**。
+> 于是这个序列就会出错：
+>
+> ```
+> 选 scrubber -> F7 编译   → main.o 是【洗地机】版
+> 选 sweeper  -> F7 增量编译 → Keil 发现 main.c 比 main.o 旧, 不重编
+>                            → 直接把洗地机的 main.o 链成 sweeper.hex
+> ```
+>
+> **实测证据**：当时 `Objects/main.o` 时间戳 14:10:45（洗地机那次编译），
+> 而 `Objects/sweeper.axf` 是 14:19:17（晚了 9 分钟，中间没重编），
+> 且 `sweeper.hex` 与 `scrubber.hex` **SHA256 完全相同**。
+> 也就是说 **`sweeper.hex` 里装的确实是洗地机固件** —— 灯没说谎。
+>
+> **后果**：洗地机的几何（150/425）装到扫地机上 → 转向被放大/缩小 2.19 倍、
+> 里程计距离少报 27%（详见下面"两辆车共用这一份固件"那节）→ **导航必然跑飞**。
+>
+> **修法**：每个 target 一个独立输出目录
+> （`Objects/sweeper/` 与 `Objects/scrubber/`，`Listings/` 同理），
+> 这样 `.o` 不可能互相覆盖。`tools/add_keil_targets.py` 已同步修好，
+> 以后加车型不会再犯。
+>
+> **教训**：
+> 1. **"两个 hex 不一样"不等于"两个 hex 都对"** —— 我上次就是这么验的，
+>    当时刚跑完 Rebuild 所以确实对，但**没验证"哪个是哪个"**。
+>    真正的验证要在 hex 里搜**车型特有的常量**（扫地机周长 0.644026 / 轮距 0.930，
+>    洗地机 0.471239 / 0.425）。
+> 2. **换 target 之后如果不用 Rebuild，就一定要看灯**。现在结构上修好了，
+>    但"看灯复核"这个习惯值得留着 —— 它是唯一不依赖工具链的行为。
 
 > ⚠ 改双 target **之前**那个 `Objects/stm32-chassis.hex` 已经删掉了 ——
 > 它的文件名不带车型，分不清是哪辆车，别再烧它。
@@ -143,7 +184,7 @@ SWD 占用 PA13/PA14，和串口不冲突。目前 Code ≈ 12972 B / RO 268 / R
 > 不带 `-t` 编的是列表里**第一个**（现在是 `sweeper`），不是源码默认值 —— 别混。
 >
 > 以后要再加车型（第三个底盘）：`python tools/add_keil_targets.py <uvprojx>`
-> （幂等，已经加过会拒绝并提示）。
+> （幂等，已经加过会拒绝并提示；会自动给新 target 设独立输出目录）。
 
 ---
 
