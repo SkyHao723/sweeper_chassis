@@ -120,17 +120,29 @@ GYRO_RATIO = 0.00026644
 # 底盘几何 —— 必须和固件 main.c 里的一致, 否则还原出来的外环修正量是错的。
 # 用途: 固件上报的"目标"是**含外环修正的最终命令**, 拿这里算出的理论目标一减,
 # 就得到外环到底加了多少。见 main.c 的 Trim_Apply。
-WHEEL_DIAMETER_MM = 205.0
-TRACK_WIDTH_MM = 930.0
-WHEEL_CIRC_M = WHEEL_DIAMETER_MM / 1000.0 * 3.141592653589793
-TRACK_WIDTH_M = TRACK_WIDTH_MM / 1000.0
+#
+# ★★ 2026-10-12 修: 以前这里写死扫地机的 205/930, 于是**洗地机上这一列恒偏 +10 RPM**
+#    (0.3 m/s: 扫地机名义 27.9 RPM, 洗地机 38.2 RPM), 看起来像"外环一直在加 10",
+#    把助推/外环的分析带偏了一晚上。
+#    现在改成**按诊断帧里的车型号自动选几何**(车型号是固件上报的, 见 vehicle_text)。
+GEOM = {                       # 车型号 -> (轮径 mm, 轮距 mm)
+    1: (205.0, 930.0),         # 扫地机
+    2: (150.0, 425.0),         # 洗地机
+}
+DEFAULT_GEOM = (205.0, 930.0)  # 旧固件(f[30] bit5-6 = 0)只能按扫地机算
 
 
-def nominal_rpm(vx, wz):
-    """主机下发的 (vx, wz) -> 左右轮理论物理转速, 和固件 Drive_Apply 同一套公式。"""
-    v_l = vx - wz * TRACK_WIDTH_M * 0.5
-    v_r = vx + wz * TRACK_WIDTH_M * 0.5
-    return (v_l / WHEEL_CIRC_M * 60.0, v_r / WHEEL_CIRC_M * 60.0)
+def nominal_rpm(vx, wz, vehicle=0):
+    """主机下发的 (vx, wz) -> 左右轮理论物理转速, 和固件 Drive_Apply 同一套公式。
+
+    ★ vehicle 必须来自诊断帧的车型号; 传 0(旧固件)就只能退回扫地机几何,
+      这时候洗地机上的结果会偏, 提示一下比默默算错强。"""
+    d_mm, t_mm = GEOM.get(vehicle, DEFAULT_GEOM)
+    circ = d_mm / 1000.0 * 3.141592653589793
+    track = t_mm / 1000.0
+    v_l = vx - wz * track * 0.5
+    v_r = vx + wz * track * 0.5
+    return (v_l / circ * 60.0, v_r / circ * 60.0)
 
 
 def i16(b, i):
@@ -616,8 +628,9 @@ def main():
             os._exit(0)
 
     sender = None
-    # 只有 --drive 时才知道主机下发的理论目标, 才能把外环修正量还原出来
-    nom = nominal_rpm(args.drive[0], args.drive[1]) if args.drive else None
+    # 只有 --drive 时才知道主机下发的理论目标, 才能把外环修正量还原出来。
+    # ★ 注意这里先留 None: 几何要按诊断帧里的车型号算, 第一帧到了才能算(见下面)。
+    nom = None
     if args.drive:
         if args.file:
             sys.exit("--drive 需要真实串口, 不能和 -f 一起用")
@@ -627,8 +640,8 @@ def main():
         sender.start()
         print("# 正在下发 vx=%.3f m/s  wz=%.3f rad/s  (Ctrl-C 停止)"
               % (args.drive[0], args.drive[1]))
-        print("# 理论轮速目标: 左 %+.1f RPM  右 %+.1f RPM"
-              "  —— 固件上报的'目标'含外环修正, 相减就是修正量" % nom)
+        print("# 理论轮速目标按诊断帧里的**车型号**算 "
+              "(几何错了这一列会整体偏移, 以前就是这么被误导过)")
 
     t0 = time.time()
     last_diag = None
@@ -665,6 +678,11 @@ def main():
                 if 0 < gap < 128:
                     dropped += gap
             seen_seq = d.seq
+
+            # ★ 理论轮速要按**诊断帧上报的车型号**算几何(见 nominal_rpm 的说明)。
+            #   所以不能提前算, 得等第一帧拿到车型号。
+            if (nom is None) and args.drive:
+                nom = nominal_rpm(args.drive[0], args.drive[1], d.vehicle)
 
             probs = tracker.update(d.problems())
             if args.only_problems and not probs:
