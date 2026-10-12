@@ -380,14 +380,31 @@ class Diag(object):
         return ("seq=%-3d %s%s vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s%s"
                 % (self.seq, vehicle_text(self.vehicle),
                    selftest_text(self.selftest_nomove), self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2), trim,
-                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a))
+                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a,
+                   (" " + self.drive_text()) if self.drive_text() else ""))
+
+    def drive_text(self):
+        """诊断帧 [26] 的高位: 驱动模式 + 扭矩保护锁存。
+
+        ★ 这两位是 2026-10 加"力矩模式"实验时新占的 —— 速度模式下**恒为 0**,
+          所以老固件/老日志在这里只会印出空串, 不会误报。
+
+        为什么值得单独印出来: "这块板烧的是速度模式还是力矩模式"上车前必须能一眼
+        看出来 —— 和车型号同理。力矩模式的参数是没标定的, 而且保护一旦锁存就只刹车
+        (车表现为"不走"), 不印出来就只能猜。"""
+        out = []
+        if self.relay & 0x04:
+            out.append("★力矩模式固件")
+        if self.relay & 0x08:
+            out.append("**扭矩保护已锁存(超速/堵转, 只刹车)**")
+        return "/".join(out)
 
 
 def vehicle_text(v):
@@ -429,11 +446,16 @@ def flags_text(f):
         # 驱动器还没回码 -> 只发刹车, 车不动是正常的(不是故障)
         out.append("驱动器未就绪(等回码, 车被刹住)")
     if f & 0x40:
-        # ★ 起步助推正在加力。这是"小转向命令愣在原地"和"转向太敏感"这两个
-        #   症状共同的现场证据: 助推在给 = 轮子还没转起来。
-        out.append("起步助推中")
+        # 这一位的含义**随驱动模式变**(固件里由 Drive_ActiveFlag() 给):
+        #   速度模式 = 起步助推正在加力。这是"小转向命令愣在原地"和"转向太敏感"
+        #             这两个症状共同的现场证据: 助推在给 = 轮子还没转起来。
+        #   力矩模式 = 扭矩环正在出力(|扭矩指令| > 0.05A)。
+        # 台架上很好用: 命令了却一直不亮 = 环没在给(或保护锁存); 亮了却不动 =
+        # 在给但推不动(电流不够 / 被卡住)。
+        out.append("起步助推中/扭矩出力中")
     if f & 0x80:
-        # 助推加到上限、KICK_MAX_MS 内轮子仍然没转 -> 被东西顶住/驱动器没使上劲
+        # 速度模式: 助推加到上限、KICK_MAX_MS 内轮子仍然没转 -> 被东西顶住
+        # 力矩模式: 这条恒为 0(力矩模式走 Torque_Guard, 堵转由 f[26] bit3 报)
         out.append("**助推加到上限还不转(轮子被顶住?)**")
     return "/".join(out)
 

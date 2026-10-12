@@ -230,7 +230,17 @@
  * ★ 自检"没转"会被记下来(诊断帧 f[30] bit7), 因为"动了一下"是操作员肉眼判断的,
  *   而"到底哪个轮子没转"得看数据。
  *------------------------------------------------------------------------*/
+/* ★★ 力矩模式下**默认关掉上电自检点动** ★★
+ *   理由: 自检会在上电 3 秒后自己往前窜一下。速度模式下那一窜是驱动器速度环
+ *   执行的、幅度可预期; 而力矩模式的增益(TQ_KP/TQ_KI/TQ_STICTION)目前**全是
+ *   没标定的估计值**, 同一条命令可能窜出去很远。第一次上电不该带一个
+ *   "参数还没标定的自动前窜"。
+ *   台架标定完、并且确认过点动幅度之后, 再把下面这个改回 1。 */
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+#define SELFTEST_ENABLE     0
+#else
 #define SELFTEST_ENABLE     1
+#endif
 #define SELFTEST_DELAY_MS   3000    /* ★ 上电后先等这么久再动 */
 #define SELFTEST_VX         0.25f   /* 点动速度 m/s。必须明显高于起步门槛
                                        (洗地机 0.12 / 扫地机 0.22 m/s), 否则
@@ -319,9 +329,48 @@
 
 #define MODE_SPEED         0x05
 #define MODE_POSITION      0x06
+#define MODE_TORQUE        0x04    /* ★ 力矩模式。协议 PDF 第 4/8 页: 单位 A,
+                                      放大 10 倍保留 1 位小数 -> 写 -100~100
+                                      对应 -10.0A~+10.0A, 正负 = 扭矩方向。
+                                      (我们曾经误判"0x04 不存在", 见
+                                       docs/foc-can-protocol.md §2.1/§7) */
 #define CTRL_ENABLE        0x01
 #define CTRL_DISABLE       0x02
 #define CTRL_BRAKE         0x03
+#define CTRL_RESET_FAULT   0x0F    /* ★ 复位/清故障。驱动器故障锁存后不用再断电。
+                                      目前**没有**被代码用到, 先记在这里 —— 用之前
+                                      想清楚"什么时候该清", 别把真故障清成静默。 */
+
+/*====================== 驱动模式: 驱动器自己闭环 or 我们闭环 ==========
+ * 背景: 实测驱动器**内部速度环**有极限环 —— 目标 27.9 RPM, 实际在 0↔71 RPM
+ * 之间暴力来回冲、电流 7~11A。外环(我们的 Trim)只贡献几个 RPM, 够不着这一层。
+ * 而协议**不暴露任何参数读写**(见 docs/foc-can-protocol.md §6), 我们调不了它。
+ *
+ * 所以只剩两条路: ①找厂家调; ②**切扭矩模式, 速度环由 STM32 自己做**。
+ * 这个开关就是第 ② 条。两条路都保留, 靠编译宏 A/B, 默认还是速度模式。
+ *
+ *   DRIVE_MODE_SPEED  0 : 驱动器内部速度环(现状, 默认)。Trim/Boost 在它外面打补丁。
+ *   DRIVE_MODE_TORQUE 1 : 我们发扭矩, 自己用 PI 做速度环。Trim/Boost **不再使用**
+ *                         (它们本来就是为"修补驱动器那个环"而生的; 现在那个环不在了,
+ *                          两个积分环串在一起必然打架 —— 只留一个积分器)。
+ *
+ * ★★ 安全模型完全不同, 这是这个开关最需要注意的地方 ★★
+ *   速度模式: 指令卡住 = 匀速跑(危险但收敛)。
+ *   扭矩模式: 指令卡住 = **持续加速**(不收敛)。所以要额外三道保护,
+ *             见下面 Torque_Guard() —— 没有它们, 扭矩模式不能上车。
+ *===================================================================*/
+#define DRIVE_MODE_SPEED    0
+#define DRIVE_MODE_TORQUE   1
+#ifndef DRIVE_MODE_SEL
+/* ★★ 这个默认值在 torque-mode 分支上是 **TORQUE** ★★
+ *   也就是在这个分支上, Keil 里照常选 sweeper/scrubber, 编出来的就是**力矩模式**
+ *   固件 —— 不需要额外选 target, 更不需要手改源码(手改源码正是"选 sweeper 却烧成
+ *   洗地机"那次事故的成因, 绝不再引入第二种"我记得我改过")。
+ *   想在本分支编速度模式做 A/B: 命令行加 -DDRIVE_MODE_SEL=0(工程里的 <Define>
+ *   优先于这里的默认值), 或者把这里改回 DRIVE_MODE_SPEED。
+ *   ★ main 分支上这个默认值是 DRIVE_MODE_SPEED, 不受影响。 */
+#define DRIVE_MODE_SEL      DRIVE_MODE_TORQUE
+#endif
 
 /* 故障码 (FOC_CH4-V1.2 第 11 页附表), 回码 DATA1 / 上报帧 DATA2 */
 #define FOC_FAULT_NONE       0
@@ -628,6 +677,13 @@ static int16_t  wheel_left_rpm, wheel_right_rpm;   /* 已按接线校准的物�
 static uint8_t  wheel_left_fresh, wheel_right_fresh; /* 该轮回码是否新鲜 */
 static float    body_vx, body_wz;                  /* 轮速正解出的车体速度 */
 
+/* ★ 下面的 Trim(轮速外环) 和 Boost(起步助推)**只服务于速度模式** —— 它们的
+   存在意义是给驱动器内部那个(有极限环的)速度环打补丁。切到力矩模式之后我们自己
+   就是那个环(见 Torque_Apply), 两个积分环串联必然打架, 所以整段不编译。
+   用 #if 隔开而不是留着不用: ARMCC 会对"定义了但没人引用"报警告, 而本工程
+   坚持两个模式都 0 Warning —— 有警告就意味着"这段代码的生死没人管"。 */
+#if DRIVE_MODE_SEL == DRIVE_MODE_SPEED
+
 /* 外环修正状态 (物理轮速域, 左右各一份) —— 见 TRIM_* 的说明 */
 typedef struct
 {
@@ -635,8 +691,6 @@ typedef struct
 } wheel_trim_t;
 
 static wheel_trim_t trim_w[2];      /* [0] = 左轮, [1] = 右轮 */
-#define TRIM_IDX_LEFT   0
-#define TRIM_IDX_RIGHT  1
 
 /* 助推的状态 —— ★ 这几个是**两轮共享**的, 不是每轮一份。
  *
@@ -651,7 +705,16 @@ static float    boost_amt;          /* 当前助推量 RPM (会逐级加力, 见
 static uint16_t boost_ms;           /* 本轮已连续助推了多久, 用于防卡死保护 */
 static uint16_t boost_step_ms;      /* 距上次加力多久 */
 static uint16_t boost_cool_ms;      /* 防卡死"歇一会儿"的剩余时间, 见 KICK_COOL_MS */
-static uint8_t  boost_stuck;        /* 加满上限还不转 -> 锁存。目标归零才清 */
+
+#endif  /* DRIVE_MODE_SEL == DRIVE_MODE_SPEED */
+
+/* ★ 左右轮的下标两种模式都用(trim_w 和 tq_w 同序), 所以放在 #if 外面 */
+#define TRIM_IDX_LEFT   0
+#define TRIM_IDX_RIGHT  1
+
+/* ★ boost_stuck 也放在 #if 外面: 诊断帧的 flags bit7 要读它, 而且两种模式下
+   "有没有卡住过"都是有意义的信息(力矩模式下由 Torque_Guard 的堵转保护对应)。 */
+static uint8_t  boost_stuck;        /* 加到上限还不转 -> 锁存。目标归零才清 */
 
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
@@ -842,7 +905,18 @@ static void CAN1_SendMotorCmd(uint32_t id, uint8_t mode, uint8_t ctrl, int16_t v
 }
 
 #define CAN1_SendSpeed(id, rpm)  CAN1_SendMotorCmd((id), MODE_SPEED, CTRL_ENABLE, (rpm))
+
+/* ★ 停车帧按驱动模式选模式号, 但**控制字和值永远一样**(刹车 + 0)。
+ *   这样做的好处是: 全固件所有停车路径(上电、看门狗、驱动器没就绪、上电自检收尾、
+ *   目标为 0)都自动跟着模式走, 一处都不用改 —— 而且扭矩模式下**模式号恒定不变**,
+ *   不会半个字出现"跑着跑着切模式"(协议要求"模式切换需在电机停止空闲状态下生效",
+ *   见 docs/foc-can-protocol.md §2.3)。 */
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+#define CAN1_SendStop(id)        CAN1_SendMotorCmd((id), MODE_TORQUE, CTRL_BRAKE, 0)
+#define CAN1_SendTorque(id, i)   CAN1_SendMotorCmd((id), MODE_TORQUE, CTRL_ENABLE, (i))
+#else
 #define CAN1_SendStop(id)        CAN1_SendMotorCmd((id), MODE_SPEED, STOP_CTRL,   0)
+#endif
 
 static void CAN1_Poll(void)
 {
@@ -1291,6 +1365,10 @@ static void Wheel_Update(void)
     body_wz = (v_right - v_left) / TRACK_WIDTH_M;
 }
 
+/* ★★ 从这里到 Trim_Apply 结束, 整段是**速度模式专用**(给驱动器内部速度环打补丁)。
+   力矩模式下这段不编译 —— 见上面 statics 处的说明。 */
+#if DRIVE_MODE_SEL == DRIVE_MODE_SPEED
+
 /*========================= 起步助推判决 ============================
  * 两轮**共享**的一次判决, 返回这一周期要叠加的助推量 RPM。
  * 为什么必须共享、不能每轮各判, 见上面 KICK_* 说明里那一段。
@@ -1575,6 +1653,8 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
     return out;
 }
 
+#endif  /* DRIVE_MODE_SEL == DRIVE_MODE_SPEED  (助推 + 轮速外环修正) */
+
 /*===================== 驱动器就绪判断 ==============================
  * 差速车只有一个轮子出力就等于原地打转, 所以**没确认两个驱动器都活着之前,
  * 只发刹车、绝不发速度** —— 直行命令变成左转就是这么来的(见 drv_seen_mask)。
@@ -1740,6 +1820,259 @@ static void SelfTest_Tick(void)
 #endif
 }
 
+/*========================= 力矩模式: 我们自己的速度环 ==================
+ * 只在 DRIVE_MODE_SEL == DRIVE_MODE_TORQUE 时编译。
+ *
+ * 输入: 目标轮速(RPM) + 实际轮速(RPM), 输出: 扭矩电流指令(A x10)。
+ * 也就是把驱动器内部那个(有极限环的)速度环整个换掉。
+ *
+ *★★ 参数全是**起始猜测**, 必须在台架上标定 ★★
+ *   我没有这台电机+这台车的转矩常数、静摩擦、转动惯量, 所以下面每个数都是
+ *   "量级上说得通"的估计, **不是实测值**。第一次上车必须架空、从很小的数开始
+ *   往上试, 并把最终值记回 docs/nav2-reference.md。
+ *   已知的锚点只有一个: 满量程 ±10.0A(写 ±100), 以及速度模式测出的"起步门槛
+ *   约 15 RPM"(那是驱动器电压域的量, 换算不成电流, 只能当个提醒: 静摩擦不小)。
+ *
+ * 控制律:  误差 = 目标 - 实际
+ *          P  = TQ_KP * 误差
+ *          I  += TQ_KI * 误差 * dt        (带抗饱和)
+ *          静摩擦补偿: 轮子还没转起来时, 输出至少给到 TQ_STICTION_A10
+ *          硬限流 ±TQ_MAX_A10
+ *          变化率限幅 TQ_SLEW_A10_PER_S (扭矩不能阶跃)
+ *
+ * 为什么必须单独做"静摩擦补偿": 速度模式下静摩擦是**驱动器**帮忙顶过去的
+ * (它的环会一直加电压直到轮子动)。扭矩模式下没有这个东西了 —— 纯 PI 要等
+ * 积分自己爬到起步力矩, 起步会很慢, 而且在极低速会"给一下就停、停一下再给"
+ * 地抖。所以显式给一个起步力矩下限。
+ *===================================================================*/
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+
+#define TQ_KP               1.2f    /* A x10 / RPM   —— 10 RPM 误差 -> 1.2A */
+#define TQ_KI               0.6f    /* A x10 / (RPM·s) */
+#define TQ_DEADBAND_RPM     2.0f    /* 误差小于这个就不管(免得在原地抖) */
+#define TQ_MAX_A10          30.0f   /* ★ 硬限流 = 3.0A (满量程 10.0A 的 30%)。
+                                       先保守; 爬坡/起步不够再往上放, 但绝不超过
+                                       驱动器的 100(=10A)。 */
+#define TQ_STICTION_A10     8.0f    /* 起步力矩下限的**起始值** = 0.8A。
+                                       ★ 它会自己往上爬, 见 TQ_FLOOR_* */
+#define TQ_STALL_RPM        1.5f    /* 认为"轮子没转"的阈值 */
+#define TQ_SLEW_A10_PER_S   120.0f  /* 指令变化率限幅 -> 0.8A 大约 7ms 加到位 */
+#define TQ_STALL_TGT_RPM    3.0f    /* 目标大于这个才做堵转判断 */
+#define TQ_STALL_MS         2000    /* **下限爬满之后**还不转, 再顶这么久就收手 */
+#define TQ_RUNAWAY_MARGIN_RPM  25.0f/* 实际超过目标这么多 = 可疑 */
+#define TQ_RUNAWAY_MS       800     /* 可疑状态持续这么久 = 失控, 锁存 */
+#define TQ_ABS_MAX_RPM      60.0f   /* 绝对上限, 超了立刻锁存(不看目标) */
+
+/* 起步力矩下限的爬升 —— ★ 这是从"助推"那里学来的教训, 别重复踩:
+ * 我们**不知道**这台车起步需要多少扭矩(静摩擦、载重、坡道都影响它)。如果下限
+ * 固定成一个小值, 那么"扭矩不够 -> 轮子不动 -> 堵转保护锁存"会被误读成
+ * "力矩模式不工作"; 如果固定成一个大值, 起步又会窜。
+ * 做法: 从 TQ_STICTION_A10 起, 只要"有目标、却没转起来"就每 TQ_FLOOR_STEP_MS
+ * 往上加 TQ_FLOOR_STEP_A10, 一直爬到 TQ_MAX_A10 为止; 一旦转起来就立刻收回起始值。
+ * 这样它**自己找到**起步需要的力矩, 而且爬升过程能从驱动器回码的电流栏直接看到。
+ * ★ 两轮**共享**一个下限(不是每轮各一份): 和助推同样的理由 —— 各自爬升会让两轮
+ *   指令差出十几, 起步时车会歪一下。 */
+#define TQ_FLOOR_STEP_A10   4.0f    /* 每 TQ_FLOOR_STEP_MS 往上加 0.4A */
+#define TQ_FLOOR_STEP_MS    250
+
+typedef struct
+{
+    float i10;      /* 上一次输出, 用于变化率限幅 */
+    float integ;    /* 积分项 (A x10) */
+} wheel_torque_t;
+
+static wheel_torque_t tq_w[2];      /* [0]=左 [1]=右, 和 trim_w 同序 */
+static float    tq_floor;           /* 当前起步力矩下限 (A x10), 两轮共享 */
+static uint16_t tq_floor_ms;        /* 距上次抬下限多久 */
+static uint16_t tq_guard_ms;        /* 超速可疑已持续多久 */
+static uint16_t tq_stall_ms;        /* 下限爬满之后仍不转已持续多久 */
+static uint8_t  torque_fault;       /* 锁存: 1 = 触发过保护, 只刹车 */
+static uint16_t torque_stop_ms;     /* 目标为 0 已持续多久(用于解除锁存) */
+#define TQ_REARM_STOP_MS    500     /* 停稳这么久才允许重新起步(解除锁存) */
+
+/* 起步力矩下限的爬升(两轮共享一次判决)。必须在 Torque_Apply 之前调。 */
+static void Torque_Floor_Update(float tgt_l, float act_l, uint8_t fresh_l,
+                                float tgt_r, float act_r, uint8_t fresh_r, float dt)
+{
+    uint8_t need;
+    float   amax;
+
+    if (!fresh_l || !fresh_r) return;   /* 数据不可信就不动下限 */
+
+    need = (uint8_t)((fabsf(tgt_l) > TQ_STALL_TGT_RPM) ||
+                     (fabsf(tgt_r) > TQ_STALL_TGT_RPM));
+
+    amax = fabsf(act_l);
+    if (fabsf(act_r) > amax) amax = fabsf(act_r);
+
+    if (need && (amax < TQ_STALL_RPM))
+    {
+        tq_floor_ms += (uint16_t)(dt * 1000.0f);
+        while (tq_floor_ms >= TQ_FLOOR_STEP_MS)
+        {
+            tq_floor_ms -= TQ_FLOOR_STEP_MS;
+            tq_floor += TQ_FLOOR_STEP_A10;
+            if (tq_floor > TQ_MAX_A10) tq_floor = TQ_MAX_A10;
+        }
+    }
+    else
+    {
+        /* 转起来了(或没有目标): 立刻收回起始值, 下次起步从头爬 */
+        tq_floor_ms = 0;
+        tq_floor    = TQ_STICTION_A10;
+    }
+}
+
+/* 每轮一份的扭矩 PI + 静摩擦补偿。tgt == 0 时返回 0(调用方会发刹车帧)。 */
+static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
+{
+    float err;
+    float out;
+    float adir;
+
+    if (tgt == 0.0f)
+    {
+        w->integ = 0.0f;
+        w->i10   = 0.0f;
+        return 0.0f;
+    }
+
+    err = tgt - act;
+    if ((err > -TQ_DEADBAND_RPM) && (err < TQ_DEADBAND_RPM)) err = 0.0f;
+
+    if (err != 0.0f)
+    {
+        w->integ += TQ_KI * err * dt;
+        /* 抗饱和: 积分自己不许超过硬限流 */
+        if (w->integ >  TQ_MAX_A10) w->integ =  TQ_MAX_A10;
+        if (w->integ < -TQ_MAX_A10) w->integ = -TQ_MAX_A10;
+    }
+
+    out = TQ_KP * err + w->integ;
+
+    /* 静摩擦补偿: 只在"还没转起来"时兜底, 用的是**会往上爬的**下限 tq_floor。
+       转起来之后交给 PI —— 否则轮子一动就撤、一停又给, 会在极低速来回磕。 */
+    if ((act > -TQ_STALL_RPM) && (act < TQ_STALL_RPM) && (err != 0.0f))
+    {
+        adir = (err > 0.0f) ? 1.0f : -1.0f;
+        if ((out * adir) < tq_floor) out = adir * tq_floor;
+    }
+
+    out = ClampF(out, -TQ_MAX_A10, TQ_MAX_A10);
+
+    /* 变化率限幅: 扭矩指令不能阶跃(机械冲击 + 电流冲击) */
+    {
+        float step = TQ_SLEW_A10_PER_S * dt;
+        if (out > w->i10 + step) out = w->i10 + step;
+        if (out < w->i10 - step) out = w->i10 - step;
+    }
+
+    w->i10 = out;
+    return out;
+}
+
+/* 三道保护。**两轮一起判、一起停** —— 和助推同样的理由: 单轮自己收手会让
+ * 差速车原地打转, 而"打转"比"停下"危险得多。
+ *
+ *   (1) 绝对超速    |实际| > TQ_ABS_MAX_RPM            -> 立刻锁存
+ *   (2) 超目标速度  |实际| > |目标| + 余量, 持续 TQ_RUNAWAY_MS -> 锁存
+ *                   ★ 这一条同时覆盖"接线反了" —— 接线反了闭环就变成正反馈,
+ *                     表现为实际转速朝反方向越来越大, 一定会撞上这条。
+ *   (3) 堵转        有目标、|实际| 却一直 ≈ 0, 持续 TQ_STALL_MS -> 锁存
+ *                   ★ 这一条挡的是"驱动器根本不认 mode 4"(那就是白给电流发热)、
+ *                     轮子被卡住、以及 CAN 没通到电机。
+ *
+ * 锁存之后只发刹车帧, 直到**目标为 0 且持续 TQ_REARM_STOP_MS** 才重新允许起步。
+ * 为什么不一直锁死到断电: 机器人不能因为一次保护就得人工重启。为什么不立刻
+ * 自动重试: 立刻重试就成了"抖一下停一下"的循环, 比停着更难看也更危险。
+ */
+static void Torque_Guard(float tgt_l, float act_l, uint8_t fresh_l,
+                         float tgt_r, float act_r, uint8_t fresh_r, float dt)
+{
+    float tmax = fabsf(tgt_l);
+    float amax = fabsf(act_l);
+    uint16_t ms = (uint16_t)(dt * 1000.0f);
+
+    /* ★ 反馈不新鲜就不判决 —— 拿陈旧数据判"失控"是错的(会把正常减速误判成失控)。
+       正常情况下轮不到这里: Drive_Ready() 已经在更外层拦住这种局面并刹车了
+       (RPM_STALE_MS), 这里只是**每轮各自**再兜一道 —— 因为 Drive_Ready 是"两轮
+       一起新鲜"的与逻辑, 而 Torque_Guard 的判据本质上是"这一轮的数据可信吗"。 */
+    if (!fresh_l || !fresh_r)
+    {
+        tq_guard_ms = 0;
+        tq_stall_ms = 0;
+        return;
+    }
+
+    if (fabsf(tgt_r) > tmax) tmax = fabsf(tgt_r);
+    if (fabsf(act_r) > amax) amax = fabsf(act_r);
+
+    /* 目标为 0: 复位计时并逐步解除锁存(车已经停了, 允许下一次起步) */
+    if (tmax <= 0.0f)
+    {
+        tq_guard_ms = 0;
+        tq_stall_ms = 0;
+        if (torque_stop_ms < TQ_REARM_STOP_MS) torque_stop_ms += ms;
+        if (torque_stop_ms >= TQ_REARM_STOP_MS) torque_fault = 0;
+        return;
+    }
+    torque_stop_ms = 0;
+
+    if (torque_fault) return;       /* 已锁存, 不重复判 */
+
+    if (amax > TQ_ABS_MAX_RPM)      /* (1) */
+    {
+        torque_fault = 1;
+        return;
+    }
+
+    if (amax > (tmax + TQ_RUNAWAY_MARGIN_RPM))  /* (2) */
+    {
+        tq_guard_ms += ms;
+        if (tq_guard_ms >= TQ_RUNAWAY_MS) { torque_fault = 1; return; }
+    }
+    else tq_guard_ms = 0;
+
+    /* (3) 堵转: 有目标、轮子却一直不转, **而且下限已经爬满了**(说明该给的都给了)
+            —— 这才是真堵住/驱动器不认 mode 4/轮子被卡住。
+           ★ 判据里带 tq_floor >= TQ_MAX_A10 是关键: 只看"两秒没转"会把
+             "起步电流不够"误判成堵转, 而那是调参问题不是故障 —— 见 TQ_FLOOR_*。 */
+    if ((tmax > TQ_STALL_TGT_RPM) && (amax < TQ_STALL_RPM) && (tq_floor >= TQ_MAX_A10))
+    {
+        tq_stall_ms += ms;
+        if (tq_stall_ms >= TQ_STALL_MS) torque_fault = 1;
+    }
+    else tq_stall_ms = 0;
+}
+
+/* 把扭矩环状态清干净(锁存/未就绪/停车时调) */
+static void Torque_Reset(void)
+{
+    tq_w[TRIM_IDX_LEFT].i10    = 0.0f;
+    tq_w[TRIM_IDX_LEFT].integ  = 0.0f;
+    tq_w[TRIM_IDX_RIGHT].i10   = 0.0f;
+    tq_w[TRIM_IDX_RIGHT].integ = 0.0f;
+    tq_floor    = TQ_STICTION_A10;      /* 下限回到起始值, 下次起步重新爬 */
+    tq_floor_ms = 0;
+}
+
+#endif  /* DRIVE_MODE_SEL == DRIVE_MODE_TORQUE */
+
+/* 诊断帧 bit6 的判据, 两种模式各有一个对应物:
+ *   速度模式 = "正在给起步助推"(叠加了 boost_amt RPM)
+ *   力矩模式 = "扭矩环正在出力"(|扭矩指令| > 0.5 -> 0.05A)
+ * ★ 台架上这一位很好用: 命令了却一直不亮 = 环没在给(或者保护锁存了);
+ *   亮了却不动 = 在给但推不动(电流不够/被卡住)。 */
+static uint8_t Drive_ActiveFlag(void)
+{
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+    return (uint8_t)((fabsf(tq_w[TRIM_IDX_LEFT].i10)  > 0.5f) ||
+                     (fabsf(tq_w[TRIM_IDX_RIGHT].i10) > 0.5f));
+#else
+    return (uint8_t)(boost_on && (boost_amt > 0.5f) && (boost_cool_ms == 0));
+#endif
+}
+
 /*========================= 差速逆解 ================================
  * 车体 (vx, wz) -> 左右轮目标转速。差速车用不到 vy。
  *   v_left  = vx - wz * b/2
@@ -1757,11 +2090,16 @@ static void Drive_Apply(void)
     float v_right = target_vx + target_wz * (TRACK_WIDTH_M * 0.5f);
     float rpm_l = v_left / WHEEL_CIRC_M * 60.0f;
     float rpm_r = v_right / WHEEL_CIRC_M * 60.0f;
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+    float   tq_l, tq_r;                 /* 左右轮的扭矩指令 (A x10) */
+    int16_t i1, i2;                     /* 转成电机域之后的扭矩指令 */
+#else
     float cmd_l;
     float cmd_r;
     float boost;
     int16_t m1;
     int16_t m2;
+#endif
 
     if ((dt <= 0.0f) || (dt > 0.2f)) dt = (float)CAN_PERIOD_MS * 0.001f;
     last_trim_ms = g_tick_ms;      /* 就算下面提前 return 也要更新, 免得恢复时 dt 爆掉 */
@@ -1771,6 +2109,9 @@ static void Drive_Apply(void)
        顺便把外环状态清零, 免得带着上一次攒的修正冲出去。 */
     if (!Drive_Ready())
     {
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+        Torque_Reset();     /* 力矩模式: 把我们的积分/输出清零(见 Torque_Reset) */
+#else
         trim_w[TRIM_IDX_LEFT].trim  = 0.0f;
         trim_w[TRIM_IDX_RIGHT].trim = 0.0f;
         boost_on      = 0;  /* 停过之后助推状态也清干净 */
@@ -1778,6 +2119,7 @@ static void Drive_Apply(void)
         boost_ms      = 0;
         boost_step_ms = 0;
         boost_cool_ms = 0;
+#endif
         boost_stuck   = 0;
         target_left_rpm  = 0;
         target_right_rpm = 0;
@@ -1788,6 +2130,59 @@ static void Drive_Apply(void)
 
     rpm_l = ClampF(rpm_l, -(float)MAX_RPM, (float)MAX_RPM);
     rpm_r = ClampF(rpm_r, -(float)MAX_RPM, (float)MAX_RPM);
+
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+    /*=================== 力矩模式: 我们自己的速度环 ===================
+     * 和速度模式最大的区别在**这一层没有第二个人**了: 速度模式下我们发的 RPM
+     * 是"请求", 驱动器内部那个环负责去实现; 这里我们直接给电流, 驱动器只当
+     * 一个电流源 —— 所以"实现转速"这件事整个落在下面这几行上。
+     * 相应地 Trim/Boost **全部不用**: 它们的存在意义是修补驱动器那个环,
+     * 现在那个环不在了, 留着就是两个积分环串联, 必然打架。
+     *================================================================*/
+    Torque_Floor_Update(rpm_l, (float)wheel_left_rpm,  wheel_left_fresh,
+                        rpm_r, (float)wheel_right_rpm, wheel_right_fresh, dt);
+    Torque_Guard(rpm_l, (float)wheel_left_rpm,  wheel_left_fresh,
+                 rpm_r, (float)wheel_right_rpm, wheel_right_fresh, dt);
+
+    /* 保护锁存 或 目标为 0: 一律刹车, 并把自己的状态清干净。
+       ★ 用 CAN1_SendStop 而不是"发 0 扭矩" —— 0 扭矩 = 自由滑行, 那不是停车。 */
+    if (torque_fault || ((rpm_l == 0.0f) && (rpm_r == 0.0f)))
+    {
+        Torque_Reset();
+        target_left_rpm  = 0;
+        target_right_rpm = 0;
+        CAN1_SendStop(MOTOR1_CAN_ID);
+        CAN1_SendStop(MOTOR2_CAN_ID);
+        return;
+    }
+
+    tq_l = Torque_Apply(&tq_w[TRIM_IDX_LEFT],  rpm_l, (float)wheel_left_rpm,  dt);
+    tq_r = Torque_Apply(&tq_w[TRIM_IDX_RIGHT], rpm_r, (float)wheel_right_rpm, dt);
+
+    /* 物理轮速域 -> 电机域: 和速度模式用**同一套**接线校准, 这样两个模式
+       对"哪个电机是左边""哪个要取反"的理解不可能分叉。 */
+    if (MOTOR1_IS_LEFT) { i1 = (int16_t)tq_l; i2 = (int16_t)tq_r; }
+    else                { i1 = (int16_t)tq_r; i2 = (int16_t)tq_l; }
+    if (MOTOR1_INVERT) i1 = (int16_t)(-i1);
+    if (MOTOR2_INVERT) i2 = (int16_t)(-i2);
+
+    /* 上报的"目标轮速"是**名义目标**(不含我们的修正) —— 力矩模式下没有
+       "目标 RPM 的修正量"这个概念了, 主机拿它和自己下发的比就是 0。 */
+    target_left_rpm  = (int16_t)rpm_l;
+    target_right_rpm = (int16_t)rpm_r;
+
+    /* 每轮各自决定: 有目标 -> 给扭矩(使能); 目标为 0 -> 给刹车。
+       ★ 目标为 0 的轮子发**刹车**而不是"0 扭矩": 原地转时内轮会自由滑行被拖着走,
+         发刹车(动态制动)更像速度模式下"内轮被驱动器按在 0"的手感。
+         刹车是被动的, 不注入能量, 所以这一步是安全的。 */
+    if (rpm_l != 0.0f) CAN1_SendTorque(MOTOR1_IS_LEFT ? MOTOR1_CAN_ID : MOTOR2_CAN_ID,
+                                       MOTOR1_IS_LEFT ? i1 : i2);
+    else               CAN1_SendStop(MOTOR1_IS_LEFT ? MOTOR1_CAN_ID : MOTOR2_CAN_ID);
+    if (rpm_r != 0.0f) CAN1_SendTorque(MOTOR1_IS_LEFT ? MOTOR2_CAN_ID : MOTOR1_CAN_ID,
+                                       MOTOR1_IS_LEFT ? i2 : i1);
+    else               CAN1_SendStop(MOTOR1_IS_LEFT ? MOTOR2_CAN_ID : MOTOR1_CAN_ID);
+
+#else   /* ================= 速度模式(现状) ================= */
 
     /* 起步助推: **一次判决, 两轮共用**(见 KICK_* 最后一段)。必须放在两次
        Trim_Apply 之前, 而且只调一次 —— 每轮各判一次会让两轮指令差 12 RPM。 */
@@ -1831,6 +2226,7 @@ static void Drive_Apply(void)
         CAN1_SendStop(MOTOR1_CAN_ID);
         CAN1_SendStop(MOTOR2_CAN_ID);
     }
+#endif
 }
 
 /*======================= IMU (YbImu) ==============================
@@ -2024,8 +2420,7 @@ static void Send_DiagFrame(uart_port_t *p)
     if (imu_gyro_ok)      flags |= 0x08;    /* 陀螺仪自开机以来读到过非零 */
     if (reset_by_iwdg)    flags |= 0x10;    /* 上次复位是看门狗引起的(主循环卡死过) */
     if (!Drive_Ready())   flags |= 0x20;    /* 有驱动器没回码/掉线: 此时只发刹车 */
-    if (boost_on && (boost_amt > 0.5f) && (boost_cool_ms == 0))
-        flags |= 0x40;                       /* 正在给起步助推(叠加了 boost_amt RPM) */
+    if (Drive_ActiveFlag()) flags |= 0x40;   /* 速度模式=正在助推 / 力矩模式=正在给扭矩 */
     if (boost_stuck)      flags |= 0x80;    /* 加到上限还不转, 已进入"给一会歇一会" */
 
     f[0] = DIAG_HEAD;
@@ -2046,7 +2441,15 @@ static void Send_DiagFrame(uart_port_t *p)
     f[23] = ports[PORT_MAIN].bad_count;
     f[24] = ports[PORT_MAIN].ok_count;
     f[25] = ports[PORT_MAIN].overflow;
-    f[26] = relay_state;                 /* bit0 滚刷 bit1 水泵 */
+    /* bit0 滚刷 bit1 水泵
+       ★ bit2 = 本固件是**力矩模式**(编译期常量, 上车前一眼确认)
+         bit3 = **扭矩保护已锁存**(超速/堵转, 见 Torque_Guard) -> 那时候只刹车
+       速度模式下 bit2/3 恒为 0, 所以这两位对现有上位机/脚本是透明的。 */
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+    f[26] = (uint8_t)(relay_state | 0x04 | (torque_fault ? 0x08 : 0x00));
+#else
+    f[26] = relay_state;
+#endif
     f[27] = imu_status;                  /* YBIMU_ST_* */
     f[28] = imu_found_addr;              /* 0 = 没扫到 */
     f[29] = seq++;                       /* 帧序号, 上位机据此发现丢帧 */
