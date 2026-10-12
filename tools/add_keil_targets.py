@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""给 Keil 工程加第二个 target: sweeper / scrubber 各一个。
+r"""给 Keil 工程加第二个 target: sweeper / scrubber 各一个。
 
 为什么要这么做: 靠改源码里的 VEHICLE_SEL 再编译, 两个车型产出的 hex **文件名
 完全一样**(都是 stm32-chassis.hex), 编完就分不清哪个是哪个 —— 而几何选错是
