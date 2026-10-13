@@ -453,6 +453,49 @@
  * 协议已占用: 0x04 灯带 / 0x01 回充开关 / 0x00 安全防护, 0x05 是空的。 */
 #define FUNC_RELAY         0x05     /* f[2] = 掩码: bit0 滚刷继电器 bit1 水泵继电器 */
 
+/* ★★★ 2026-10-13 新增: 驱动器复位 (f[1]=0x06)
+ *
+ * 起因 —— 实测抓到的驱动器锁存状态(地面上, 右轮):
+ *     目标 +54 RPM | 实际 0 | 电流 -0.3 ~ +4.6A | 故障码"正常" | 模式"速度"
+ *   同一时刻左轮在吃 17.5A、电池 40.7V 纹丝不动、can_err=0(说明两个驱动器都在 ACK,
+ *   命令确实到了)。**断电重启后立刻恢复正常**(3 遍全部两轮工作)。
+ *   => 驱动器会进入一种"能收能答、报正常、但几乎不输出电流"的锁存状态。
+ *
+ * 协议里本来就有 `CTRL_RESET_FAULT (0x0F)`, 但固件**一次都没调用过**。
+ * 有了这条命令, 遇到那个状态就不用整车断电了。
+ *
+ * 用法: f[2] = 掩码, bit0 复位 1号, bit1 复位 2号 (0 = 两个都复位)
+ * ★★ 硬安全约束: **只在目标为 0(车已停)时才接受**。协议明确写"模式切换需在电机
+ *    停止空闲状态下生效"; 跑着的时候给驱动器发复位 = 输出瞬间消失, 车会失控。
+ *    拒绝的次数会记在诊断帧里, 让主机知道"我发了但被拒了"。 */
+#define FUNC_DRV_RESET     0x06
+
+/* 诊断帧 f[26] 的高 4 位 —— 低 4 位已被 relay/torque 占用, 高 4 位一直空着,
+ * 所以"驱动器不给力"这个新状态**不用改帧长**。 */
+#define DRVDEAD_L_NOW      0x10     /* 此刻 1号(左) 有目标却不给电流 */
+#define DRVDEAD_R_NOW      0x20     /* 此刻 2号(右) 同上 */
+#define DRVDEAD_L_LATCH    0x40     /* 1号 出现过(目标归零才清) */
+#define DRVDEAD_R_LATCH    0x80
+#define DRVDEAD_NOW_MASK   0x30
+#define DRVDEAD_LATCH_MASK 0xC0
+
+/* ★ "驱动器不给力"的判据阈值(2026-10-13) —— 三个数都是被实测数据夹出来的:
+ *
+ *   判据: |目标| >= 15 RPM  且  |实际| < 3 RPM  且  |电流| < 5.0A,  持续 800ms
+ *
+ *   ★ 关键是**电流小**这一条 —— 它把这个新状态和已有的"堵转"分开:
+ *       堵转    = 有目标 + 不动 + **电流大**(12~17A) -> 驱动器在使劲但顶不动
+ *       不给力  = 有目标 + 不动 + **电流小**(0~4.6A) -> 驱动器根本没在执行
+ *     两组实测数据差得足够远(4.6 vs 12), 5.0A 这条线两边都留了余量。
+ *
+ *   ★ 也不会误伤起步: 实测起步时电流 0.2s 就 2.4A、0.5s 就 6.0A
+ *     -> 800ms 窗口内必然越过 5.0A, 所以正常起步不会被判成"不给力"。
+ *     (这也是为什么窗口取 800 而不是 400: 起步瞬态大约 0.5~0.6 秒。) */
+#define DRV_DEAD_TGT_RPM   15.0f    /* 目标大于它才算"应该动" */
+#define DRV_DEAD_ACT_RPM   3.0f     /* 实际小于它才算"没动" */
+#define DRV_DEAD_CUR_A10   50       /* 电流(0.1A 单位)小于它才算"没使劲" = 5.0A */
+#define DRV_DEAD_MS        800      /* 持续这么久才置位 */
+
 /*-------------------------- 周期 --------------------------------*/
 #define CAN_PERIOD_MS      20       /* 向电机重复发送的周期 */
 #define ODOM_PERIOD_MS     20       /* 轮速采样/(可选)卡尔曼周期 (50Hz) */
@@ -872,6 +915,15 @@ static uint16_t boost_cool_ms;      /* 防卡死"歇一会儿"的剩余时间, �
    "有没有卡住过"都是有意义的信息(力矩模式下由 Torque_Guard 的堵转保护对应)。 */
 static uint8_t  boost_stuck;        /* 加到上限还不转 -> 锁存。目标归零才清 */
 
+/* ★★★ 驱动器"不给力"检测的状态 (2026-10-13 新增, 见 DRV_DEAD_* 的说明)
+ * 也放在 #if 外面: 诊断帧 f[26] 要读它, 而且两种模式(速度/力矩)下
+ * "驱动器收了命令却不输出"都是有意义的信息。 */
+static uint16_t drv_dead_ms[2];     /* [0]=1号 [1]=2号, 已持续多久 */
+static uint8_t  drv_dead_now;       /* bit0 1号 bit1 2号 此刻不给力 */
+static uint8_t  drv_dead_latch;     /* 同上, 锁存。目标归零才清 */
+static uint8_t  drv_reset_count;    /* 主机要求复位驱动器的次数(实际发出去的) */
+static uint8_t  drv_reset_reject;   /* ★ 因为"车还在动"被拒的次数 —— 上报让主机知道 */
+
 /* IMU (YbImu, 位翻转 I2C on PB10/PB11) */
 static float    imu_accel_g[3];      /* 单位 g */
 static float    imu_gyro[3];         /* 单位 rad/s */
@@ -1072,6 +1124,15 @@ static void CAN1_SendMotorCmd(uint32_t id, uint8_t mode, uint8_t ctrl, int16_t v
 #define CAN1_SendTorque(id, i)   CAN1_SendMotorCmd((id), MODE_TORQUE, CTRL_ENABLE, (i))
 #else
 #define CAN1_SendStop(id)        CAN1_SendMotorCmd((id), MODE_SPEED, STOP_CTRL,   0)
+#endif
+
+/* ★ 驱动器复位帧 (f[1]=FUNC_DRV_RESET 触发, 见 FUNC_DRV_RESET 的说明)。
+ * 模式号跟着当前驱动模式走(和停车帧同一个道理), 控制字用协议里的 0x0F=复位。
+ * ★ 只在"目标为 0"时才允许发出 —— 由 Cmd_Apply 把关, 不在这里。 */
+#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
+#define CAN1_SendDrvReset(id)    CAN1_SendMotorCmd((id), MODE_TORQUE, CTRL_RESET_FAULT, 0)
+#else
+#define CAN1_SendDrvReset(id)    CAN1_SendMotorCmd((id), MODE_SPEED,  CTRL_RESET_FAULT, 0)
 #endif
 
 static void CAN1_Poll(void)
@@ -1384,6 +1445,28 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
         return;
     }
 
+    /* ---- ★ 驱动器复位: f[1]=FUNC_DRV_RESET (见 FUNC_DRV_RESET 的说明) ----
+     * ★★ 硬安全约束: 只在**目标为 0(车已停)** 时接受。
+     *    跑着的时候给驱动器发复位 = 输出瞬间消失 -> 车会失控。
+     *    上层先发一条零速帧, 下一个周期再发这条复位帧即可。 */
+    if (f[1] == FUNC_DRV_RESET)
+    {
+        if ((target_vx == 0.0f) && (target_wz == 0.0f))
+        {
+            uint8_t mask = f[2];
+            if (mask == 0) mask = 0x03;         /* 0 = 两个都复位 */
+            if (mask & 0x01) CAN1_SendDrvReset(MOTOR1_CAN_ID);
+            if (mask & 0x02) CAN1_SendDrvReset(MOTOR2_CAN_ID);
+            if (drv_reset_count != 0xFF) drv_reset_count++;
+        }
+        else
+        {
+            if (drv_reset_reject != 0xFF) drv_reset_reject++;   /* 车在动, 拒绝 */
+        }
+        if (ports[port_id].ok_count != 0xFF) ports[port_id].ok_count++;
+        return;
+    }
+
     /* ---- 协议里的其它功能帧: 本工程没实现, 必须忽略 ----
      * 这些帧和速度帧同为 11 字节、同头同尾, 靠 f[1]/f[2] 区分
      * (docs/chassis-serial-protocol.md 第 6 节):
@@ -1532,6 +1615,74 @@ static void Wheel_Update(void)
     v_right = (float)wheel_right_rpm * WHEEL_CIRC_M / 60.0f;
     body_vx = (v_left + v_right) * 0.5f;
     body_wz = (v_right - v_left) / TRACK_WIDTH_M;
+}
+
+/*=================== 驱动器"不给力"检测 (2026-10-13 新增) ===================
+ * 判据见 DRV_DEAD_* 的说明。这里只说**为什么必须由底盘来判**:
+ *
+ *   主机只看得到"某个轮子不动"。但"不动"有两种完全不同的原因:
+ *       堵转    : 驱动器在使劲但顶不动   -> 电流大(实测 12~17A) -> 应该少给力、别烤电机
+ *       不给力  : 驱动器根本没在执行      -> 电流小(实测 0~4.6A) -> 应该复位/报错
+ *   这两种的**处置方向相反**, 而主机从"不动"这一个现象里分不出来。
+ *   底盘能看到电流, 所以这个判断必须在这里做。
+ *
+ * ★ 实测的那个"不给力"案例(地面右轮):
+ *      目标 +54 | 实际 0 | 电流 -0.3~+4.6A | 故障码 正常 | 模式 速度 | 电池 40.7V 不动
+ *      同时刻左轮吃 17.5A(说明总线/电源/能力都没问题), can_err=0(两个驱动器都在 ACK)
+ *      **断电重启后 3 遍全部恢复正常**
+ *   => 是驱动器进入了"能收能答、报正常、但不输出"的锁存状态, 不是硬件坏。
+ *=================================================================*/
+static void DrvDead_Update(float dt)
+{
+    uint8_t now = 0;
+    uint8_t i;
+    uint16_t dms = (uint16_t)(dt * 1000.0f + 0.5f);
+
+    if (dms == 0) dms = 1;
+
+    /* 目标归零 = 车停下来 -> 锁存标志清掉(和 boost_stuck 同一个规矩:
+       停过之后不带着历史, 免得"歇一下再走"被上一轮的标志误伤)。 */
+    if ((target_left_rpm == 0) && (target_right_rpm == 0))
+    {
+        drv_dead_latch = 0;
+        drv_dead_now   = 0;
+        drv_dead_ms[TRIM_IDX_LEFT]  = 0;
+        drv_dead_ms[TRIM_IDX_RIGHT] = 0;
+        return;
+    }
+
+    for (i = 0; i < 2; i++)
+    {
+        float tgt = (i == TRIM_IDX_LEFT) ? (float)target_left_rpm : (float)target_right_rpm;
+        float act = (i == TRIM_IDX_LEFT) ? (float)wheel_left_rpm  : (float)wheel_right_rpm;
+        int16_t cur;
+        int16_t ac;
+
+        /* 电流是**电机域**的(1号/2号), 而目标/实际是**物理域**的(左/右),
+           按接线校准把电流映射过来。取绝对值所以不用管 INVERT。 */
+        if (i == TRIM_IDX_LEFT) cur = MOTOR1_IS_LEFT ? m1_cur : m2_cur;
+        else                    cur = MOTOR1_IS_LEFT ? m2_cur : m1_cur;
+        ac = (cur < 0) ? (int16_t)(-cur) : cur;
+
+        if ((fabsf(tgt) >= DRV_DEAD_TGT_RPM) &&
+            (fabsf(act) <  DRV_DEAD_ACT_RPM) &&
+            (ac < DRV_DEAD_CUR_A10))
+        {
+            if (drv_dead_ms[i] < 60000u) drv_dead_ms[i] = (uint16_t)(drv_dead_ms[i] + dms);
+        }
+        else
+        {
+            drv_dead_ms[i] = 0;
+        }
+
+        if (drv_dead_ms[i] >= (uint16_t)DRV_DEAD_MS)
+        {
+            now |= (uint8_t)(1u << i);
+            drv_dead_latch |= (uint8_t)(1u << i);
+        }
+    }
+
+    drv_dead_now = now;
 }
 
 /* ★★ 从这里到 Trim_Apply 结束, 整段是**速度模式专用**(给驱动器内部速度环打补丁)。
@@ -2929,6 +3080,14 @@ static void Send_DiagFrame(uart_port_t *p)
 #else
     f[26] = relay_state;
 #endif
+    /* ★ bit4~7 = 驱动器"不给力"(有目标 + 不动 + **电流小**), 见 DrvDead_Update。
+       和"堵转"是一对相反的信息: 堵转是电流大。主机要靠这个决定"复位"还是"少给力"。
+       bit4 1号(左)此刻  bit5 2号(右)此刻  bit6/7 对应锁存(目标归零才清)。
+       低位不变, 所以对现有解析脚本透明。 */
+    if (drv_dead_now   & 0x01) f[26] |= DRVDEAD_L_NOW;
+    if (drv_dead_now   & 0x02) f[26] |= DRVDEAD_R_NOW;
+    if (drv_dead_latch & 0x01) f[26] |= DRVDEAD_L_LATCH;
+    if (drv_dead_latch & 0x02) f[26] |= DRVDEAD_R_LATCH;
     f[27] = imu_status;                  /* YBIMU_ST_* */
     f[28] = imu_found_addr;              /* 0 = 没扫到 */
     f[29] = seq++;                       /* 帧序号, 上位机据此发现丢帧 */
@@ -3092,6 +3251,9 @@ int main(void)
         {
             last_can_ms = g_tick_ms;
             Drive_Apply();
+            /* ★ 紧跟在下发之后判"驱动器给不给力" —— 这样读到的是本周期
+               刚决定的 target_left/right_rpm 和最新的回码(见 DrvDead_Update)。 */
+            DrvDead_Update((float)CAN_PERIOD_MS / 1000.0f);
         }
 
         /* 上报: 先标准 24 字节帧, 紧跟一帧扩展诊断帧。

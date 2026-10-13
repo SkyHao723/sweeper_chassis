@@ -244,6 +244,52 @@ def build_relay(mask):
     return bytes(f)
 
 
+FUNC_DRV_RESET = 0x06
+
+
+def build_drv_reset(mask=0x03):
+    """构造 11 字节**驱动器复位**帧 (f[1]=FUNC_DRV_RESET, f[2]=掩码 bit0 1号 bit1 2号)。
+
+    ★ 为什么加它 (2026-10-13, 实测抓到):
+      驱动器会进入一种"能收能答、报'正常'、但几乎不输出电流"的锁存状态 ——
+      实测: 目标 +54 RPM / 实际 0 / 电流 -0.3~+4.6A / 故障码"正常" / 电池 40.7V 纹丝不动,
+      同一时刻另一个轮子吃 17.5A、can_err=0(两个驱动器都在 ACK, 命令确实到了)。
+      **整车断电重启后 3 遍全部恢复正常** -> 是锁存状态, 不是硬件坏。
+      协议里本来就有 CTRL_RESET_FAULT(0x0F), 固件以前**一次都没调用过**。
+
+    ★★ 固件的硬约束: **只在目标为 0(车已停)时才接受** —— 跑着的时候让驱动器输出
+       瞬间消失, 车会失控。所以用法是: 先发零速帧把车按住, 再发这条。见 send_drv_reset()。
+    """
+    f = bytearray(CMD_SIZE)
+    f[0] = CMD_HEAD
+    f[1] = FUNC_DRV_RESET
+    f[2] = mask & 0x03
+    bcc = 0
+    for x in f[:CMD_SIZE - 2]:
+        bcc ^= x
+    f[CMD_SIZE - 2] = bcc
+    f[CMD_SIZE - 1] = CMD_TAIL
+    return bytes(f)
+
+
+def send_drv_reset(port, mask=0x03, hold_ms=500, reps=5):
+    """先零速按住车, 再发驱动器复位帧。
+
+    ★ 顺序不能反: 固件只在 target==0 时接受复位帧, 否则计入"被拒"。
+    ★ 复位的效果不是立刻可见 —— 它只是让驱动器清掉锁存状态, 之后仍要靠
+      正常的速度帧才知道好没好。所以这条命令之后应该**重新跑一次测试**来判断。"""
+    t0 = time.time()
+    while (time.time() - t0) * 1000.0 < hold_ms:      # 1) 先把车按住
+        port.write(build_cmd(0.0, 0.0))
+        time.sleep(0.02)
+    for _ in range(reps):                            # 2) 再发复位
+        port.write(build_drv_reset(mask))
+        time.sleep(0.05)
+    for _ in range(STOP_BURST):                      # 3) 收尾还是零速
+        port.write(build_cmd(0.0, 0.0))
+        time.sleep(0.02)
+
+
 class Sender(threading.Thread):
     """后台线程: 按 SEND_HZ 持续发同一条速度命令。
     必须持续发 —— STM32 有 800ms 看门狗, 停发就自动刹车。"""
@@ -296,10 +342,20 @@ def fault_name(code):
 # 并把这次判为**无效**, 免得又拿脏数据下结论。
 #
 # 两个判据(都要求"持续一段时间", 为的是躲开起步瞬态和噪声):
-#   堵转: |目标| >= 20 RPM 且 |实际| < 5 RPM 且 |电流| >= 2.0A, 持续 >= 400ms
-#         (起步时轮子还没破静摩擦, 也会有零点几秒的这种状态 —— 所以要设时长)
-#   失控: |实际偏航率 - 命令偏航率| >= 0.45 rad/s, 持续 >= 200ms
+#   堵转: |目标| >= 20 RPM 且 |实际| < 5 RPM 且 |电流| >= 6.0A, 持续 >= 800ms
+#   失控: |实际偏航率 - 命令偏航率| >= 0.45 rad/s, 持续 >= 600ms
 #         (直行时命令是 0, 于是它就是"车在自己乱转")
+#
+# ★★★ 阈值 2026-10-13 调过两次, 都是被真实数据打回来的 ★★★
+#   ① 失控时长 200ms -> 600ms: 200ms 把"最好那次"(每米偏航 +1.36, 净偏航只有 2 度)
+#      也判成无效 —— 它有 8 帧起步瞬态越阈; 真正的失控是连续 21 帧。
+#   ② 堵转 电流 2.0A -> 6.0A、时长 400ms -> 800ms:
+#      地面上起步时, 目标已经是 20+, 轮子还在起转(实际 5), 电流刚过 2A ——
+#      **400ms 就把起步瞬态判成"2号轮堵转"并立刻停车**, 地面测试根本没法做。
+#      实测的真实堵转是 1.25s+ / 22~43A, 和起步瞬态(0.4~0.6s / 2A) 差得很远。
+#      => 抬到 6A/800ms 才分得开。
+#   ★ 教训: 判据的阈值必须**同时拿"真故障"和"正常瞬态"两组数据夹出来**,
+#     只按"看起来合理"拍一个数, 不是误报就是漏报。
 #
 # ★ 判出来后还要分"两轮都堵"还是"只有一轮堵":
 #     两轮都堵 -> 整车被挡住了(或者总电源/被抬起来悬空)
@@ -308,8 +364,8 @@ def fault_name(code):
 #============================================================================
 STALL_TGT_RPM = 20.0     # 目标大于它才算"应该转"
 STALL_ACT_RPM = 5.0      # 实际小于它才算"没转"
-STALL_CUR_A   = 2.0      # 电流大于它才算"在使劲"(没使劲的 0 RPM 只是没收到命令)
-STALL_MS      = 400      # 持续这么久才算堵转
+STALL_CUR_A   = 6.0      # 电流大于它才算"在使劲"(没使劲的 0 RPM 只是没收到命令)
+STALL_MS      = 800      # 持续这么久才算堵转
 RUNAWAY_WZ    = 0.45     # rad/s, 偏离命令多少算失控
 # ★ RUNAWAY_MS 从 200ms 提到 600ms —— 是拿真实日志定出来的:
 #   最好那次(每米偏航 +1.36, 净偏航只有 2 度)也有 8 帧(400ms)越过 0.45,
@@ -677,6 +733,21 @@ class Diag(object):
             out.append("★力矩模式固件")
         if self.relay & 0x08:
             out.append("**扭矩保护已锁存(超速/堵转, 只刹车)**")
+        # ★ bit4~7 = 驱动器"不给力"(2026-10-13 新增, 见固件 DrvDead_Update)
+        #   判据是"有目标 + 不动 + **电流小**" —— 和"堵转"(电流大)是一对相反的信息,
+        #   处置方向也相反: 堵转要少给力, 不给力要复位。
+        dn = self.relay & 0x30
+        dl = self.relay & 0xC0
+        if dn:
+            who = []
+            if dn & 0x10: who.append("1号")
+            if dn & 0x20: who.append("2号")
+            out.append("**驱动器不给力:%s**" % "+".join(who))
+        if dl:
+            who = []
+            if dl & 0x40: who.append("1号")
+            if dl & 0x80: who.append("2号")
+            out.append("(不给力出现过:%s)" % "+".join(who))
         return "/".join(out)
 
 
@@ -878,6 +949,11 @@ def main():
                     help="关掉「堵转/偏航失控」自动停车。默认是开的: 一旦认出这两种场面"
                          "(见 classify 的说明)就立刻发零速停车并把这次判为**无效**,"
                          "免得又拿「车顶到墙」那种脏数据下结论。")
+    ap.add_argument("--drv-reset", type=int, metavar="MASK", nargs="?", const=3, default=None,
+                    help="给驱动器发一条复位帧(协议 CTRL_RESET_FAULT 0x0F), 用它代替整车断电。"
+                         "MASK: bit0=1号 bit1=2号, 省略=两个都复位。"
+                         "★ 用途: 实测驱动器会进入'能收能答、报正常、但不输出电流'的锁存状态"
+                         "(目标有、实际 0、电流 <2A), 断电才能恢复。见 build_drv_reset 的说明。")
     ap.add_argument("--classify", metavar="LOG",
                     help="离线判定: 读一个以前保存的日志文件, 给出这次测试有效/无效。"
                          "不需要硬件, 用来复核历史数据。")
@@ -891,6 +967,19 @@ def main():
         return classify_saved_log(args.classify)
 
     stream, dump = open_stream(args)
+
+    # ---- ★ 驱动器复位: 发一条 FUNC_DRV_RESET 帧 (2026-10-13 新增) ----
+    # 用途见 build_drv_reset 的说明: 遇到"驱动器能收能答、报正常、但不输出电流"
+    # 那个锁存状态时, 用这个代替整车断电。
+    if args.drv_reset is not None:
+        if args.file:
+            sys.exit("--drv-reset 需要真实串口, 不能和 -f 一起用")
+        mask = args.drv_reset & 0x03
+        print("# 驱动器复位: 掩码 %d (%s)" % (mask, {0: "两个", 1: "1号", 2: "2号", 3: "两个"}[mask]))
+        print("# 先发 0.5 秒零速把车按住, 再发复位帧 (固件只在目标为 0 时接受)")
+        send_drv_reset(stream, mask)
+        print("# 已发出。★ 效果不是立刻可见 —— 重新跑一次测试才能判断好没好。")
+        sys.exit(0)
 
     # ---- 继电器保持模式: 只发继电器帧, 绝不发速度帧 ----
     # 为什么只发继电器帧就够了、而且是**更好**的:
