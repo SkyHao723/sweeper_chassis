@@ -68,6 +68,10 @@ static void poll_serial(void)
             Serial.println("★★ 收到 x -> 立刻刹车并停止");
             g_stop = true;
         }
+        if (c == '4') {
+            Serial.println("★★ 收到 4 -> 解锁力矩阶梯(0.5A 起), 3 秒后开始");
+            g_arm_torque = true;
+        }
     }
 }
 
@@ -176,10 +180,20 @@ static void brake_for(uint16_t ms)
 }
 
 /*======================= 序列状态机 =======================*/
-enum { PH_COM, PH_SPEED, PH_TORQUE, PH_DONE };
+/* ★ 2026-10-13 改成"地面安全版":
+ *   实测**架空**时 mode4 给 2.0A 就把轮子推到 **489 RPM**(3.8 m/s) —— 因为力矩模式是
+ *   **纯扭矩、没有任何速度限制**, 空载下会一直加速到"扭矩 = 摩擦"的平衡点。
+ *   => 地面上跑 mode4 会冲。所以: ①② 自动跑(② 有速度闭环, 安全);
+ *      ③ 力矩阶梯**必须串口按 '4' 才跑**, 而且从 0.5A 起。
+ *   ★ 地面测试这个门槛是必须的, 别去掉。 */
+enum { PH_COM, PH_SPEED, PH_WAIT, PH_TORQUE, PH_DONE };
+#define TORQUE_STEPS  6
+static const int16_t g_tq_val[TORQUE_STEPS]  = { 5, 10, 20, 40, 80, 120 };  /* 0.5~12.0A */
+static const char   *g_tq_name[TORQUE_STEPS] = { "0.5A", "1.0A", "2.0A", "4.0A", "8.0A", "12.0A" };
+
 static int      g_phase = PH_COM;
 static int      g_step  = 0;
-static uint32_t g_phase_t0 = 0;
+static bool     g_arm_torque = false;   /* 串口 '4' 才置位 */
 static bool     g_abort = false;
 
 void setup()
@@ -205,9 +219,8 @@ void setup()
         Serial.println("★ twai_start 失败");
         while (1) delay(1000);
     }
-    Serial.println("CAN 已启动 (500kbps, 扩展帧)。3 秒后开始…");
-    delay(3000);
-    g_phase_t0 = millis();
+    Serial.println("CAN 已启动 (500kbps, 扩展帧)。3 秒后开始… (按 x 可取消, 按 4 解锁力矩档)");
+    for (int i = 0; i < 30; i++) { poll_serial(); if (g_stop) break; delay(100); }
 }
 
 /* 每个阶段跑一次; 返回后由 loop 推进 */
@@ -235,21 +248,38 @@ static void run_phase(void)
         /* 对照组: 速度模式 38RPM(150mm 轮 = 0.3m/s) —— 实车这个速度能正常走 */
         hold(MODE_SPEED, CTRL_ENABLE, 38, 38, 4, "② 对照组 mode5 速度 38RPM (实车能走的速度)");
         brake_for(1500);
-        g_phase = PH_TORQUE;
+        g_phase = PH_WAIT;
+        break;
+
+    case PH_WAIT:
+        /* ★ 停在这里等人按 '4' —— 力矩模式是纯扭矩、无速度限制, 自动跑会冲。
+           到这一步 ①② 已经跑完, 你可以先判断"速度模式到底能不能驱动"。 */
+        Serial.println();
+        Serial.println("========================================================");
+        Serial.println(" ①② 已跑完。**力矩阶梯(mode4)不会自动跑** —— 它是纯扭矩、");
+        Serial.println(" 没有任何速度限制, 架空实测 2.0A 就冲到 489 RPM。");
+        Serial.println(" 确认车已架空或前方留足空场后, 串口发 '4' 才开始(从 0.5A 起)。");
+        Serial.println(" 不发就保持刹车。串口 'x' 随时停车。");
+        Serial.println("========================================================");
+        /* 等 '4' 或 'x'; 期间持续刹车 */
+        for (;;) {
+            poll_serial();
+            if (g_stop || g_abort) { g_phase = PH_DONE; break; }
+            if (g_arm_torque)     { g_phase = PH_TORQUE; break; }
+            send_both(MODE_SPEED, CTRL_BRAKE, 0, 0);
+            poll_rx();
+            delay(CMD_PERIOD_MS - 1);
+        }
         break;
 
     case PH_TORQUE:
         {
-            /* 值单位 A×10 (协议/上位机/ESP32 桥三处一致) */
-            static const int16_t steps_[] = { 20, 40, 80, 120 };
-            static const char   *names_[] = { "2.0A", "4.0A", "8.0A", "12.0A" };
+            if (g_step >= TORQUE_STEPS) { g_phase = PH_DONE; break; }
 
-            if (g_step >= 4) { g_phase = PH_DONE; break; }
-
-            char tag[80];
-            snprintf(tag, sizeof(tag), "③ 力矩 mode4 阶梯 %s (第 %d/4 档)",
-                     names_[g_step], g_step + 1);
-            hold(MODE_TORQUE, CTRL_ENABLE, steps_[g_step], steps_[g_step], 3, tag);
+            char tag[96];
+            snprintf(tag, sizeof(tag), "③ 力矩 mode4 阶梯 %s (第 %d/%d 档)",
+                     g_tq_name[g_step], g_step + 1, TORQUE_STEPS);
+            hold(MODE_TORQUE, CTRL_ENABLE, g_tq_val[g_step], g_tq_val[g_step], 3, tag);
             brake_for(2000);
             g_step++;
         }
