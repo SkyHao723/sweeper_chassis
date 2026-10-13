@@ -2939,11 +2939,13 @@ static void Drive_Apply(void)
         {
             if ((diff > 0.0f) && (al > tl + TQ_SLIP_OVER_RPM))
             {
-                tq_l *= TQ_SLIP_CUT;        /* 左轮在空转 -> 削它 */
+                tq_l *= TQ_SLIP_CUT;                    /* 左轮在空转 -> 削它 */
+                tq_w[TRIM_IDX_LEFT].integ = 0.0f;       /* ★ 2026-10-13 同时清积分 */
             }
             else if ((diff < 0.0f) && (ar > tr + TQ_SLIP_OVER_RPM))
             {
-                tq_r *= TQ_SLIP_CUT;        /* 右轮在空转 -> 削它 */
+                tq_r *= TQ_SLIP_CUT;                    /* 右轮在空转 -> 削它 */
+                tq_w[TRIM_IDX_RIGHT].integ = 0.0f;      /* ★ 同时清积分 */
             }
         }
     }
