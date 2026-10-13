@@ -2187,137 +2187,152 @@ static uint8_t Drive_ActiveFlag(void)
 #endif
 }
 
-/*=================== 偏航外环: 用 IMU 陀螺仪, 不用轮速 =======================
+/*=================== 偏航失控制动 —— ★不是航向环★ =======================
  *
- * ★ 为什么必须单独立一个环 —— 2026-10-13 洗地机实测:
+ * ★★ 2026-10-13 架构修正: 这一版把上一版的"IMU 航向 PI 环"整个换掉了 ★★
  *
- *   0.3 m/s 直行(命令 wz=0), 每米偏航(IMU 积分 / 轮速积分里程):
- *       轮速外环"门限版": 8.27 deg/m
- *       轮速外环"低通版": 10.67 deg/m   (外环确实动作了: 目标差 0 -> 1.42 RPM)
- *   => **把两个轮子的转速修到一样, 车还是歪的。**
+ * 【为什么航向环是错的 —— 这是本轮最重要的发现】
  *
- *   再看对不上的地方:
- *       用轮速差推出来的偏航: Δrpm 1.6~2.4  ->  2.4~3.6 deg/m
- *       IMU 实际测到的:                          8.3~10.7 deg/m     <- 差 3 倍
- *   => **有一大截偏航是轮速解释不了的。**
+ *   主机侧**本来就已经有一个**保持航向的控制器, 而且调得很讲究:
+ *       ~/wheeltec/src/straight_line_drive/   (ROS2 action: /drive_straight)
+ *       注释写着 "DJI-gimbal style heading lock", 50Hz, yaw_kp=1.40,
+ *       max_yaw_rate=0.08, yaw_des_max_deg=2.5,
+ *       还有一个**自适应前馈** wz_ff(初值 -0.013, ff_adapt_gain=0.10,
+ *       ff_adapt_limit=0.012)在慢慢学出偏航偏置, 以及 control_sign 处理符号。
  *
- *   可能的原因(三个都指向同一个解法):
- *     ① 左右轮胎**实际滚动半径**不同(磨损/载重/气压) —— 转速相等 ≠ 地面速度相等
- *     ② 真实**轮距**不是名义的 425mm —— 同样的轮速差会转出不同角速度
- *     ③ 轮速回码本身有偏(驱动器只给 int16 RPM, 1 RPM 分辨率)
+ *   底盘里再放一个航向环 = **两个控制器抢同一个自由度**。两个积分环串联必然
+ *   互相绕, 谁也别想稳。这就是我在 docs 里提醒过上位机的那种冲突, 只不过这次
+ *   犯错的是我自己。
+ *   => **底盘该做的是"忠实的速度执行器": 给它 vx/wz, 它就真的走出 vx/wz。**
+ *      保持航向、保持位置、保持姿态, 都是主机的事。
  *
- *   轮速只是**代理量**; 陀螺仪测的是**物理事实**。所以这个环闭在陀螺仪上:
- *   让"车体实际偏航率"跟上"命令的 wz"。直行时 wz_cmd=0, 于是它做的事就是
- *   **把偏航压到零** —— 也就是"走直"; 转弯时它让实际转角跟上命令 —— 也就是"转准"。
+ * 【但底盘确实有一件主机管不了的事: 自激发散】
  *
- * ★★★ 这是**速率环, 不是位姿环** —— 这一点很重要, 刻意如此:
- *   底盘必须是一个"忠实的速度执行器"(给 vx/wz, 就真的走出 vx/wz)。速率环满足
- *   这个契约; 而"保持航向/保持位置"那类依赖路径的环会和上位机 EKF/Nav2 的
- *   位姿环抢同一个自由度, 不能放进底盘。见 docs/ros-integration.md。
+ *   洗地机实测(0.3 m/s 直行, 逐帧数据):
+ *     帧 40: 两轮还相等, 陀螺 z 开始长起来
+ *     帧 70: 偏航 1.1 rad/s, 而偏航环(上一版)只能给 23 RPM 差速 —— 打不过
+ *     机理: 偏航把**外侧轮拖着转快**(驱动器那个弱速度环拉不住) -> 轮速差变大
+ *           -> 偏航更大 -> **正反馈发散**。轮速差被拖到 59 RPM, 而命令只给了 23。
+ *   主机那个环的 max_yaw_rate 只有 0.08 rad/s, 遇到 1.1 rad/s 早就饱和了, 无能为力。
+ *
+ * 【所以这里只做"失控制动", 不做"航向控制"】
+ *
+ *   正常范围内(偏差 < YAW_ARREST_RPM)底盘**一点都不动** -> 从机制上不可能和主机抢;
+ *   只有偏差超过阈值、并且持续一小段时间(躲开起步瞬态和噪声)才介入,
+ *   给一个**反向的**大差速把它摁住。
+ *   权限差 3 倍以上(主机最猛 0.08, 本环阈值 0.25), 分工天然清楚。
  *
  * 安全性:
- *   - 修正量硬限幅(YAW_CORR_MAX), 且按名义值比例限制, **不允许把某个轮子的命令改向**
- *   - IMU 读失败(imu_ok=0)时**冻结积分并逐拍退回修正** —— 没有可信的陀螺仪就不修
- *   - 只有"确实在动"时才修(目标为 0 时整个环停, 免得停车时乱动)
- *   - 修正量超时保护: 连续修正过大且没有效果 -> 说明模型/传感器有问题, 退回零修正
- *     (这一条防的是"陀螺仪装反/标度错 -> 环变成正反馈", 见 fabsf(yaw_corr) 的钳位)
+ *   - 硬限幅(YAW_ARREST_CORR), 按名义值比例限幅, 且 Drive_Apply 里显式保证
+ *     **不许把某个轮子的命令改成反向**(权限大, 这条底线必须兜住)
+ *   - IMU 读失败(imu_ok=0) -> 立刻解除并零修正(没有可信陀螺仪就不介入)
+ *   - 目标为 0(没在动) -> 整环复位
+ *   - 顶格还压不住超过 YAW_ARREST_MAX_MS -> 放弃本上电周期(说明不是"偏航失控"
+ *     能解释的场面, 继续给差速只会更糟)
  *============================================================================*/
-#define YAW_LOOP_ENABLE     1
-#define YAW_KP              0.80f   /* 比例: rad/s 误差 -> rad/s 修正。
-                                       ★ 2026-10-13 从 0.30 提到 0.80: 这台车会**自激发散**,
-                                       需要更快响应才能在小扰动阶段压住, 而不是等长起来再打。 */
-#define YAW_KI              0.50f   /* 积分: 每秒、每 1 rad/s 误差攒多少 rad/s 修正
-                                       (稳态偏差主要靠它消; 比例项提供阻尼) */
-/* ★★★ 权限 —— 这个数是**实测定的**, 不是拍的 ★★★
- * 第一版 YAW_CORR_MAX=0.4 rad/s(约 24 RPM 差速), 实测**打不过**:
- *   机器先自己开始偏航(实测帧 40 时两轮还相等), 偏航把**外侧轮拖着转快**
- *   (驱动器那个弱速度环拉不住), 于是轮速差越来越大 -> 偏航更大 -> **正反馈发散**。
- *   实测: 偏航峰值 1.1 rad/s, 对应的轮速差 59 RPM
- *   (= 1.1 * 轮距0.425 * 60 / 周长0.471), 而那个差是**被拖出来的**、不是命令出来的
- *   —— 命令只给了 23 RPM(顶格)。
- *   => 权限必须大于"偏航自己带出来的轮速差"。1.2 rad/s 对应约 65 RPM 差速。
- * 安全: 它只是**速率**环, 有限幅 + Drive_Apply 里的"不许让轮子反向"保证;
- *   另外 YAW_STUCK_S 那条保护会在"顶格 5 秒仍不见效"时把整个环停掉。 */
-#define YAW_CORR_MAX        1.20f
-#define YAW_GYRO_LPF_S      0.15f   /* 陀螺仪低通时间常数(秒): 抑制噪声进比例项 */
-#define YAW_MOVE_DEADBAND   1.0f    /* 两轮目标绝对值之和小于它 = 没在动 -> 整环停 */
-#define YAW_STUCK_S         5.0f    /* 修正顶到限幅且持续这么久还不见效 -> 归零并停用 */
+#define YAW_ARREST_ENABLE   1
+#define YAW_ARREST_RPM      0.25f   /* rad/s: |实际偏航率 − 命令偏航率| 超过它才算"失控"。
+                                       ★ 必须远大于主机环的 max_yaw_rate=0.08 ——
+                                       这个 3 倍差就是"不抢主机"的分界线。 */
+#define YAW_ARREST_REL_RPM  0.10f   /* 降回它以下才解除(迟滞, 防抖) */
+#define YAW_ARREST_MS       150     /* 持续这么久才介入: 躲开起步/模式切换的瞬态 */
+#define YAW_ARREST_CORR     1.20f   /* 介入时给的修正量 rad/s(≈65 RPM 差速)。
+                                       实测偏航 1.1 rad/s 对应 59 RPM 被拖出来的差速,
+                                       所以权限要大于它才打得过。 */
+#define YAW_ARREST_MAX_MS   4000    /* 顶格这么久还压不住 -> 放弃 */
+#define YAW_ARREST_LPF_S    0.10f   /* 陀螺仪低通: 抑制噪声误触发 */
+#define YAW_MOVE_DEADBAND   1.0f    /* 两轮目标绝对值之和小于它 = 没在动 -> 整环复位 */
 
-#if YAW_LOOP_ENABLE
-static float yaw_corr;          /* 当前偏航修正量 rad/s */
-static float yaw_gyro_lp;       /* 低通后的陀螺仪读数 rad/s */
-static uint16_t yaw_stuck_ms;   /* 顶到限幅持续了多久(毫秒)。
-                                   ★ 必须 uint16: 5 秒 = 5000ms 放不进 uint8。
-                                     (第一版写成 uint8_t 还配 (uint8_t)(5.0f*100.0f),
-                                      编译直接报 #173-D "值放不下" —— 幸好本工程要求
-                                      0 警告, 这种溢出才不会悄悄溜过去) */
-static uint8_t  yaw_disabled;   /* 触发过"没效果"保护 -> 本上电周期不再修 */
+#if YAW_ARREST_ENABLE
+static float    yaw_gyro_lp;     /* 低通后的陀螺仪读数 rad/s */
+static uint16_t yaw_dev_ms;      /* 偏差持续超阈多久(毫秒) */
+static uint8_t  yaw_arrest_on;   /* 正在失控制动 */
+static uint16_t yaw_arrest_ms;   /* 制动持续了多久(毫秒) */
+static uint8_t  yaw_arrest_give; /* 放弃标志: 本上电周期不再制动 */
 #endif
 
-/* 返回要叠加到左右轮上的**差速修正量**(RPM, 右加左减)。0 表示不修。
+/* 返回要叠加到左右轮上的**差速修正量**(RPM, 右加左减)。0 表示不介入。
  * 在 Drive_Apply 里、逆解之后、两种驱动模式之前调用 —— 它只改"物理轮速目标",
- * 所以速度模式和力矩模式共用同一套修正。 */
+ * 所以速度模式和力矩模式共用同一套逻辑。 */
 static float Yaw_Trim(float rpm_l, float rpm_r, float wz_cmd, float dt)
 {
-#if YAW_LOOP_ENABLE
-    float e, corr, drpm, alpha;
+#if YAW_ARREST_ENABLE
+    float dev, drpm, alpha;
 
-    /* 没在动就不修: 停车时陀螺仪会因"静止归零"给出 0, 拿它做文章没有意义 */
-    if ((fabsf(rpm_l) + fabsf(rpm_r)) < YAW_MOVE_DEADBAND) return 0.0f;
+    /* 没在动 -> 整环复位(停车时陀螺仪会因"静止归零"给 0, 拿它做文章没意义) */
+    if ((fabsf(rpm_l) + fabsf(rpm_r)) < YAW_MOVE_DEADBAND)
+    {
+        yaw_arrest_on = 0;
+        yaw_dev_ms    = 0;
+        yaw_arrest_ms = 0;
+        yaw_gyro_lp   = 0.0f;
+        return 0.0f;
+    }
 
-    /* 陀螺仪不可信就不修, 并且把积分冻结 + 修正逐拍退回 0(而不是保持上次的值) */
+    /* 陀螺仪不可信 -> 立刻解除, 不介入 */
     if (!imu_ok)
     {
-        yaw_corr    = 0.0f;
-        yaw_gyro_lp = 0.0f;
-        yaw_stuck_ms = 0;
+        yaw_arrest_on = 0;
+        yaw_dev_ms    = 0;
+        yaw_arrest_ms = 0;
+        yaw_gyro_lp   = 0.0f;
         return 0.0f;
     }
 
-    if (yaw_disabled) return 0.0f;
+    if (yaw_arrest_give) return 0.0f;
 
-    alpha       = dt / (YAW_GYRO_LPF_S + dt);
+    alpha       = dt / (YAW_ARREST_LPF_S + dt);
     yaw_gyro_lp += alpha * (imu_gyro[2] - yaw_gyro_lp);
 
-    /* 误差 = 命令的偏航率 - 实际偏航率。直行时 wz_cmd=0, 于是它就是"把偏航压零" */
-    e = wz_cmd - yaw_gyro_lp;
+    /* 失控量 = 实际偏航率 − 命令偏航率。直行时命令是 0, 于是它就是"车在乱转多少" */
+    dev = yaw_gyro_lp - wz_cmd;
 
-    corr = YAW_KP * e + yaw_corr;
-    /* 积分只在没顶到限幅时继续(抗饱和) */
-    if ((corr < YAW_CORR_MAX) && (corr > -YAW_CORR_MAX))
+    if (yaw_arrest_on)
     {
-        yaw_corr += YAW_KI * e * dt;
+        if (fabsf(dev) < YAW_ARREST_REL_RPM)      /* 迟滞: 压下来了就松手 */
+        {
+            yaw_arrest_on = 0;
+            yaw_dev_ms    = 0;
+            yaw_arrest_ms = 0;
+            return 0.0f;
+        }
     }
-    if (yaw_corr >  YAW_CORR_MAX) yaw_corr =  YAW_CORR_MAX;
-    if (yaw_corr < -YAW_CORR_MAX) yaw_corr = -YAW_CORR_MAX;
-    corr = YAW_KP * e + yaw_corr;
-    if (corr >  YAW_CORR_MAX) corr =  YAW_CORR_MAX;
-    if (corr < -YAW_CORR_MAX) corr = -YAW_CORR_MAX;
+    else
+    {
+        if (fabsf(dev) > YAW_ARREST_RPM)
+        {
+            yaw_dev_ms += (uint16_t)(dt * 1000.0f);
+            if (yaw_dev_ms < YAW_ARREST_MS) return 0.0f;   /* 还没持续够, 不介入 */
+        }
+        else
+        {
+            yaw_dev_ms = 0;
+            return 0.0f;
+        }
+        yaw_arrest_on = 1;
+        yaw_arrest_ms = 0;
+    }
 
-    /* ★ "没效果"保护: 修正一直顶在限幅上说明"给了它还是歪" —— 那多半是陀螺仪
-       装反/标度错/轮距错得离谱, 继续修就是把环变成正反馈。归零并停用。 */
-    if (fabsf(corr) >= (YAW_CORR_MAX - 0.001f))
+    /* 顶格太久还压不住 -> 放弃(不是"偏航失控"能解释的场面, 再给差速只会更糟) */
+    yaw_arrest_ms += (uint16_t)(dt * 1000.0f);
+    if (yaw_arrest_ms >= (uint16_t)(YAW_ARREST_MAX_MS))
     {
-        yaw_stuck_ms += (uint16_t)(dt * 1000.0f);
-        if (yaw_stuck_ms > (uint16_t)65000u) yaw_stuck_ms = 65000u;   /* 防溢出 */
-    }
-    else yaw_stuck_ms = 0;
-    if (yaw_stuck_ms >= (uint16_t)(YAW_STUCK_S * 1000.0f))
-    {
-        yaw_disabled = 1;
-        yaw_corr     = 0.0f;
+        yaw_arrest_give = 1;
+        yaw_arrest_on   = 0;
         return 0.0f;
     }
 
-    /* rad/s 的偏航修正 -> 左右轮的差速 RPM
-       wz = (v_r - v_l)/轮距, 而 v = rpm*周长/60
-       -> 给右轮 +d/2、左轮 -d/2 时, 产生的 wz = d*(周长/60)/轮距
-       -> d = wz * 轮距 * 60 / 周长 */
-    drpm = corr * TRACK_WIDTH_M * 60.0f / WHEEL_CIRC_M;
+    /* bang-bang: 给一个**和失控方向相反**的修正量(不搞 PI, 免得又变成和主机抢的环) */
+    dev = (dev > 0.0f) ? YAW_ARREST_CORR : -YAW_ARREST_CORR;
 
-    /* 再按名义值比例限一层: 原来 25%, 实测不够(偏航自己带出来的差速能到 59 RPM,
-       而 25% 只给 19 RPM) -> 放到 80%。**"不许把轮子命令改成反向"这条底线不在这里,
-       在 Drive_Apply 里按"修正前的方向"显式钳 —— 那才是能真正兜住的地方。** */
+    /* rad/s 的偏航修正 -> 左右轮差速 RPM
+       wz = (v_r − v_l)/轮距, v = rpm*周长/60
+       -> 给右轮 +d/2、左轮 −d/2 时产生的 wz = d*(周长/60)/轮距
+       -> d = wz * 轮距 * 60 / 周长 */
+    drpm = dev * TRACK_WIDTH_M * 60.0f / WHEEL_CIRC_M;
+
+    /* 按名义值比例限幅 80%: 实测偏航自己拖出来的差速能到 59 RPM, 25% 不够。
+       "不许让轮子反向"这条底线不在这里, 在 Drive_Apply 里按修正前的方向显式钳。 */
     {
         float lim = (fabsf(rpm_l) + fabsf(rpm_r)) * 0.80f;
         if (drpm >  lim) drpm =  lim;
