@@ -51,6 +51,9 @@ sweeper_chassis/
 ├── docs/
 │   ├── wiring.md                         完整接线总表（先看这个）
 │   ├── ros-integration.md                接入 ROS 2 的状态/启动/还缺什么
+│   ├── ★ division-of-labor.md            **谁该干什么**：STM32 与 RK3588 的责任边界、
+│   │                                     接口契约、时间尺度分界线、缺口与归属建议
+│   │                                     （改底盘级闭环之前必看）
 │   ├── ★ nav2-reference.md               **给做 Nav2 定位/导航的同事**：接口契约、
 │   │                                     TF 树、实测精度、速度包线、故障模式
 │   ├── chassis-serial-protocol.md        底盘串口协议说明（Wheeltec 那套，RK3588↔STM32）
