@@ -436,8 +436,8 @@
  *    那时再把斜坡加回来也不迟 —— 它本来是为了柔顺, 不是为了准确。
  *
  *  减速保持 0: 要停就立刻停, 别拖泥带水(停车安全优先)。 */
-#define ACCEL_STEP_MS      0
-#define DECEL_STEP_MS      0
+#define ACCEL_STEP_MS      2
+#define DECEL_STEP_MS      2
 
 /*-------------------------- 协议 --------------------------------*/
 #define CMD_FRAME_SIZE     11
@@ -550,6 +550,30 @@
  *   若实测仍出现慢摆, 先把 tau 加大(它是唯一该动的旋钮), 不要退回到门限做法。 */
 #define TRIM_FILT_TAU_S     4.0f    /* 误差低通时间常数(秒), 要远大于内环振荡周期 */
 #define TRIM_FILT_CLAMP_RPM 15.0f   /* 低通后的误差限幅: 免得起步瞬间的大误差把积分一把顶满 */
+
+/* ★★★ 2026-10-13 新增: "没在动就不积分"(和上面那个低通是互补的两件事) ★★★
+ *
+ * 低通解决的是"内环振荡让外环看不见稳态偏差";
+ * 这一条解决的是"执行器根本做不到时, 外环不该继续攒积分"。
+ *
+ * 起因(架空+手按住实测): 轮子被按住 -> 实际一直 0 -> 外环看到 25 RPM 的误差,
+ *   一路把修正攒到 +20% 上限; 助推同时也在 +20 RPM 往上顶。
+ *   => 驱动器收到的目标比命令高 68% -> 它内部积分被喂到饱和 -> **松手猛冲 122 RPM**。
+ *
+ * ★ 判据的关键: **"动没动" ≠ "跟没跟上"**。
+ *   轮子在振荡(实测目标 38、实际在 23~52 之间来回)也算**在动** —— 那种情况的
+ *   误差是**稳态偏差**, 外环恰恰应该去修(这正是低通版的意义)。
+ *   只有"命令它动、实际一直是 0"才说明**执行器做不到**, 那时再攒就是喂饱和。
+ *   => 所以门限用 **|实际| < TRIM_NOMOVE_RPM 持续 TRIM_NOMOVE_MS**, 不用误差大小。
+ *
+ *   (历史: 第一版用的是"误差 > 5 RPM 就不积分" —— 判据错了。正常振荡时误差也很大,
+ *    于是外环被整个废掉。现在这条用的是"有没有在动", 才是对的那个量。)
+ *
+ * 超时之后不但不攒, 还要**把已经攒的慢慢退回去**(TRIM_UNWIND_RPM_S):
+ *   退回去 = 主动把驱动器内部积分从饱和区拉出来。 */
+#define TRIM_NOMOVE_RPM     2.0f    /* |实际| 低于它 = 没在动 */
+#define TRIM_NOMOVE_MS      1000    /* 持续这么久才算"执行器做不到"。0 = 关掉这条门限 */
+#define TRIM_UNWIND_RPM_S   10.0f   /* 没在动时每秒退多少 RPM 修正量 */
 
 /* ★★★ 起步助推(KICK)的**独立开关** —— 2026-10-12 新增 ★★★
  *
@@ -666,8 +690,33 @@
 #define KICK_STEP_MS       200      /* 加力间隔 */
 #define KICK_STILL_RPM     2.0f     /* |实际| 低于它 = 还是静止 */
 #define KICK_MOVING_RPM    6.0f     /* |实际| 高于它 = 转起来了, 撤助推 */
-#define KICK_MAX_MS        3000     /* 加到上限还不动, 先给这么久就歇一下(防卡死) */
-#define KICK_COOL_MS       2000     /* ★ 歇多久再试。**不能永久放弃**, 见下面说明 */
+
+/* ★★★ 2026-10-13 大改: 满力时限缩短 + 歇久一点 + 冷却是**真的收干净**
+ *
+ * 起因是架空 + 手按住左轮的实测(目标 25 RPM, 轮子被按住):
+ *     时间 | 目标  实际   电流
+ *     1.0s |  +38     +0   +8.70A    <- 目标被顶到 38(命令只有 25)
+ *     7.5s |  +26     +0   +4.00A
+ *     松手瞬间: 实际冲到 122 RPM(目标的 5 倍!)
+ *   拆开那 +17 RPM 的超出量: 助推 +20 封顶, 外环 Trim +20% (=+5)。
+ *   **两者都在"轮子不动"时往上加 -> 驱动器收到的目标比命令高 68% ->
+ *     它内部速度环的积分被喂到饱和 -> 负载一消失就全部释放 = 猛冲。**
+ *
+ * 为什么这是**我们的错**而不是驱动器的:
+ *   助推的设计目标是破**静摩擦**;"被顶住"和"静摩擦"在开始那一刻长得一模一样
+ *   (实际转速都是 0), **唯一的区别是时间** —— 静摩擦加力后几百毫秒就突破,
+ *   被顶住永远不会。所以判据只能是时间, 而且超时后必须**真的把目标降下来**。
+ *
+ * 改动三处:
+ *   ① KICK_MAX_MS 3000 -> 1200: 静摩擦通常 1 秒内突破, 顶住的话早点收手
+ *   ② KICK_COOL_MS 2000 -> 3000: 歇久一点, 让驱动器内部积分有时间退掉
+ *   ③ 冷却开始时把 boost_amt **清零**(原来只是 return 0, 量还留着) ——
+ *      重新开始时从零逐级加, 而不是立刻又满力 3 秒
+ *
+ * ⚠️ 别把 KICK_MAX_MS 调得太短: 太短会让"静摩擦确实需要更久"的场景起不来。
+ *    1.2 秒是"几百毫秒突破 + 余量"的折中, **要在架空/地面各验证一次**。 */
+#define KICK_MAX_MS        1200     /* 加到上限还不动, 先给这么久就歇一下(防卡死) */
+#define KICK_COOL_MS       3000     /* ★ 歇多久再试。**不能永久放弃**, 见下面说明 */
 
 /*-------------------------- IMU --------------------------------*/
 /* IMU 读一次大概 1~3ms(位翻转 I2C), 和轮速一起按 ODOM_PERIOD_MS 采样。
@@ -794,6 +843,7 @@ typedef struct
 {
     float    trim;          /* 积分修正量, RPM */
     float    e_filt;        /* 低通之后的误差 RPM —— ★ 2026-10-13 新增, 见 Trim_Apply */
+    uint16_t nomove_ms;     /* ★ "实际一直是 0"持续了多久(毫秒)。见 TRIM_NOMOVE_MS */
 } wheel_trim_t;
 
 static wheel_trim_t trim_w[2];      /* [0] = 左轮, [1] = 右轮 */
@@ -1680,6 +1730,11 @@ static float Boost_Decide(float nom_l, float nom_r,
             boost_ms      = 0;
             boost_step_ms = 0;
             boost_cool_ms = KICK_COOL_MS;
+            /* ★★★ 2026-10-13: 冷却是**真的收干净**。原来只是 return 0,
+               boost_amt 还留着 20 RPM, 于是 3 秒的"歇"一过立刻又是满力 ——
+               实测那样会把驱动器内部积分一直按在饱和区(松手猛冲 122 RPM)。
+               清零之后重新开始是"从零逐级加"(4 RPM/200ms, 1 秒到顶)。 */
+            boost_amt     = 0.0f;
             return 0.0f;
         }
 
@@ -1742,8 +1797,9 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
        (助推/计时的清零在 Boost_Decide 里, 因为它是共享的) */
     if (mag < TRIM_DEADBAND_RPM)
     {
-        w->trim   = 0.0f;
-        w->e_filt = 0.0f;       /* ★ 滤波器状态也要清, 否则下次起步带着旧偏差 */
+        w->trim      = 0.0f;
+        w->e_filt    = 0.0f;    /* ★ 滤波器状态也要清, 否则下次起步带着旧偏差 */
+        w->nomove_ms = 0;
         return 0.0f;
     }
 
@@ -1757,16 +1813,48 @@ static float Trim_Apply(wheel_trim_t *w, float nominal, float actual,
         float e = nominal - actual;
         float ef;
 
-        w->e_filt += (dt / (TRIM_FILT_TAU_S + dt)) * (e - w->e_filt);
+        /* ★★★ 先判"到底动没动" —— 见 TRIM_NOMOVE_MS 的说明。
+           动没动 ≠ 跟没跟上: 轮子在振荡也算在动(那种误差该修);
+           只有"命令它动、实际一直是 0"才是**执行器做不到**。 */
+        if (fabsf(actual) < TRIM_NOMOVE_RPM)
+        {
+            if (w->nomove_ms < 60000u) w->nomove_ms += (uint16_t)(dt * 1000.0f);
+        }
+        else
+        {
+            w->nomove_ms = 0;
+        }
 
-        /* 低通之后再限幅: 起步瞬间误差有 30+ RPM, 不限幅会把积分一把顶到限幅,
-           然后轮子一跟上来就得花同样久退回去 -> 低频摆。限幅把"攒/退"的速度
-           都约束在 TRIM_KI*TRIM_FILT_CLAMP_RPM 以内。 */
-        ef = w->e_filt;
-        if (ef >  TRIM_FILT_CLAMP_RPM) ef =  TRIM_FILT_CLAMP_RPM;
-        if (ef < -TRIM_FILT_CLAMP_RPM) ef = -TRIM_FILT_CLAMP_RPM;
+        if ((TRIM_NOMOVE_MS > 0) && (w->nomove_ms >= (uint16_t)TRIM_NOMOVE_MS))
+        {
+            /* 执行器做不到 —— 不但不攒, 还要**把已攒的慢慢退回去**:
+               退回去等于主动把驱动器内部那个我们碰不到的积分从饱和区拉出来。
+               (实测: 不退的话松手瞬间冲 122 RPM, 目标才 25。) */
+            if (w->trim > 0.0f)
+            {
+                w->trim -= TRIM_UNWIND_RPM_S * dt;
+                if (w->trim < 0.0f) w->trim = 0.0f;
+            }
+            else if (w->trim < 0.0f)
+            {
+                w->trim += TRIM_UNWIND_RPM_S * dt;
+                if (w->trim > 0.0f) w->trim = 0.0f;
+            }
+            w->e_filt = 0.0f;   /* 滤波器也清, 免得"恢复的瞬间"用旧偏差猛补一下 */
+        }
+        else
+        {
+            w->e_filt += (dt / (TRIM_FILT_TAU_S + dt)) * (e - w->e_filt);
 
-        w->trim += TRIM_KI * ef * dt;
+            /* 低通之后再限幅: 起步瞬间误差有 30+ RPM, 不限幅会把积分一把顶到限幅,
+               然后轮子一跟上来就得花同样久退回去 -> 低频摆。限幅把"攒/退"的速度
+               都约束在 TRIM_KI*TRIM_FILT_CLAMP_RPM 以内。 */
+            ef = w->e_filt;
+            if (ef >  TRIM_FILT_CLAMP_RPM) ef =  TRIM_FILT_CLAMP_RPM;
+            if (ef < -TRIM_FILT_CLAMP_RPM) ef = -TRIM_FILT_CLAMP_RPM;
+
+            w->trim += TRIM_KI * ef * dt;
+        }
     }
 
     /*---- 限幅: 按名义值的比例, 不用绝对值 ----
@@ -2468,6 +2556,8 @@ static void Drive_Apply(void)
         trim_w[TRIM_IDX_RIGHT].trim = 0.0f;
         trim_w[TRIM_IDX_LEFT].e_filt  = 0.0f;   /* 滤波器状态一起清 */
         trim_w[TRIM_IDX_RIGHT].e_filt = 0.0f;
+        trim_w[TRIM_IDX_LEFT].nomove_ms  = 0;   /* "没在动"计时也清, 见 TRIM_NOMOVE_MS */
+        trim_w[TRIM_IDX_RIGHT].nomove_ms = 0;
         boost_on      = 0;  /* 停过之后助推状态也清干净 */
         boost_amt     = 0.0f;
         boost_ms      = 0;
