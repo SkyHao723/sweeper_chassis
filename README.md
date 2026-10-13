@@ -1,5 +1,25 @@
 # sweeper_chassis — 两驱差速清扫车底盘
 
+> ## ⚠️ 你正在 `torque-mode` 分支上
+>
+> 这条分支做的是**力矩模式实验**：不再用驱动器内部的速度环，改由 STM32 发**扭矩**
+> （模式 `0x04`）自己做速度环。起因是实测驱动器那个环有极限环
+> （目标 27.9 RPM、实际在 0↔71 RPM 之间暴冲）。
+>
+> ```
+> ★ 本分支 DRIVE_MODE_SEL 的默认值是 TORQUE
+>   → Keil 里照常选 sweeper/scrubber，编出来的就是力矩模式固件
+> ★ 本分支默认关掉了"上电自检点动"（增益还没标定，不能让车自动前窜）
+> ★ 台架步骤 / 参数表 / 安全壳 见 docs/torque-mode.md
+> ★ 这个实验不要合回 main
+> ```
+>
+> 验收：`decode_diag.py` 行尾出现 **`★力矩模式固件`**（诊断帧 `[26]` bit2）。
+> 回退：`git checkout main`。
+>
+> 其余内容（接线、协议、ROS 接入、Nav2）与 `main` 相同，下面照旧。
+
+
 STM32 底盘控制器 + FOC 驱动器 CAN 总线，上位机是 **RK3588**（ROS 2）。
 
 **只有一个上位机，也只有一个固件。** 定位（卡尔曼滤波）在上位机做，
@@ -31,12 +51,17 @@ sweeper_chassis/
 ├── docs/
 │   ├── wiring.md                         完整接线总表（先看这个）
 │   ├── ros-integration.md                接入 ROS 2 的状态/启动/还缺什么
+│   ├── ★ division-of-labor.md            **谁该干什么**：STM32 与 RK3588 的责任边界、
+│   │                                     接口契约、时间尺度分界线、缺口与归属建议
+│   │                                     （改底盘级闭环之前必看）
 │   ├── ★ nav2-reference.md               **给做 Nav2 定位/导航的同事**：接口契约、
 │   │                                     TF 树、实测精度、速度包线、故障模式
 │   ├── chassis-serial-protocol.md        底盘串口协议说明（Wheeltec 那套，RK3588↔STM32）
 │   ├── ★ foc-can-protocol.md             **FOC 驱动器 CAN 协议（STM32↔驱动器）**，
 │   │                                     经厂家资料核对；模式/控制字/回码/上报/故障码
 │   ├── pos-mode.md                       位置模式实验（在 pos-mode 分支上）
+│   ├── ★ torque-mode.md                  **力矩模式实验**（在 torque-mode 分支上）：
+│   │                                     台架步骤、安全壳、参数表、判据
 │   └── foc-driver-protocol-v1.2.pdf      FOC 驱动器通讯协议原始文档（厂家 PDF）
 ├── tools/
 │   ├── decode_diag.py                    解码扩展诊断帧（查"轮子有没有劲"）

@@ -57,6 +57,9 @@
 import argparse
 import collections
 import os
+# ★ re 是为了 parse_saved_log(离线复核历史日志要解析自己打印的文本格式)。
+#   这个工具主体是**手工按字节解析**的, 所以一开始没有 re —— 别以为它到处都是。
+import re
 import struct
 import sys
 import threading
@@ -120,17 +123,29 @@ GYRO_RATIO = 0.00026644
 # 底盘几何 —— 必须和固件 main.c 里的一致, 否则还原出来的外环修正量是错的。
 # 用途: 固件上报的"目标"是**含外环修正的最终命令**, 拿这里算出的理论目标一减,
 # 就得到外环到底加了多少。见 main.c 的 Trim_Apply。
-WHEEL_DIAMETER_MM = 205.0
-TRACK_WIDTH_MM = 930.0
-WHEEL_CIRC_M = WHEEL_DIAMETER_MM / 1000.0 * 3.141592653589793
-TRACK_WIDTH_M = TRACK_WIDTH_MM / 1000.0
+#
+# ★★ 2026-10-12 修: 以前这里写死扫地机的 205/930, 于是**洗地机上这一列恒偏 +10 RPM**
+#    (0.3 m/s: 扫地机名义 27.9 RPM, 洗地机 38.2 RPM), 看起来像"外环一直在加 10",
+#    把助推/外环的分析带偏了一晚上。
+#    现在改成**按诊断帧里的车型号自动选几何**(车型号是固件上报的, 见 vehicle_text)。
+GEOM = {                       # 车型号 -> (轮径 mm, 轮距 mm)
+    1: (205.0, 930.0),         # 扫地机
+    2: (150.0, 425.0),         # 洗地机
+}
+DEFAULT_GEOM = (205.0, 930.0)  # 旧固件(f[30] bit5-6 = 0)只能按扫地机算
 
 
-def nominal_rpm(vx, wz):
-    """主机下发的 (vx, wz) -> 左右轮理论物理转速, 和固件 Drive_Apply 同一套公式。"""
-    v_l = vx - wz * TRACK_WIDTH_M * 0.5
-    v_r = vx + wz * TRACK_WIDTH_M * 0.5
-    return (v_l / WHEEL_CIRC_M * 60.0, v_r / WHEEL_CIRC_M * 60.0)
+def nominal_rpm(vx, wz, vehicle=0):
+    """主机下发的 (vx, wz) -> 左右轮理论物理转速, 和固件 Drive_Apply 同一套公式。
+
+    ★ vehicle 必须来自诊断帧的车型号; 传 0(旧固件)就只能退回扫地机几何,
+      这时候洗地机上的结果会偏, 提示一下比默默算错强。"""
+    d_mm, t_mm = GEOM.get(vehicle, DEFAULT_GEOM)
+    circ = d_mm / 1000.0 * 3.141592653589793
+    track = t_mm / 1000.0
+    v_l = vx - wz * track * 0.5
+    v_r = vx + wz * track * 0.5
+    return (v_l / circ * 60.0, v_r / circ * 60.0)
 
 
 def i16(b, i):
@@ -250,6 +265,234 @@ def fault_name(code):
     if code == 0:
         return "正常"
     return "%s(%d)" % (FAULTS.get(code, "未知故障"), code)
+
+
+#========================= 测试有效性判定 (堵转 / 偏航失控) =========================
+# ★ 为什么要有这一段 —— 2026-10-13
+#
+# 之前所有"走直/转准"的测试都被同一个问题污染过: **车到底有没有顶到东西?**
+#   实测出现过"轮子 0 RPM 却吃 20~43A", 这个特征有两个同样成立的解释:
+#       (a) 驱动器/相线故障           (b) 轮子被顶住了(车头顶到墙 -> 该轮堵转)
+#   分不清这两者, 任何结论都不成立 —— 我为此已经收回过一次"硬件故障"的判断。
+#
+# 所以把它变成**可判定、且自动终止**的: 跑的时候实时认, 认出来立刻停车,
+# 并把这次判为**无效**, 免得又拿脏数据下结论。
+#
+# 两个判据(都要求"持续一段时间", 为的是躲开起步瞬态和噪声):
+#   堵转: |目标| >= 20 RPM 且 |实际| < 5 RPM 且 |电流| >= 2.0A, 持续 >= 400ms
+#         (起步时轮子还没破静摩擦, 也会有零点几秒的这种状态 —— 所以要设时长)
+#   失控: |实际偏航率 - 命令偏航率| >= 0.45 rad/s, 持续 >= 200ms
+#         (直行时命令是 0, 于是它就是"车在自己乱转")
+#
+# ★ 判出来后还要分"两轮都堵"还是"只有一轮堵":
+#     两轮都堵 -> 整车被挡住了(或者总电源/被抬起来悬空)
+#     只有一轮 -> 可能是车角顶住, 也可能是**那一条通道的故障** —— 两种情况
+#                 用同一次测试分不开, 需要"把驱动轮垫起来"的空转测试来定
+#============================================================================
+STALL_TGT_RPM = 20.0     # 目标大于它才算"应该转"
+STALL_ACT_RPM = 5.0      # 实际小于它才算"没转"
+STALL_CUR_A   = 2.0      # 电流大于它才算"在使劲"(没使劲的 0 RPM 只是没收到命令)
+STALL_MS      = 400      # 持续这么久才算堵转
+RUNAWAY_WZ    = 0.45     # rad/s, 偏离命令多少算失控
+# ★ RUNAWAY_MS 从 200ms 提到 600ms —— 是拿真实日志定出来的:
+#   最好那次(每米偏航 +1.36, 净偏航只有 2 度)也有 8 帧(400ms)越过 0.45,
+#   但那是起步/停车的瞬态, 判它"无效"就把好数据扔了;
+#   而真正的失控(那次 -55 deg/m)是 21 帧(1.05s)连续越阈。
+#   => 600ms 能把两者分开。改这个值前请先拿这两份日志复核。
+RUNAWAY_MS    = 600
+FRAME_MS      = 50.0     # 诊断帧 20Hz
+
+
+def make_row(diag, gz=0.0):
+    """把一帧诊断 + 当前陀螺仪读数摊平成判定器要的字典。
+       c1/c2 换算成安培(协议是 A x10)。"""
+    return {"tl": float(diag.tl), "tr": float(diag.tr),
+            "wl": float(diag.wl), "wr": float(diag.wr),
+            "c1": diag.c1 / 10.0, "c2": diag.c2 / 10.0,
+            "vx": float(diag.vx), "gz": float(gz)}
+
+
+def classify(rows, wz_cmd=0.0):
+    """rows = [make_row(...), ...] -> 判定字典。无副作用, 可以离线喂历史日志。"""
+    res = {"verdict": "有效", "reason": "", "frames": len(rows),
+           "stall_l": 0, "stall_r": 0, "runaway": 0,
+           "distance": 0.0, "yaw": 0.0, "yaw_per_m": 0.0}
+    if len(rows) < 5:
+        res["verdict"] = "无数据"
+        return res
+
+    need_stall = max(1, int(STALL_MS / FRAME_MS))
+    need_run   = max(1, int(RUNAWAY_MS / FRAME_MS))
+    run_l = run_r = run_dev = 0
+    best_l = best_r = best_dev = 0
+
+    for r in rows:
+        # ---- 堵转(左右各判各的) ----
+        for side in ("l", "r"):
+            t = abs(r.get("t" + side, 0.0))
+            a = abs(r.get("w" + side, 0.0))
+            c = abs(r.get("c1" if side == "l" else "c2", 0.0))
+            if t >= STALL_TGT_RPM and a < STALL_ACT_RPM and c >= STALL_CUR_A:
+                if side == "l":
+                    run_l += 1; best_l = max(best_l, run_l)
+                else:
+                    run_r += 1; best_r = max(best_r, run_r)
+            else:
+                if side == "l":
+                    run_l = 0
+                else:
+                    run_r = 0
+        # ---- 偏航失控 ----
+        dev = abs(r.get("gz", 0.0) - wz_cmd)
+        run_dev = run_dev + 1 if dev >= RUNAWAY_WZ else 0
+        best_dev = max(best_dev, run_dev)
+
+    res["stall_l"], res["stall_r"], res["runaway"] = best_l, best_r, best_dev
+    res["distance"] = sum(r.get("vx", 0.0) for r in rows) * FRAME_MS / 1000.0 / 1000.0
+    res["yaw"]      = sum(r.get("gz", 0.0) for r in rows) * FRAME_MS / 1000.0
+    if res["distance"] > 0.1:
+        res["yaw_per_m"] = res["yaw"] / res["distance"] * 57.2958
+
+    if best_l >= need_stall or best_r >= need_stall:
+        both = best_l >= need_stall and best_r >= need_stall
+        res["verdict"] = "★无效(轮子堵转)"
+        res["reason"] = ("1号 %d 帧 / 2号 %d 帧 有目标却不转且有大电流。%s"
+                         % (best_l, best_r,
+                            "**两个轮子都堵** -> 整车被挡住了(或驱动轮悬空), "
+                            "不是单通道问题"
+                            if both else
+                            "**只有一轮堵** -> 可能是车角顶住, 也可能是该通道故障;"
+                            "要分清必须做'驱动轮垫起来空转'的测试"))
+    elif best_dev >= need_run:
+        res["verdict"] = "★无效(偏航失控)"
+        res["reason"] = ("实际偏航率偏离命令 %.2f rad/s 以上持续 %d 帧 —— "
+                         "车在自己乱转, 这次数据不能用" % (RUNAWAY_WZ, best_dev))
+    return res
+
+
+def print_verdict(res, prefix="  "):
+    print("%s判定: %s" % (prefix, res["verdict"]))
+    if res["reason"]:
+        print("%s  %s" % (prefix, res["reason"]))
+    print("%s  里程 %.2f m | 偏航积分 %+.3f rad | 每米偏航 %+.2f deg/m"
+          % (prefix, res["distance"], res["yaw"], res["yaw_per_m"]))
+    print("%s  堵转帧: 1号 %d / 2号 %d | 失控帧: %d  (共 %d 帧)"
+          % (prefix, res["stall_l"], res["stall_r"], res["runaway"], res["frames"]))
+
+
+def selftest_classify():
+    """★ 判定器的自检 —— 用构造数据验证逻辑, 不需要硬件。
+       这是本轮"可验证"的部分: 三种场面必须分别判对。"""
+    def mk(n, tl, tr, wl, wr, c1, c2, gz=0.0, vx=300.0):
+        return [{"tl": tl, "tr": tr, "wl": wl, "wr": wr,
+                 "c1": c1, "c2": c2, "vx": vx, "gz": gz}] * n
+
+    cases = [
+        ("正常直行",            mk(60, 38, 38, 39, 34, 5.0, -3.0), 0.0, "有效"),
+        ("2号堵转(0RPM+大电流)", mk(60, 38, 49, 36, 0.0, 6.0, -22.6), 0.0, "★无效(轮子堵转)"),
+        ("两轮都堵",            mk(60, 38, 38, 0.0, 0.0, 12.0, -12.0), 0.0, "★无效(轮子堵转)"),
+        ("偏航失控",            mk(60, 38, 38, 39, 34, 5.0, -3.0, gz=1.05), 0.0, "★无效(偏航失控)"),
+        ("短瞬态不算堵转",       mk(4, 38, 38, 0.0, 0.0, 12.0, -12.0) + mk(56, 38, 38, 39, 34, 5.0, -3.0), 0.0, "有效"),
+        ("正常转弯(命令 0.6)",   mk(60, 30, 46, 31, 45, 5.0, 4.0, gz=0.60), 0.6, "有效"),
+    ]
+    ok = True
+    for name, rows, wz, want in cases:
+        got = classify(rows, wz)["verdict"]
+        good = (got == want)
+        ok = ok and good
+        print("  [%s] %-22s -> %-14s (期望 %s)" % ("通过" if good else "失败", name, got, want))
+    print("自检%s" % ("全部通过 ✓" if ok else "★有不通过"))
+    return 0 if ok else 1
+
+
+def parse_saved_log(path):
+    """把以前保存的文本日志还原成 rows —— 用于离线复核历史数据。
+       ★ 这是解析我们自己打印的格式, 格式改了这里也要改(所以放在同一个文件里)。"""
+    rows = []
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if not line.startswith("seq="):
+            continue
+        r = {}
+        m = re.search(r"vx=\s*([-+]?\d+)", line)
+        if m:
+            r["vx"] = float(m.group(1))
+        for side, pat in (("l", r"1号 目标\s*([-+]?\d+) 实际\s*([-+]?\d+)\s*([-+]?[\d.]+)A"),
+                          ("r", r"2号 目标\s*([-+]?\d+) 实际\s*([-+]?\d+)\s*([-+]?[\d.]+)A")):
+            m = re.search(pat, line)
+            if m:
+                r["t" + side] = float(m.group(1))
+                r["w" + side] = float(m.group(2))
+                r["c" + ("1" if side == "l" else "2")] = float(m.group(3))
+        m = re.search(r"gyro=\([^)]*\)=([-+\d.]+),([-+\d.]+),([-+\d.]+)rad/s", line)
+        if m:
+            r["gz"] = float(m.group(3))
+        # ★ 必须**所有字段都齐**才收: 日志里偶尔会缺一段(比如那帧还没收到陀螺仪
+        #   遥测), 少字段的行混进来会让判定器 KeyError 崩掉 —— 实测就崩过一次。
+        need = ("vx", "tl", "wl", "c1", "tr", "wr", "c2", "gz")
+        if all(k in r for k in need):
+            rows.append(r)
+    return rows
+
+
+def classify_saved_log(path, wz_cmd=0.0):
+    rows = parse_saved_log(path)
+    print("文件: %s   解析出 %d 帧" % (path, len(rows)))
+    if not rows:
+        print("★ 一帧都没解析出来 —— 文件格式不对, 或者当时就没抓到数据")
+        return 1
+    print_verdict(classify(rows, wz_cmd))
+    return 0
+
+
+class LiveGuard(object):
+    """在跑的时候实时认"堵转/偏航失控"。增量维护连续计数, 不用每帧重扫全部历史。
+
+    ★ 触发就停车, 不是"记下来等跑完再说" —— 实测见过被堵住的轮子持续吃 43A,
+      那纯粹在发热; 而且既然这次已经无效, 早点停也省得车一直往墙上顶。"""
+
+    def __init__(self, wz_cmd=0.0):
+        self.wz = wz_cmd
+        self.run_l = self.run_r = self.run_dev = 0
+        self.tripped = None       # None / "stall" / "runaway"
+        self.detail = ""
+
+    def feed(self, row):
+        if self.tripped:
+            return
+        need_stall = max(1, int(STALL_MS / FRAME_MS))
+        need_run   = max(1, int(RUNAWAY_MS / FRAME_MS))
+
+        for side in ("l", "r"):
+            t = abs(row["t" + side])
+            a = abs(row["w" + side])
+            c = abs(row["c1" if side == "l" else "c2"])
+            if (t >= STALL_TGT_RPM) and (a < STALL_ACT_RPM) and (c >= STALL_CUR_A):
+                if side == "l":
+                    self.run_l += 1
+                else:
+                    self.run_r += 1
+            else:
+                if side == "l":
+                    self.run_l = 0
+                else:
+                    self.run_r = 0
+
+        for side, cnt in (("1号", self.run_l), ("2号", self.run_r)):
+            if cnt >= need_stall:
+                self.tripped = "stall"
+                self.detail = ("%s轮有目标(%d RPM)却不转(实际 %.0f)且电流 %.1fA, "
+                               "持续 %dms —— 车可能顶到东西了, 或者该通道故障"
+                               % (side, STALL_TGT_RPM, STALL_ACT_RPM,
+                                  STALL_CUR_A, STALL_MS))
+                return
+
+        dev = abs(row["gz"] - self.wz)
+        self.run_dev = self.run_dev + 1 if dev >= RUNAWAY_WZ else 0
+        if self.run_dev >= need_run:
+            self.tripped = "runaway"
+            self.detail = ("偏航率偏离命令 %.2f rad/s 以上(实测 %.2f, 命令 %.2f) "
+                           "持续 %dms —— 车在自己乱转"
+                           % (RUNAWAY_WZ, row["gz"], self.wz, RUNAWAY_MS))
 
 
 def mode_name(code):
@@ -380,14 +623,31 @@ class Diag(object):
         return ("seq=%-3d %s%s vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s%s"
                 % (self.seq, vehicle_text(self.vehicle),
                    selftest_text(self.selftest_nomove), self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
                    mode_name(self.m1), fault_name(self.f1),
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2), trim,
-                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a))
+                   self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a,
+                   (" " + self.drive_text()) if self.drive_text() else ""))
+
+    def drive_text(self):
+        """诊断帧 [26] 的高位: 驱动模式 + 扭矩保护锁存。
+
+        ★ 这两位是 2026-10 加"力矩模式"实验时新占的 —— 速度模式下**恒为 0**,
+          所以老固件/老日志在这里只会印出空串, 不会误报。
+
+        为什么值得单独印出来: "这块板烧的是速度模式还是力矩模式"上车前必须能一眼
+        看出来 —— 和车型号同理。力矩模式的参数是没标定的, 而且保护一旦锁存就只刹车
+        (车表现为"不走"), 不印出来就只能猜。"""
+        out = []
+        if self.relay & 0x04:
+            out.append("★力矩模式固件")
+        if self.relay & 0x08:
+            out.append("**扭矩保护已锁存(超速/堵转, 只刹车)**")
+        return "/".join(out)
 
 
 def vehicle_text(v):
@@ -429,11 +689,16 @@ def flags_text(f):
         # 驱动器还没回码 -> 只发刹车, 车不动是正常的(不是故障)
         out.append("驱动器未就绪(等回码, 车被刹住)")
     if f & 0x40:
-        # ★ 起步助推正在加力。这是"小转向命令愣在原地"和"转向太敏感"这两个
-        #   症状共同的现场证据: 助推在给 = 轮子还没转起来。
-        out.append("起步助推中")
+        # 这一位的含义**随驱动模式变**(固件里由 Drive_ActiveFlag() 给):
+        #   速度模式 = 起步助推正在加力。这是"小转向命令愣在原地"和"转向太敏感"
+        #             这两个症状共同的现场证据: 助推在给 = 轮子还没转起来。
+        #   力矩模式 = 扭矩环正在出力(|扭矩指令| > 0.05A)。
+        # 台架上很好用: 命令了却一直不亮 = 环没在给(或保护锁存); 亮了却不动 =
+        # 在给但推不动(电流不够 / 被卡住)。
+        out.append("起步助推中/扭矩出力中")
     if f & 0x80:
-        # 助推加到上限、KICK_MAX_MS 内轮子仍然没转 -> 被东西顶住/驱动器没使上劲
+        # 速度模式: 助推加到上限、KICK_MAX_MS 内轮子仍然没转 -> 被东西顶住
+        # 力矩模式: 这条恒为 0(力矩模式走 Torque_Guard, 堵转由 f[26] bit3 报)
         out.append("**助推加到上限还不转(轮子被顶住?)**")
     return "/".join(out)
 
@@ -551,7 +816,21 @@ def main():
                          "1=滚刷 2=水泵 3=两个都开 0=都关。"
                          "必须持续发 —— STM32 断链 800ms 会自己把继电器断开。"
                          "Ctrl-C 退出时自动发 0 关掉。")
+    ap.add_argument("--no-abort", action="store_true",
+                    help="关掉「堵转/偏航失控」自动停车。默认是开的: 一旦认出这两种场面"
+                         "(见 classify 的说明)就立刻发零速停车并把这次判为**无效**,"
+                         "免得又拿「车顶到墙」那种脏数据下结论。")
+    ap.add_argument("--classify", metavar="LOG",
+                    help="离线判定: 读一个以前保存的日志文件, 给出这次测试有效/无效。"
+                         "不需要硬件, 用来复核历史数据。")
+    ap.add_argument("--classify-selftest", action="store_true",
+                    help="判定器自检: 用构造数据验证堵转/失控/正常三种场面判得对(不需要硬件)。")
     args = ap.parse_args()
+
+    if args.classify_selftest:
+        return selftest_classify()
+    if args.classify:
+        return classify_saved_log(args.classify)
 
     stream, dump = open_stream(args)
 
@@ -594,8 +873,9 @@ def main():
             os._exit(0)
 
     sender = None
-    # 只有 --drive 时才知道主机下发的理论目标, 才能把外环修正量还原出来
-    nom = nominal_rpm(args.drive[0], args.drive[1]) if args.drive else None
+    # 只有 --drive 时才知道主机下发的理论目标, 才能把外环修正量还原出来。
+    # ★ 注意这里先留 None: 几何要按诊断帧里的车型号算, 第一帧到了才能算(见下面)。
+    nom = None
     if args.drive:
         if args.file:
             sys.exit("--drive 需要真实串口, 不能和 -f 一起用")
@@ -605,8 +885,8 @@ def main():
         sender.start()
         print("# 正在下发 vx=%.3f m/s  wz=%.3f rad/s  (Ctrl-C 停止)"
               % (args.drive[0], args.drive[1]))
-        print("# 理论轮速目标: 左 %+.1f RPM  右 %+.1f RPM"
-              "  —— 固件上报的'目标'含外环修正, 相减就是修正量" % nom)
+        print("# 理论轮速目标按诊断帧里的**车型号**算 "
+              "(几何错了这一列会整体偏移, 以前就是这么被误导过)")
 
     t0 = time.time()
     last_diag = None
@@ -616,6 +896,12 @@ def main():
     bat_mv = 0
     gyro_raw = None
     accel = None
+    # ★ 实时有效性守卫 + 收集本轮的 rows(跑完给判定器用)
+    guard = None
+    drive_rows = []
+    aborted = None
+    if args.drive and not args.no_abort:
+        guard = LiveGuard(args.drive[1])
     # 加速度峰峰值追踪: 这是判断"轮速是真在抖还是只是回码在抖"的独立裁判,
     # 见 tel_accel_ms2 的说明。取最近 2 秒(20Hz x 40 帧)的峰峰值。
     acc_hist = collections.deque(maxlen=40)
@@ -644,6 +930,11 @@ def main():
                     dropped += gap
             seen_seq = d.seq
 
+            # ★ 理论轮速要按**诊断帧上报的车型号**算几何(见 nominal_rpm 的说明)。
+            #   所以不能提前算, 得等第一帧拿到车型号。
+            if (nom is None) and args.drive:
+                nom = nominal_rpm(args.drive[0], args.drive[1], d.vehicle)
+
             probs = tracker.update(d.problems())
             if args.only_problems and not probs:
                 continue
@@ -652,6 +943,27 @@ def main():
             print(d.line(bat_mv, gyro_raw, nom, accel))
             for p in probs:
                 print("    !! " + p)
+
+            # ===== ★ 实时有效性守卫: 认出"堵转/偏航失控"就立刻停车 =====
+            #  为什么必须实时: (1) 再往堵住的电机里灌电流就是纯发热(实测见过 0 RPM 吃 43A);
+            #  (2) 抓到了就说明这次数据不能用, 早停早省事。
+            if guard is not None:
+                # tel_gyro_raw 给的是**原始值**, 换算成 rad/s (协议 ±500dps)
+                # ★ 注意: 这里用的是原始符号, 没套固件里的 IMU_GYRO_Z_SIGN。
+                #   直行(wz_cmd=0)时判据取绝对值, 符号无所谓;
+                #   转弯测试时若符号约定和固件不一致, 需要手动核对。
+                gz = (gyro_raw[2] * GYRO_RATIO) if gyro_raw else 0.0
+                row = make_row(d, gz)
+                drive_rows.append(row)
+                guard.feed(row)
+                if guard.tripped:
+                    print("!! ★ %s" % guard.detail)
+                    print("!! ★ 立刻零速停车, **本次测试判为无效** "
+                          "(车可能顶到东西了, 或该通道故障 —— 见 classify 的说明)")
+                    aborted = guard.tripped
+                    if sender:
+                        sender.halt()
+                    break
 
             # 每 1 秒报一次加速度峰峰值 —— 用来判断轮速抖动是真是假
             # ★ 必须丢掉"不可能"的样本: 真实加速度计永远读到重力, 模长不可能接近 0。
@@ -690,6 +1002,13 @@ def main():
                   "  - STM32 固件里 Send_DiagFrame 有没有被调用")
         if dump:
             dump.close()
+        # ★ 本次测试到底算不算数 —— 跑完必须给个结论, 否则又会拿脏数据下结论
+        if args.drive and drive_rows:
+            print()
+            print("===== 本次测试有效性判定 =====")
+            if aborted:
+                print("  (被实时守卫提前终止: %s)" % aborted)
+            print_verdict(classify(drive_rows, args.drive[1]))
         try:
             stream.close()
         except Exception:
