@@ -2266,6 +2266,33 @@ static void SelfTest_Tick(void)
  *   保护还得在。这也是这个开关能安全用的前提。
  */
 #define TQ_OPENLOOP_A10     0       /* 0 = 正常闭环;  非0 = 开环恒定电流(0.1A 单位) */
+
+/* ★★★ 开环**扫电流**模式 (2026-10-13, 台架标定用) ★★★
+ *
+ * 【为什么还要这个】固定电流版每换一个电流就要重烧一次 —— 标"电流→稳态转速"曲线
+ *   要烧七八次, 太慢。改成 **电流 = |目标RPM| × 这个系数**, 就能直接拿 --drive 的
+ *   vx 当电流旋钮, **一次烧录扫完整条曲线**。
+ *
+ *   例(150mm 轮, 系数 500):
+ *       --drive 0.05 0 -> 目标  6 RPM -> 电流  0.3A
+ *       --drive 0.10 0 -> 目标 13 RPM -> 电流  0.6A
+ *       --drive 0.20 0 -> 目标 25 RPM -> 电流  1.3A
+ *       --drive 0.30 0 -> 目标 38 RPM -> 电流  1.9A
+ *
+ * ★★ 量纲别搞错 —— 我自己第一版注释就写错了, 白扫了一轮:
+ *    mag 的单位是 **A×10**, 所以 系数 = |目标RPM| × GAIN_M/1000 得到的是 A×10。
+ *    系数 50 时 38 RPM 只给 0.19A(**实测两个轮子完全不动**); 要 1.9A 得用系数 500。
+ *
+ * 【实测背景 —— 为什么非标定不可】闭环默认参数一上电就锁存, 查下来是
+ *   TQ_STICTION_A10=25(2.5A) 那个**为带载设计的静摩擦下限**: 空载 1.5A 就能把轮子
+ *   推到 62 RPM, 2.5A 自然直接撞上 TQ_ABS_MAX_RPM=60。
+ *   实测: 闭环 0.10 m/s(目标 12 RPM) -> 实际先冲 +56, 再反冲到 **-89 RPM**, 0.5 秒锁存。
+ *   => 参数是为**带载**配的, 台架是**空载**, 必须先量出真实增益再配。
+ *
+ * ★ 台架标定时要同时把 TQ_ABS_MAX_RPM 放大(见编译脚本), 否则曲线在 60 RPM 就断。
+ */
+#define TQ_OPENLOOP_GAIN_M  0       /* ★ 千分之一 A×10 / RPM; 0 = 关。500 -> 38RPM 给 1.9A
+                                       (用整数是因为**预处理器不能算浮点数**, 写 0.05f 会报 #31) */
 #define TQ_DEADBAND_RPM     2.0f    /* 误差小于这个就不管(免得在原地抖) */
 #define TQ_MAX_A10          80.0f   /* ★ 硬限流 = 8.0A。
                                        ★★ 2026-10-12 首次台架实测后从 3.0A 提到 8.0A ★★
@@ -2311,51 +2338,82 @@ static void SelfTest_Tick(void)
                                         看不到车轮起步的那一刻) */
 #define TQ_FLOOR_STEP_MS    200
 
+/* ★★★ 轮速差保护(防单轮打滑空转) —— 阈值, 见 Drive_Apply 里那一大段说明
+ *
+ * 实测背景(地面, 目标 12 RPM, 电流只给到 4.2A):
+ *   左轮推不动 -> 右轮独自使劲 -> 小轮打滑空转 -> 瞬间冲过 TQ_ABS_MAX_RPM
+ *   -> 锁存停车。极端形态实测到 **291 RPM**(另一轮 0)。
+ * 速度模式下这一层由驱动器自己兜(它会尝试拉回打滑轮); **力矩模式没有**,
+ * 所以必须自己做, 而且是"削快的那一轮"而不是停车(打滑是暂时的)。
+ *
+ * 两个条件都要满足才算打滑: 转速差 > TQ_SLIP_DIFF_RPM  **且** 快的那轮超过目标
+ * TQ_SLIP_OVER_RPM。只看转速差会把转弯误判成打滑(转弯时两轮本来就差得多)。 */
+#define TQ_SLIP_DIFF_RPM    20.0f   /* 两轮实际转速差超过它 = 疑似单轮打滑 */
+#define TQ_SLIP_OVER_RPM    20.0f   /* 且快的那一轮超过自己的目标这么多 */
+#define TQ_SLIP_CUT         0.25f   /* 削到原来的这个比例 */
+
 typedef struct
 {
-    float i10;      /* 上一次输出, 用于变化率限幅 */
-    float integ;    /* 积分项 (A x10) */
+    float i10;          /* 上一次输出, 用于变化率限幅 */
+    float integ;        /* 积分项 (A x10) */
+    /* ★★★ 2026-10-13: 起步力矩下限改成**每轮一份**(原来是一个全局变量, 两轮共享)。
+     *
+     * 原来为什么是错的(实测抓到的): 共享变量的爬升条件是"**两轮里较快的那个**
+     *   amax < 1.5 RPM 都没转"。于是一旦某一轮先转起来, 另一轮的加力就被**叫停**:
+     *     地面实测 目标 12 RPM: 2号偶尔转到 5~14 RPM -> amax>1.5 -> floor 停止爬升
+     *     -> **1号 全程 0 RPM, 电流峰值只有 6.6A(而上限是 12A)**
+     *   而左轮恰恰是"阻力大、需要更多电流才动"的那一个(速度模式下要 12~17A)。
+     *   => 用一个轮子的转动去判断另一个轮子该不该加力, 逻辑本身就是错的。
+     * 现在每轮各自判"我自己转了没有", 互不干扰。 */
+    float    floor_a10; /* 本轮自己的起步力矩下限 (A x10) */
+    uint16_t floor_ms;  /* 本轮距上次抬下限多久 */
 } wheel_torque_t;
 
 static wheel_torque_t tq_w[2];      /* [0]=左 [1]=右, 和 trim_w 同序 */
-static float    tq_floor;           /* 当前起步力矩下限 (A x10), 两轮共享 */
-static uint16_t tq_floor_ms;        /* 距上次抬下限多久 */
 static uint16_t tq_guard_ms;        /* 超速可疑已持续多久 */
 static uint16_t tq_stall_ms;        /* 下限爬满之后仍不转已持续多久 */
 static uint8_t  torque_fault;       /* 锁存: 1 = 触发过保护, 只刹车 */
 static uint16_t torque_stop_ms;     /* 目标为 0 已持续多久(用于解除锁存) */
 #define TQ_REARM_STOP_MS    500     /* 停稳这么久才允许重新起步(解除锁存) */
 
-/* 起步力矩下限的爬升(两轮共享一次判决)。必须在 Torque_Apply 之前调。 */
+/* 起步力矩下限的爬升 —— ★ 2026-10-13 改成**每轮各自独立**判决,
+   不再"两轮共享一次"。理由见 wheel_torque_t 里 floor_a10 的说明。
+   必须在 Torque_Apply 之前调。 */
 static void Torque_Floor_Update(float tgt_l, float act_l, uint8_t fresh_l,
                                 float tgt_r, float act_r, uint8_t fresh_r, float dt)
 {
     uint8_t need;
-    float   amax;
+    uint8_t i;
 
-    if (!fresh_l || !fresh_r) return;   /* 数据不可信就不动下限 */
-
-    need = (uint8_t)((fabsf(tgt_l) > TQ_STALL_TGT_RPM) ||
-                     (fabsf(tgt_r) > TQ_STALL_TGT_RPM));
-
-    amax = fabsf(act_l);
-    if (fabsf(act_r) > amax) amax = fabsf(act_r);
-
-    if (need && (amax < TQ_STALL_RPM))
+    /* ★★★ 每轮**各自**判"我自己转了没有" —— 见 wheel_torque_t 里 floor_a10 的说明。
+       原来的共享版会被"另一轮的转动"叫停, 导致阻力大的那一轮永远拿不到足够电流。 */
+    for (i = 0; i < 2; i++)
     {
-        tq_floor_ms += (uint16_t)(dt * 1000.0f);
-        while (tq_floor_ms >= TQ_FLOOR_STEP_MS)
+        float tg = (i == TRIM_IDX_LEFT) ? tgt_l : tgt_r;
+        float ac = (i == TRIM_IDX_LEFT) ? act_l : act_r;
+        uint8_t fr = (i == TRIM_IDX_LEFT) ? fresh_l : fresh_r;
+        wheel_torque_t *w = &tq_w[i];
+
+        if (!fr) continue;              /* 这一轮数据不可信 -> 不动它的下限 */
+
+        need = (uint8_t)(fabsf(tg) > TQ_STALL_TGT_RPM);
+
+        if (need && (fabsf(ac) < TQ_STALL_RPM))
         {
-            tq_floor_ms -= TQ_FLOOR_STEP_MS;
-            tq_floor += TQ_FLOOR_STEP_A10;
-            if (tq_floor > TQ_MAX_A10) tq_floor = TQ_MAX_A10;
+            w->floor_ms += (uint16_t)(dt * 1000.0f);
+            while (w->floor_ms >= TQ_FLOOR_STEP_MS)
+            {
+                w->floor_ms -= TQ_FLOOR_STEP_MS;
+                w->floor_a10 += TQ_FLOOR_STEP_A10;
+                if (w->floor_a10 > TQ_MAX_A10) w->floor_a10 = TQ_MAX_A10;
+            }
         }
-    }
-    else
-    {
-        /* 转起来了(或没有目标): 立刻收回起始值, 下次起步从头爬 */
-        tq_floor_ms = 0;
-        tq_floor    = TQ_STICTION_A10;
+        else
+        {
+            /* 这一轮转起来了(或它没有目标): 它自己的下限立刻收回起始值 */
+            w->floor_ms  = 0;
+            w->floor_a10 = TQ_STICTION_A10;
+        }
     }
 }
 
@@ -2365,7 +2423,7 @@ static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
     float out;
     /* ★ err/adir 只在闭环分支里用 —— 声明也放进去, 否则开环编译会报
        "#177-D declared but never referenced"(0 Warning 是硬要求)。 */
-#if TQ_OPENLOOP_A10 == 0
+#if (TQ_OPENLOOP_A10 == 0) && (TQ_OPENLOOP_GAIN_M == 0)
     float err;
     float adir;
 #endif
@@ -2377,14 +2435,20 @@ static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
         return 0.0f;
     }
 
-#if TQ_OPENLOOP_A10 != 0
-    /* ---- 开环定电流(见 TQ_OPENLOOP_A10 的说明) ----
+#if (TQ_OPENLOOP_A10 != 0) || (TQ_OPENLOOP_GAIN_M != 0)
+    /* ---- 开环(见 TQ_OPENLOOP_A10 / TQ_OPENLOOP_GAIN 的说明) ----
        绕过 PI, 只保留限幅和变化率限幅; 方向跟目标走。
        integ 清掉, 免得开环期间的积分在切回闭环时突然释放。 */
     {
         float step = TQ_SLEW_A10_PER_S * dt;
+        float mag;
+#if TQ_OPENLOOP_A10 != 0
+        mag = (float)TQ_OPENLOOP_A10;          /* 固定电流 */
+#else
+        mag = fabsf(tgt) * ((float)TQ_OPENLOOP_GAIN_M / 1000.0f);  /* ★ 用 vx 当旋钮 */
+#endif
         w->integ = 0.0f;
-        out = ((tgt > 0.0f) ? 1.0f : -1.0f) * (float)TQ_OPENLOOP_A10;
+        out = ((tgt > 0.0f) ? 1.0f : -1.0f) * mag;
         out = ClampF(out, -TQ_MAX_A10, TQ_MAX_A10);
         if (out > w->i10 + step) out = w->i10 + step;
         if (out < w->i10 - step) out = w->i10 - step;
@@ -2405,12 +2469,13 @@ static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
 
     out = TQ_KP * err + w->integ;
 
-    /* 静摩擦补偿: 只在"还没转起来"时兜底, 用的是**会往上爬的**下限 tq_floor。
+    /* 静摩擦补偿: 只在"还没转起来"时兜底, 用的是**会往上爬的**下限。
+       ★ 2026-10-13: 改成**本轮自己的** w->floor_a10(原来是一个全局共享变量)。
        转起来之后交给 PI —— 否则轮子一动就撤、一停又给, 会在极低速来回磕。 */
     if ((act > -TQ_STALL_RPM) && (act < TQ_STALL_RPM) && (err != 0.0f))
     {
         adir = (err > 0.0f) ? 1.0f : -1.0f;
-        if ((out * adir) < tq_floor) out = adir * tq_floor;
+        if ((out * adir) < w->floor_a10) out = adir * w->floor_a10;
     }
 
     out = ClampF(out, -TQ_MAX_A10, TQ_MAX_A10);
@@ -2424,7 +2489,7 @@ static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
 
     w->i10 = out;
     return out;
-#endif  /* TQ_OPENLOOP_A10 */
+#endif  /* TQ_OPENLOOP_A10 || TQ_OPENLOOP_GAIN_M */
 }
 
 /* 三道保护。**两轮一起判、一起停** —— 和助推同样的理由: 单轮自己收手会让
@@ -2491,25 +2556,35 @@ static void Torque_Guard(float tgt_l, float act_l, uint8_t fresh_l,
 
     /* (3) 堵转: 有目标、轮子却一直不转, **而且下限已经爬满了**(说明该给的都给了)
             —— 这才是真堵住/驱动器不认 mode 4/轮子被卡住。
-           ★ 判据里带 tq_floor >= TQ_MAX_A10 是关键: 只看"两秒没转"会把
-             "起步电流不够"误判成堵转, 而那是调参问题不是故障 —— 见 TQ_FLOOR_*。 */
-    if ((tmax > TQ_STALL_TGT_RPM) && (amax < TQ_STALL_RPM) && (tq_floor >= TQ_MAX_A10))
+           ★ 判据里带"下限爬满"是关键: 只看"两秒没转"会把"起步电流不够"
+             误判成堵转, 而那是调参问题不是故障 —— 见 TQ_FLOOR_*。
+           ★ 2026-10-13: 下限改成每轮一份之后, 这里取**两轮里较大的那个**
+             (至少有一轮已经被给到极限还不转 = 该收手了)。 */
     {
-        tq_stall_ms += ms;
-        if (tq_stall_ms >= TQ_STALL_MS) torque_fault = 1;
+        float fmax = tq_w[TRIM_IDX_LEFT].floor_a10;
+        if (tq_w[TRIM_IDX_RIGHT].floor_a10 > fmax) fmax = tq_w[TRIM_IDX_RIGHT].floor_a10;
+
+        if ((tmax > TQ_STALL_TGT_RPM) && (amax < TQ_STALL_RPM) && (fmax >= TQ_MAX_A10))
+        {
+            tq_stall_ms += ms;
+            if (tq_stall_ms >= TQ_STALL_MS) torque_fault = 1;
+        }
+        else tq_stall_ms = 0;
     }
-    else tq_stall_ms = 0;
 }
 
 /* 把扭矩环状态清干净(锁存/未就绪/停车时调) */
 static void Torque_Reset(void)
 {
-    tq_w[TRIM_IDX_LEFT].i10    = 0.0f;
-    tq_w[TRIM_IDX_LEFT].integ  = 0.0f;
-    tq_w[TRIM_IDX_RIGHT].i10   = 0.0f;
-    tq_w[TRIM_IDX_RIGHT].integ = 0.0f;
-    tq_floor    = TQ_STICTION_A10;      /* 下限回到起始值, 下次起步重新爬 */
-    tq_floor_ms = 0;
+    uint8_t i;
+
+    for (i = 0; i < 2; i++)
+    {
+        tq_w[i].i10       = 0.0f;
+        tq_w[i].integ     = 0.0f;
+        tq_w[i].floor_a10 = TQ_STICTION_A10;  /* 下限回到起始值, 下次起步重新爬 */
+        tq_w[i].floor_ms  = 0;
+    }
 }
 
 #endif  /* DRIVE_MODE_SEL == DRIVE_MODE_TORQUE */
@@ -2830,6 +2905,48 @@ static void Drive_Apply(void)
 
     tq_l = Torque_Apply(&tq_w[TRIM_IDX_LEFT],  rpm_l, (float)wheel_left_rpm,  dt);
     tq_r = Torque_Apply(&tq_w[TRIM_IDX_RIGHT], rpm_r, (float)wheel_right_rpm, dt);
+
+    /* ================= ★★★ 轮速差保护(防单轮打滑空转) =================
+     *
+     * 【为什么力矩模式必须有它】实测出来的因果链(地面, 目标 12 RPM):
+     *     左轮推不动(电流 4.2A 不够破静摩擦)
+     *   -> 右轮独自使劲 -> 150mm 小轮**打滑空转**
+     *   -> 瞬间冲过 TQ_ABS_MAX_RPM(150) -> 立刻锁存 -> 停车
+     *   而极端形态实测到 **291 RPM**(另一轮 0 RPM) —— 那次我采样到了。
+     *   (锁存前 100ms 还显示 +6 RPM, 尖峰落在 150ms 的采样间隙里, 所以一开始
+     *    我按三条已知判据都推不出来, 查了 Torque_Guard 才定位到 (1) 那条。)
+     *
+     * 【速度模式下谁在管这事】驱动器自己 —— 它至少会"尝试"把打滑的轮子拉回
+     *   目标转速(虽然拉不住, 那就是那个欠阻尼环)。**力矩模式下没有这一层**:
+     *   一旦某一轮失去牵引力, 它就一直空转, 另一轮还在推 -> 车不动还偏航。
+     *
+     * 【做法】只削**快的那一轮**(它在空转, 给它更多电流只会转得更快),
+     *   另一轮保持推力。**绝不能停车** —— 打滑是暂时的, 停车就永远推不动了。
+     *   削掉之后它转速下来、重新抓地, 两轮就能一起把车推走。
+     *
+     * ★ 判据用**转速差** + "快的那轮超过目标", 两个条件都要满足:
+     *   只看转速差会把"转弯"误判成打滑(转弯时两轮本来就差得多)。
+     * ================================================================ */
+    {
+        float al = fabsf((float)wheel_left_rpm);
+        float ar = fabsf((float)wheel_right_rpm);
+        float tl = fabsf(rpm_l);
+        float tr = fabsf(rpm_r);
+        float diff = al - ar;
+        float adiff = (diff < 0.0f) ? -diff : diff;
+
+        if (adiff > TQ_SLIP_DIFF_RPM)
+        {
+            if ((diff > 0.0f) && (al > tl + TQ_SLIP_OVER_RPM))
+            {
+                tq_l *= TQ_SLIP_CUT;        /* 左轮在空转 -> 削它 */
+            }
+            else if ((diff < 0.0f) && (ar > tr + TQ_SLIP_OVER_RPM))
+            {
+                tq_r *= TQ_SLIP_CUT;        /* 右轮在空转 -> 削它 */
+            }
+        }
+    }
 
     /* 物理轮速域 -> 电机域: 和速度模式用**同一套**接线校准, 这样两个模式
        对"哪个电机是左边""哪个要取反"的理解不可能分叉。 */
