@@ -647,7 +647,7 @@ class Diag(object):
         return ("seq=%-3d %s%s vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s%s"
                 % (self.seq, vehicle_text(self.vehicle),
                    selftest_text(self.selftest_nomove), self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
@@ -656,6 +656,11 @@ class Diag(object):
                    mode_name(self.m2), fault_name(self.f2), trim,
                    self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a,
                    ((" " + self.drive_text()) if self.drive_text() else "") +
+                   # ★ 2026-10-13 新增: 底盘**收到的**指令 + 底盘时基。
+                   #   让主机(或人)能确认"我发的命令到底到了没有"。没人发命令时
+                   #   这里应该是 0/0, tick 一直在涨。
+                   " rxcmd=%+.3f/%+.3f tick=%d" % (
+                       self.cmd_vx / 1000.0, self.cmd_wz / 1000.0, self.tick_ms) +
                    sat_text(self.sat_now, self.sat_latch)))
 
     def drive_text(self):
@@ -1044,6 +1049,17 @@ def main():
                 break
     except KeyboardInterrupt:
         pass
+    except Exception:
+        # ★★★ 这个 except 是必须的, 不是多余 —— 2026-10-13 踩到:
+        #   finally 里有 os._exit(0), 它会**跳过解释器打印 traceback**,
+        #   于是任何解析异常都表现成"一帧都没收到、退出码 0、零输出"。
+        #   那次是 line() 里少了一个格式化参数(TypeError), 却让我花了好几轮
+        #   去怀疑串口/固件/帧长 —— 全是白费。
+        #   **诊断工具自己出错时必须能说出来。**
+        import traceback
+        traceback.print_exc()
+        print("★ 工具内部异常(不是没数据!) —— 上面的 traceback 才是真因",
+              file=sys.stderr)
     finally:
         if sender:
             sender.halt()           # 无论如何都要把车按住再退出
