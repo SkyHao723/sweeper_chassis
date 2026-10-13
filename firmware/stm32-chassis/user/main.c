@@ -2244,6 +2244,28 @@ static void SelfTest_Tick(void)
 
 #define TQ_KP               1.2f    /* A x10 / RPM   —— 10 RPM 误差 -> 1.2A */
 #define TQ_KI               0.6f    /* A x10 / (RPM·s) */
+
+/* ★★★ 开环定电流测试 (torque-mode-v2 分支, 2026-10-13 新增) ★★★
+ *
+ * 【为什么需要它】力矩模式**从没跑通过**。而在调那个 PI 之前, 必须先单独验证
+ *   三件和 PI 毫无关系的基础事实 —— 任何一条不对, 调参都是白费, 而且调不出来
+ *   还查不出原因:
+ *     ① **方向**: 命令正电流, 轮子真的往"前进方向"转吗?
+ *        速度模式下的正方向已经实测验过(架空跟踪 100%); 但**力矩模式的符号约定
+ *        是另一套**, 完全可能相反 —— 反了的话闭环就成了正反馈。
+ *     ② **量纲**: 写 25 到底是 2.5A 吗? 驱动器回码的电流和它对得上吗?
+ *        协议写的是"A 放大 10 倍", 但那是文档, 要实测。
+ *     ③ **驱动器认不认 mode 4**: 给了电流轮子到底动没动、动多快?
+ *
+ * 【怎么用】设成非 0 (比如 25 = 2.5A) 再编译 —— 此时 Torque_Apply **完全绕过 PI**,
+ *   每个轮子恒定输出这么多电流, 方向取目标转速的符号(所以给正 vx 就是往前走)。
+ *   ★ **必须架空测试, 从小值开始(15 = 1.5A)**。
+ *   它仍然经过限幅和变化率限幅, 所以是斜坡加上去的, 不是阶跃。
+ *
+ * ★ 刻意**不**绕过 Torque_Guard(超速/失控照旧锁存): 万一方向或接线搞反了,
+ *   保护还得在。这也是这个开关能安全用的前提。
+ */
+#define TQ_OPENLOOP_A10     0       /* 0 = 正常闭环;  非0 = 开环恒定电流(0.1A 单位) */
 #define TQ_DEADBAND_RPM     2.0f    /* 误差小于这个就不管(免得在原地抖) */
 #define TQ_MAX_A10          80.0f   /* ★ 硬限流 = 8.0A。
                                        ★★ 2026-10-12 首次台架实测后从 3.0A 提到 8.0A ★★
@@ -2340,9 +2362,13 @@ static void Torque_Floor_Update(float tgt_l, float act_l, uint8_t fresh_l,
 /* 每轮一份的扭矩 PI + 静摩擦补偿。tgt == 0 时返回 0(调用方会发刹车帧)。 */
 static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
 {
-    float err;
     float out;
+    /* ★ err/adir 只在闭环分支里用 —— 声明也放进去, 否则开环编译会报
+       "#177-D declared but never referenced"(0 Warning 是硬要求)。 */
+#if TQ_OPENLOOP_A10 == 0
+    float err;
     float adir;
+#endif
 
     if (tgt == 0.0f)
     {
@@ -2351,6 +2377,21 @@ static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
         return 0.0f;
     }
 
+#if TQ_OPENLOOP_A10 != 0
+    /* ---- 开环定电流(见 TQ_OPENLOOP_A10 的说明) ----
+       绕过 PI, 只保留限幅和变化率限幅; 方向跟目标走。
+       integ 清掉, 免得开环期间的积分在切回闭环时突然释放。 */
+    {
+        float step = TQ_SLEW_A10_PER_S * dt;
+        w->integ = 0.0f;
+        out = ((tgt > 0.0f) ? 1.0f : -1.0f) * (float)TQ_OPENLOOP_A10;
+        out = ClampF(out, -TQ_MAX_A10, TQ_MAX_A10);
+        if (out > w->i10 + step) out = w->i10 + step;
+        if (out < w->i10 - step) out = w->i10 - step;
+        w->i10 = out;
+        return out;
+    }
+#else
     err = tgt - act;
     if ((err > -TQ_DEADBAND_RPM) && (err < TQ_DEADBAND_RPM)) err = 0.0f;
 
@@ -2383,6 +2424,7 @@ static float Torque_Apply(wheel_torque_t *w, float tgt, float act, float dt)
 
     w->i10 = out;
     return out;
+#endif  /* TQ_OPENLOOP_A10 */
 }
 
 /* 三道保护。**两轮一起判、一起停** —— 和助推同样的理由: 单轮自己收手会让
