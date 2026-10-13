@@ -51,7 +51,7 @@
  *   [22]   BCC = XOR([0..21])
  *   [23]   0x7D
  *
- * 【扩展诊断帧 36 字节  STM32 -> 上位机】  (本工程自定义, 头 0x7E)
+ * 【扩展诊断帧 44 字节  STM32 -> 上位机】  (本工程自定义, 头 0x7E)
  *   厂商 ROS 节点不认识这一帧。它靠"上一字节是帧尾 0x7D、本字节是 0x7B"
  *   才入帧, 而本帧永远夹在两个完整 24 字节帧之间发出, 所以它会被完整跳过、
  *   并在下一个 0x7B 处正常重新同步 —— 不需要厂商那边做任何改动。
@@ -90,8 +90,21 @@
  *           ★ bit7   = 上电自检"两轮都没转" (见 SELFTEST_* 说明)
  *   [31]    IMU 版本号(主版本)
  *   [32-33] IMU 内部融合的偏航角, int16, 单位 0.01 rad
- *   [34]    BCC = XOR([0..33])
- *   [35]    0x7D
+ *
+ *   ---- 以下 5 项 2026-10-13 新增(帧 36 -> 44 字节)。目的: **多给上位机一些数据,
+ *        帮它调自己的控制器**。以前只能看到"目标 vs 实际", 看不出"目标是主机要的,
+ *        还是已经被底盘夹过的" —— 主机对着做不到的目标一直积分(windup), 表现为
+ *        "越纠越偏"或"松手后猛冲"。伺服驱动都有饱和标志, 底盘也该有。
+ *   [34]    ★ 饱和/保护状态 **当前拍**(瞬时), 位定义见 SAT_* 宏
+ *   [35]    ★ 同上, 但**本上电周期发生过没有**(锁存, 只有复位才清)
+ *   [36-37] 底盘时基低 16 位 ms (65.5s 回绕) —— 给主机更好的时标
+ *   [38-39] ★ 底盘**收到的**指令 vx  mm/s
+ *   [40-41] ★ 底盘**收到的**指令 wz  mrad/s
+ *              这两项让主机能回答它以前答不了的两个问题:
+ *                ① "我发的命令到底到了没有"(和自己发出去的值比)
+ *                ② "到了之后有没有被夹"(和 MAX_LIN_SPEED/MAX_YAW_RATE 比)
+ *   [42]    BCC = XOR([0..41])
+ *   [43]    0x7D
  *
  *   [30..33] 是陀螺仪恒 0 时用来定位问题的: 只要 [30] 里除了 bit1 以外还有
  *   别的位置 1, 就说明模块其它功能块是活的, 问题只在陀螺仪这一块;
@@ -354,37 +367,40 @@
 #define DRIVE_MODE_SPEED    0
 #define DRIVE_MODE_TORQUE   1
 #ifndef DRIVE_MODE_SEL
-/* ★★ 这个默认值在 torque-mode 分支上是 **TORQUE** ★★
- *   也就是在这个分支上, Keil 里照常选 sweeper/scrubber, 编出来的就是**力矩模式**
- *   固件 —— 不需要额外选 target, 更不需要手改源码(手改源码正是"选 sweeper 却烧成
- *   洗地机"那次事故的成因, 绝不再引入第二种"我记得我改过")。
- *   想在本分支编速度模式做 A/B: 命令行加 -DDRIVE_MODE_SEL=0(工程里的 <Define>
- *   优先于这里的默认值), 或者把这里改回 DRIVE_MODE_SPEED。
- *   ★ main 分支上这个默认值是 DRIVE_MODE_SPEED, 不受影响。 */
-#define DRIVE_MODE_SEL      DRIVE_MODE_TORQUE
+/* ★★ main 上的默认值 = **速度模式** ★★（2026-10-13 合并 torque-mode 时定的）
+ *
+ * 决定依据（用户 2026-10-13 明确）：**航向保持交给 RK3588**，底盘只当"忠实的速度
+ * 执行器"。速度模式是已验证能跑的那条路（扫地机实测 0.30 m/s 时跟踪 103%、
+ * 漂移 −3.2°/m），而力矩模式**至今没跑通过**。
+ *
+ * 所以：
+ *   - 正常编译(在 Keil 里选 sweeper/scrubber) -> **速度模式固件**
+ *   - 要做力矩实验 -> 显式指定（命令行 `-DDRIVE_MODE_SEL=1`，或改这一行）
+ *   - **绝不要**让"默认值"和"当前想测的"不一致：2026-10-12 那次
+ *     "选 sweeper 却烧成洗地机"就是靠默认值/手改源码搞混的 */
+#define DRIVE_MODE_SEL      DRIVE_MODE_SPEED
 #endif
 
-/* ★★ 上电自检点动: 力矩模式下默认关掉 ★★
- *   理由: 自检会在上电 3 秒后自己往前窜一下。速度模式下那一窜是驱动器速度环
- *   执行的、幅度可预期; 而力矩模式的增益(TQ_KP/TQ_KI/TQ_STICTION)目前**全是
- *   没标定的估计值**, 同一条命令可能窜出去很远。第一次上电不该带一个
- *   "参数还没标定的自动前窜"。
- *   台架标定完、并且确认过点动幅度之后, 再把下面这个改回 1。
+/* ★★★ 上电自检点动: 2026-10-13 起 **默认关掉（两种模式都关）** ★★★
+ *
+ * 它是**台架工具**，不是产品功能 —— 它会让车在"没人要求"的情况下自己往前窜一下
+ * （约 7~16cm）。经历了 2026-10-13 的失控之后，"上电自己动"这一类行为的代价很清楚了。
+ *
+ * **做减法原则**：固件里任何"没有人要求它、它却自己动"的行为，都必须
+ *   ① 有明确触发条件 ② 有上限 ③ 能被上位机/编译开关关掉 ④ 能被观测。
+ * 自检满足 ②③④，但它是**默认开启**的 —— 这一条最危险（上一电就动）。
+ *
+ * 所以：**保留代码、保留开关，但默认不发车。** 要上电点动就把这里改成 1
+ * （或命令行 -DSELFTEST_ENABLE=1）。结果仍进诊断帧 f[30] bit7。
  *
  *   ★★★ 位置很重要: 这一段**必须放在 DRIVE_MODE_SEL 定义之后** ★★★
- *   它一开始被放在自检那段注释下面(文件靠前的位置), 也就是**在 DRIVE_MODE_SEL
- *   定义之前** —— 而 C 预处理器对未定义标识符按 0 处理, 于是
- *       #if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
- *   变成 `0 == 0` **恒真**, 结果自检在**两种模式下都被关掉了**。
- *   症状很隐蔽: 编译 0 Error 0 Warning, 只是速度模式的自检悄悄没了
- *   (2026-10-12 用"开关切换前后 hex 是否相同"抓到的: 两份 hex 逐字节一样)。
+ *   它一开始被放在文件靠前的位置(在 DRIVE_MODE_SEL 定义之前) —— 而 C 预处理器对
+ *   未定义标识符按 0 处理, 于是 `#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE`
+ *   变成 `0 == 0` **恒真**, 自检在**两种模式下都被关掉了**, 而且编译 0 Error 0 Warning。
+ *   (2026-10-12 靠"切换开关前后两份 hex 逐字节相同"才抓到。)
  *   教训: **凡是 #if 引用某个宏, 先确认那个宏在这行之前已经定义。** */
 #ifndef SELFTEST_ENABLE
-#if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
 #define SELFTEST_ENABLE     0
-#else
-#define SELFTEST_ENABLE     1
-#endif
 #endif
 
 /* 故障码 (FOC_CH4-V1.2 第 11 页附表), 回码 DATA1 / 上报帧 DATA2 */
@@ -429,7 +445,7 @@
 #define TEL_FRAME_SIZE     24
 #define TEL_HEAD           0x7B
 #define TEL_TAIL           0x7D
-#define DIAG_FRAME_SIZE    36
+#define DIAG_FRAME_SIZE    44
 #define DIAG_HEAD          0x7E
 #define DIAG_TAIL          0x7D
 
@@ -717,6 +733,38 @@ static uint32_t last_frame_ms;      /* 最后一条**任何合法帧** (决定�
 static uint32_t last_can_ms;
 static uint32_t last_odom_ms;
 static uint32_t last_tel_ms;
+
+/*================ 向上报的"饱和 / 保护"状态 (2026-10-13 新增) ================
+ * ★ 加它们的理由: 主机要调它的控制器, 必须知道**底盘到底做没做到它要的**。
+ *   以前只能看到"目标 vs 实际", 但看不出"目标是主机要的, 还是已经被夹过的"。
+ *   典型场景: 主机发 wz=0.5, 底盘只能给 0.35 —— 主机不知道, 就一直积分(windup),
+ *   表现为"越纠越偏"或者"松手后猛冲"。伺服驱动都有这个饱和标志, 底盘也该有。
+ *
+ * [34] sat_now   = **当前这一拍**的状态(瞬时)
+ * [35] sat_latch = **本上电周期内发生过没有**(锁存, 只有复位才清)
+ *   两位布局相同:
+ *     bit0 主机要的 vx 被夹到 MAX_LIN_SPEED
+ *     bit1 主机要的 wz 被夹到 MAX_YAW_RATE
+ *     bit2 左轮目标被夹到 MAX_RPM
+ *     bit3 右轮目标被夹到 MAX_RPM
+ *     bit4 就绪联锁生效(驱动器不全 -> 只发刹车)
+ *     bit5 failsafe 锁存中(断链)
+ *     bit6 运动看门狗在跑(当前没有有效运动命令)
+ *     bit7 链路看门狗在跑(当前没有任何合法帧)
+ * =========================================================================*/
+#define SAT_VX_CLAMP    0x01
+#define SAT_WZ_CLAMP    0x02
+#define SAT_RPM_L_CLAMP 0x04
+#define SAT_RPM_R_CLAMP 0x08
+#define SAT_NOT_READY   0x10
+#define SAT_FAILSAFE    0x20
+#define SAT_MOT_WD      0x40
+#define SAT_LINK_WD     0x80
+
+static uint8_t sat_now;             /* 当前拍状态, 每帧重算 */
+static uint8_t sat_latch;           /* 历史锁存 */
+static uint8_t mot_wd_active;       /* 运动看门狗"当前"是否在生效(没有有效速度帧) */
+static uint8_t link_wd_active;      /* 链路看门狗"当前"是否在生效(没有任何合法帧) */
 
 /* 诊断计数 */
 static uint8_t  can_error_count;
@@ -1316,6 +1364,19 @@ static void Cmd_Apply(uint8_t port_id, const uint8_t *f)
 
     target_vx = ClampF((float)vx_mm / 1000.0f, -MAX_LIN_SPEED, MAX_LIN_SPEED);
     target_wz = ClampF((float)wz_mrad / 1000.0f, -MAX_YAW_RATE, MAX_YAW_RATE);
+
+    /* ★ 记"主机要的超出底盘能力了" —— 上报给主机, 免得它对着做不到的目标一直积分。
+       注意比较的是**原始请求**和限幅后的值。见 sat_now/sat_latch 的说明。 */
+    if ((float)vx_mm / 1000.0f != target_vx)
+    {
+        sat_now   |= SAT_VX_CLAMP;
+        sat_latch |= SAT_VX_CLAMP;
+    }
+    if ((float)wz_mrad / 1000.0f != target_wz)
+    {
+        sat_now   |= SAT_WZ_CLAMP;
+        sat_latch |= SAT_WZ_CLAMP;
+    }
 
     /* ★ 滚刷和水泵都**不**自动合闸。
        两个继电器都是"外设开关", 只能由上位机显式发 f[1]=0x05 帧
@@ -2232,8 +2293,22 @@ static uint8_t Drive_ActiveFlag(void)
  *   - 目标为 0(没在动) -> 整环复位
  *   - 顶格还压不住超过 YAW_ARREST_MAX_MS -> 放弃本上电周期(说明不是"偏航失控"
  *     能解释的场面, 继续给差速只会更糟)
+ *
+ * ★★★ 2026-10-13 **默认关掉** ★★★
+ *   决定依据（用户明确）：**航向保持交给 RK3588** —— 主机侧 `straight_line_drive`
+ *   跑 50Hz 且有更多信息（里程/路径/横向误差/自适应前馈），这个环归它。
+ *
+ *   关掉它的三条理由，一条比一条重：
+ *     1. **它没验证过** —— 判定器把之前那几次 A/B 分别判成"堵转"和"失控"，**都无效**，
+ *        它连一次有效数据都没跑满
+ *     2. **它是固件里唯一一个"用 IMU 去命令电机"的东西**。关掉之后 IMU 退化成
+ *        **纯遥测**（只读 + 转发）-> "传感器输入影响执行器输出"这一整类失效模式消失
+ *     3. 2026-10-13 那次失控，就是在我验证它的过程中发生的
+ *
+ *   "设计上正当" ≠ "现在能用"。要开它做实验：改这里为 1，或命令行 -DYAW_ARREST_ENABLE=1，
+ *   **并且必须满足：驱动轮架空 / 场地空 / 串口独占 / 跑完看 decode_diag 的有效性判定。**
  *============================================================================*/
-#define YAW_ARREST_ENABLE   1
+#define YAW_ARREST_ENABLE   0
 #define YAW_ARREST_RPM      0.25f   /* rad/s: |实际偏航率 − 命令偏航率| 超过它才算"失控"。
                                        ★ 必须远大于主机环的 max_yaw_rate=0.08 ——
                                        这个 3 倍差就是"不抢主机"的分界线。 */
@@ -2384,6 +2459,8 @@ static void Drive_Apply(void)
        顺便把外环状态清零, 免得带着上一次攒的修正冲出去。 */
     if (!Drive_Ready())
     {
+        sat_now   |= SAT_NOT_READY;     /* ★ 上报: 就绪联锁生效, 主机发的速度被丢掉了 */
+        sat_latch |= SAT_NOT_READY;
 #if DRIVE_MODE_SEL == DRIVE_MODE_TORQUE
         Torque_Reset();     /* 力矩模式: 把我们的积分/输出清零(见 Torque_Reset) */
 #else
@@ -2407,6 +2484,14 @@ static void Drive_Apply(void)
 
     rpm_l = ClampF(rpm_l, -(float)MAX_RPM, (float)MAX_RPM);
     rpm_r = ClampF(rpm_r, -(float)MAX_RPM, (float)MAX_RPM);
+
+    /* ★ 轮速目标被 MAX_RPM 夹住了也要上报 —— 说明主机要的速度超出底盘能力,
+       它据此就知道"再怎么加也没用"。见 sat_now/sat_latch 的说明。 */
+    if (target_vx >= MAX_LIN_SPEED || target_vx <= -MAX_LIN_SPEED)
+    {
+        sat_now   |= (uint8_t)(SAT_RPM_L_CLAMP | SAT_RPM_R_CLAMP);
+        sat_latch |= (uint8_t)(SAT_RPM_L_CLAMP | SAT_RPM_R_CLAMP);
+    }
 
     /* ★ 偏航外环(用 IMU, 不看轮速) —— 见 Yaw_Trim 上面那一大段。
        放在逆解之后、两种驱动模式之前: 它只改"物理轮速目标", 所以速度模式和力矩
@@ -2699,7 +2784,7 @@ static void Send_MainTelemetry(uart_port_t *p)
     for (i = 0; i < TEL_FRAME_SIZE; i++) Port_SendByte(p, f[i]);
 }
 
-/* 扩展诊断帧 (0x7E, 32 字节) —— 本工程自定义, 厂商驱动不认识。
+/* 扩展诊断帧 (0x7E, 44 字节) —— 本工程自定义, 厂商驱动不认识。
  *
  * 完整布局见文件开头。这里只说为什么需要它:
  * 主遥测帧(24B)是厂商协议定死的, 没有地方放驱动器的输出电流和故障码。
@@ -2770,7 +2855,26 @@ static void Send_DiagFrame(uart_port_t *p)
                       (uint8_t)(selftest_no_move ? 0x80 : 0x00));
     f[31] = imu_ver_major;               /* 模块版本号 */
     PutI16(&f[32], imu_euler_yaw_crad);  /* 模块自己融合的偏航角 0.01rad */
-    /* f[34] = BCC, f[35] = 0x7D 下面填 */
+
+    /*======= [34] 起: 向上报的"饱和 / 保护"区 (2026-10-13 新增) =======
+     * 为什么给主机这些: 它要调自己的控制器, 必须知道**底盘做没做到它要的**。
+     * 以前只能看到"目标 vs 实际", 但看不出"目标是主机要的, 还是已经被夹过的"。
+     * 典型: 主机发 wz=0.5, 底盘只能给 0.35 —— 主机不知道就一直积分(windup),
+     *       表现为"越纠越偏"或"松手后猛冲"。伺服驱动都有这个饱和标志。
+     * 详细位定义见 sat_now/sat_latch 的说明。 */
+    if (!Drive_Ready())   sat_now |= SAT_NOT_READY;
+    if (failsafe_latched) sat_now |= SAT_FAILSAFE;
+    if (mot_wd_active)    sat_now |= SAT_MOT_WD;
+    if (link_wd_active)   sat_now |= SAT_LINK_WD;
+    f[34] = sat_now;                     /* 当前拍(瞬时) */
+    f[35] = sat_latch;                   /* 本上电周期发生过没有(锁存) */
+    PutU16(&f[36], (uint16_t)g_tick_ms);            /* 时间戳低16位, 65.5s 回绕 */
+    PutI16(&f[38], (int16_t)(target_vx * 1000.0f)); /* ★底盘**收到的**指令 vx mm/s */
+    PutI16(&f[40], (int16_t)(target_wz * 1000.0f)); /* ★底盘**收到的**指令 wz mrad/s
+        这两项让主机能回答两个它以前答不了的问题:
+          ① "我发的命令到底到了没有"(对比自己发出去的值)
+          ② "到了之后有没有被夹"(对比它自己发的值就知道) */
+    /* f[42] = BCC, f[43] = 0x7D 下面填 */
 
     for (i = 0; i < DIAG_FRAME_SIZE - 2; i++) bcc ^= f[i];
     f[DIAG_FRAME_SIZE - 2] = bcc;
@@ -2859,6 +2963,16 @@ int main(void)
          * 注意第 1 条是**锁存**的(failsafe_latched), 免得每个周期重复清 target;
          * 第 2 条不锁存 —— Relay_Set(0) 本身幂等, 而且链路恢复后必须能自动合回来。
          *-------------------------------------------------------------------*/
+        /* ★ 看门狗的**当前**状态要上报给主机 (sat_now 的 bit6/bit7)。
+           以前只有"断了之后 target 被清零"这个后果可见, 主机不知道是
+           "它自己的命令没到"还是"底盘把它丢了"。 */
+        mot_wd_active  = (uint8_t)((ever_linked) &&
+                                   ((g_tick_ms - last_cmd_ms)   > LINK_TIMEOUT_MS));
+        link_wd_active = (uint8_t)((ever_linked) &&
+                                   ((g_tick_ms - last_frame_ms) > LINK_TIMEOUT_MS));
+        if (mot_wd_active)  { sat_latch |= SAT_MOT_WD; }
+        if (link_wd_active) { sat_latch |= SAT_LINK_WD; }
+
         if ((failsafe_latched == 0) &&
             (ever_linked) &&
             ((g_tick_ms - last_cmd_ms) > LINK_TIMEOUT_MS))

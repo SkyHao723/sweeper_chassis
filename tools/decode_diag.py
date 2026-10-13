@@ -24,7 +24,7 @@
     python3 tools/decode_diag.py -p /dev/ttyUSB0 --dump raw.bin
     python3 tools/decode_diag.py -f raw.bin
 
-诊断帧布局 (36 字节, 多字节高字节在前):
+诊断帧布局 (44 字节, 多字节高字节在前):
     [0]     0x7E
     [1]     flags  bit0 曾收到命令 bit1 看门狗已停车 bit2 IMU有效 bit3 陀螺仪有效
                    bit4 上次复位是 IWDG(主循环卡死过)
@@ -51,7 +51,20 @@
                                   日志里留不下记号, 只能走这里
     [31]    IMU 版本号(主)
     [32-33] IMU 内部融合的偏航角 int16 0.01rad
-    [34]    BCC                     [35]   0x7D
+    ---- 以下 4 项 2026-10-13 新增(帧 36 -> 44 字节), 目的是"多给主机一些数据帮它调参" ----
+    [34]    ★ 饱和/保护状态 **当前拍**: 见 SAT_BITS
+    [35]    ★ 同上, 但**本上电周期发生过没有**(锁存)
+              位: bit0 vx指令被夹 bit1 wz指令被夹
+                  bit2/3 左右轮目标被夹到 MAX_RPM
+                  bit4 就绪联锁生效(只刹车) bit5 failsafe锁存
+                  bit6 运动看门狗生效 bit7 链路看门狗生效
+    [36-37] 底盘时基低 16 位 ms (65.5s 回绕) —— 给主机更好的时标
+    [38-39] ★ 底盘**收到的**指令 vx  mm/s
+    [40-41] ★ 底盘**收到的**指令 wz  mrad/s
+              这两项让主机能回答它以前答不了的两个问题:
+                ① "我发的命令到底到了没有"(和自己发出去的值比)
+                ② "到了之后有没有被夹"(和 MAX_LIN_SPEED/MAX_YAW_RATE 比)
+    [42]    BCC                     [43]   0x7D
 """
 
 import argparse
@@ -71,7 +84,7 @@ CMD_TAIL = 0x7D
 TEL_HEAD = 0x7B
 DIAG_HEAD = 0x7E
 TEL_SIZE = 24
-DIAG_SIZE = 36
+DIAG_SIZE = 44
 SEND_HZ = 20          # 和 STM32 的 CAN_PERIOD_MS 对齐, 上位机一般也是这个量级
 STOP_BURST = 15       # 退出前连发几帧零速, 保证车真的停下
 
@@ -150,6 +163,10 @@ def nominal_rpm(vx, wz, vehicle=0):
 
 def i16(b, i):
     return struct.unpack(">h", bytes(b[i:i + 2]))[0]
+
+
+def u16(b, i):
+    return struct.unpack(">H", bytes(b[i:i + 2]))[0]
 
 
 def tel_battery_mv(frame):
@@ -503,7 +520,8 @@ class Diag(object):
     __slots__ = ("flags", "vx", "wz", "wl", "wr", "tl", "tr",
                  "c1", "c2", "f1", "f2", "m1", "m2", "can_err",
                  "bad", "ok", "ovf", "relay", "imu_st", "imu_addr", "seq",
-                 "probe", "imu_ver", "euler_yaw", "vehicle", "selftest_nomove")
+                 "probe", "imu_ver", "euler_yaw", "vehicle", "selftest_nomove",
+                 "sat_now", "sat_latch", "tick_ms", "cmd_vx", "cmd_wz")
 
     def __init__(self, b):
         self.flags = b[1]
@@ -525,6 +543,12 @@ class Diag(object):
         self.selftest_nomove = (b[30] >> 7) & 0x01  # bit7 上电自检没转
         self.imu_ver = b[31]
         self.euler_yaw = i16(b, 32) / 100.0    # rad
+        # ---- [34] 起: 2026-10-13 新增的"饱和/保护"区 (帧 36 -> 44 字节) ----
+        self.sat_now   = b[34]      # 当前拍(瞬时), 位定义见 sat_text()
+        self.sat_latch = b[35]      # 本上电周期发生过没有(锁存)
+        self.tick_ms   = u16(b, 36) # 底盘时基低16位, 65.5s 回绕
+        self.cmd_vx    = i16(b, 38) # ★底盘**收到的**指令 vx (mm/s)
+        self.cmd_wz    = i16(b, 40) # ★底盘**收到的**指令 wz (mrad/s)
 
     def probe_text(self):
         """把 IMU 体检标志位翻成人话 —— 陀螺仪恒 0 时靠它定位问题。
@@ -623,7 +647,7 @@ class Diag(object):
         return ("seq=%-3d %s%s vx=%+5d wz=%+5d | "
                 "1号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s | "
                 "2号 目标%+4d 实际%+4d %+6.2fA %-4s %-4s%s | "
-                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s%s"
+                "can_err=%d 坏帧=%d 溢出=%d relay=%d imu=%s%s%s%s%s%s%s"
                 % (self.seq, vehicle_text(self.vehicle),
                    selftest_text(self.selftest_nomove), self.vx, self.wz,
                    self.tl, self.wl, self.c1 / 10.0,
@@ -631,7 +655,8 @@ class Diag(object):
                    self.tr, self.wr, self.c2 / 10.0,
                    mode_name(self.m2), fault_name(self.f2), trim,
                    self.can_err, self.bad, self.ovf, self.relay, imu, fl, bat, g, a,
-                   (" " + self.drive_text()) if self.drive_text() else ""))
+                   ((" " + self.drive_text()) if self.drive_text() else "") +
+                   sat_text(self.sat_now, self.sat_latch)))
 
     def drive_text(self):
         """诊断帧 [26] 的高位: 驱动模式 + 扭矩保护锁存。
@@ -648,6 +673,34 @@ class Diag(object):
         if self.relay & 0x08:
             out.append("**扭矩保护已锁存(超速/堵转, 只刹车)**")
         return "/".join(out)
+
+
+SAT_BITS = ((0x01, "vx指令被夹"), (0x02, "wz指令被夹"),
+            (0x04, "左轮目标被夹"), (0x08, "右轮目标被夹"),
+            (0x10, "驱动器未就绪只刹车"), (0x20, "failsafe锁存"),
+            (0x40, "运动看门狗生效"), (0x80, "链路看门狗生效"))
+
+
+def sat_text(now, latch):
+    """诊断帧 [34]/[35] (2026-10-13 新增, 帧从 36 字节扩到 44)。
+
+    ★ 为什么要印出来: 主机要调自己的控制器, 必须知道**底盘做没做到它要的**。
+      以前只有"目标 vs 实际", 看不出"目标是主机要的还是已经被夹过的"。
+      典型: 主机发 wz=0.5, 底盘只能给 0.35 —— 主机不知道就一直积分(windup),
+      表现为"越纠越偏"或"松手后猛冲"。
+
+    印法: **[34] 当前**用 `!` 标出, **[35] 曾经发生过**用 `~` 标出。
+      当前才在生效的(比如就绪联锁)看 [34]; 只想知道"这一趟出过什么事"看 [35]。"""
+    now_s   = [n for m, n in SAT_BITS if now & m]
+    latch_s = [n for m, n in SAT_BITS if (latch & m) and not (now & m)]
+    if not now_s and not latch_s:
+        return ""
+    out = []
+    if now_s:
+        out.append("sat[现在] " + ",".join(now_s))
+    if latch_s:
+        out.append("sat[曾] " + ",".join(latch_s))
+    return " " + " ".join(out)
 
 
 def vehicle_text(v):
