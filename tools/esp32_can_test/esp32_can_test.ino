@@ -57,6 +57,9 @@ typedef struct {
 static drv_state st1;
 static drv_state st2;
 static bool g_stop = false;     /* 串口 'x' 置位 */
+/* ★ g_arm_torque(串口 '4' 解锁力矩档)必须声明在这里 ——
+   poll_serial() 在下面几行就要用它, 放到后面会报 "was not declared in this scope"。 */
+static bool g_arm_torque = false;
 
 /* ★ 必须在每个阻塞循环里都调 —— 否则 hold() 跑那 3 秒期间按 'x' 停不下来。
    (第一版把串口检查只放在 loop() 里, 那是个安全漏洞。) */
@@ -193,7 +196,7 @@ static const char   *g_tq_name[TORQUE_STEPS] = { "0.5A", "1.0A", "2.0A", "4.0A",
 
 static int      g_phase = PH_COM;
 static int      g_step  = 0;
-static bool     g_arm_torque = false;   /* 串口 '4' 才置位 */
+/* (g_arm_torque 声明在文件上面 poll_serial 之前 —— 它先用) */
 static bool     g_abort = false;
 
 void setup()
