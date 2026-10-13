@@ -407,6 +407,41 @@ RK3588 是**非实时** Linux。它能"平均 50Hz"，但**没有任何实时保
 - **未安装** → SLAM / Nav2 的唯一环境输入缺失（`ros-integration.md` §7）
 - 装上后要改 `robot_model.yaml` 的 `base_to_laser`（**主机侧**）
 
+### 8.10 ★ 把 44 字节诊断帧接到 ROS 侧（固件已做完，**缺主机侧补丁**）
+
+**现状**：固件已经在向上发 44 字节诊断帧（左右轮速/目标/电流/故障码/饱和标志/
+看门狗状态/底盘收到的指令），**但厂商节点按设计把整帧跳过**，所以数据到不了 ROS 侧。
+
+**要做的**（位置已查到）：
+
+| 文件 | 位置 | 改什么 |
+|---|---|---|
+| `~/wheeltec/src/turn_on_wheeltec_robot/include/.../wheeltec_robot.h` | `#define RECEIVE_DATA_SIZE 24` | 加 `DIAG_FRAME_SIZE 44`、帧头常量、新 publisher |
+| 同上 | 类里的 publisher 列表 | 加 `/chassis_status`（先 `std_msgs/UInt8MultiArray` 跑通也行）|
+| `src/wheeltec_robot.cpp` | 收帧解析（约 L750 "Read and verify the data … frame by frame"）| 在 24 字节帧之外**再识别 0x7E 帧**（头 0x7E / 尾 0x7D / BCC）→ 解析 → publish |
+
+**为什么不会破坏现有功能**：厂商的入帧条件是"上一字节是帧尾 0x7D、本字节是 0x7B"，
+而诊断帧头是 0x7E —— 所以**现在是整帧跳过**；显式识别只是**接管本来就被丢弃的字节**。
+
+**验收（纯编译 + 话题验证，不需要动车）**：
+```bash
+colcon build --packages-select turn_on_wheeltec_robot   # ★ 必须过
+ros2 topic hz /chassis_status                            # 应约 20Hz
+ros2 topic echo /chassis_status --once
+```
+
+**接过去之后 3588 才真正能"调参"**：
+
+| 主机能用它做什么 | 用哪些字段 |
+|---|---|
+| **不再对着做不到的目标积分**（消除 windup）| `[34]/[35]` 饱和标志 |
+| 确认命令**到了没有、被夹了没有** | `[38-41]` 底盘收到的指令 |
+| 诊断"一边轮子不动"（**现在完全看不见**）| `[6-9]` 左右轮实际转速 |
+| 分清"没给力"还是"给了力但不动" | `[14-17]` 驱动器电流 |
+| 发现底盘进过 failsafe / 看门狗 | `[34]/[35]` bit5-7 |
+| 更好的融合时标 | `[36-37]` 底盘时基 |
+
+
 ---
 
 ### 8.9 指令合理性检查 → **★ 归底盘，2026-10-13 失控后新增的缺口**
