@@ -1,6 +1,12 @@
 #include "stm32f10x.h"
-#include "Delay.h"
 #include "YbImu.h"
+
+/* ★ 本文件不再 include Delay.h。
+ *   Delay_ms() 走 SysTick 且把"1 us = 72 个周期"写死: HSE 起不来(实际跑
+ *   8 MHz HSI) 时同一个 Delay_ms(30) 会变成 270 ms。启动里 6 次 30 ms 就是
+ *   1.6 s, 超过 1 s 的 IWDG —— 表现成"上电就复位、永远进不了主循环"。
+ *   启动/主循环的等待统一改用下面的 Wait_Ms()(TIM2 时基 + 硬上限)。
+ *   Delay.c/Delay.h 仍留在工程里, 只是不再被调用。 */
 
 /*==========================================================================
  * 两驱差速底盘 —— 达妙 DM-H65 轮毂电机 (DM6540-1EC) 最小"忠实桥"固件
@@ -45,6 +51,9 @@
 #define MOTOR2_MST_ID       0x12        /* 右轮反馈帧 ID */
 
 #define WHEEL_R_M           0.0855f     /* 轮半径 m (171 mm 轮径 / 2) */
+/* ★ 电机方向系数。2026-10-21 实测: 发 vx=+0.1 时两个轮子都**倒着转**,
+   所以整体取反。改回 +1.0f 即恢复原方向; 左右若不一致, 再加两个独立宏。 */
+#define DM_DIR_SIGN         (-1.0f)
 #define TRACK_WIDTH_M       0.425f      /* 轮距 m, 按实车架修改! */
 #define MAX_OMEGA_RAD_S     30.0f       /* 单轮角速度上限 rad/s (~2.57 m/s) */
 
@@ -129,6 +138,24 @@
 /*=========================== 全局状态 =================================*/
 volatile uint32_t g_tick_ms;            /* TIM2 1 ms 时基, 中断里自增 */
 
+/*-------------------------- 启动阶段 / 错误码 --------------------------
+ * 通过 44 字节状态帧最后一个保留字节 [41] 上报。以前这里恒 0, 上电没数据时
+ * 只能猜"是没进主循环, 还是外设坏了"; 现在串口上直接能分开:
+ *   0 = 启动中        (本固件所有帧都在主循环里发, 所以串口上不会看到 0)
+ *   1 = 正常          (CAN 初始化成功, 且 IMU 至少成功读过一次)
+ *   2 = CAN 初始化失败 (已降级继续跑, canFail 会一直涨)
+ *   3 = IMU 从没读到  (已跳过, imu_ok=0, 遥测帧照发, 六轴填 0/上次值)
+ *   4 = CAN 和 IMU 都失败
+ * 这三个状态都**不影响**帧继续发 —— 外设坏只降级, 不阻塞。
+ *--------------------------------------------------------------------*/
+#define BOOT_STAGE_RUNNING      1
+#define BOOT_STAGE_CAN_FAIL     2
+#define BOOT_STAGE_IMU_FAIL     3
+#define BOOT_STAGE_BOTH_FAIL    4
+
+static uint8_t g_boot_stage;            /* 1 或 2, 由 CAN 初始化结果决定 */
+static uint8_t g_can_init_ok;           /* 1 = CAN_Init 返回成功 */
+
 /*----------------------------- 电机反馈 --------------------------------*/
 typedef struct
 {
@@ -164,6 +191,7 @@ static float    imu_gyro[3];            /* 角速度, 单位 rad/s */
    读失败时不清零 imu_accel_g/imu_gyro, 保留上一次的值 (旧行为)。 */
 static uint8_t  imu_ok;                 /* 1 = 最近一次读取成功(加速度有效) */
 static uint8_t  imu_gyro_ok;            /* 1 = 最近一次成功读取时角速度非零 */
+static uint8_t  imu_ever_ok;            /* 1 = 上电后至少成功读过一次(给 [41] 用) */
 static uint8_t  imu_status;             /* YBIMU_ST_* 失败原因, 0 = 正常 */
 static uint8_t  imu_found_addr;         /* 扫描到的 I2C 地址, 0 = 没扫到 */
 static uint32_t imu_diag_ms;            /* 上次总线检查/地址扫描的时刻 */
@@ -210,6 +238,31 @@ void TIM2_IRQHandler(void)
     }
 }
 
+/*==================== 不依赖 SysTick 的毫秒等待 ======================
+ * 为什么不用 Delay_ms:
+ *   Delay_us() 是 `SysTick->LOAD = 72 * xus`, 把系统时钟写死成 72 MHz。
+ *   如果 HSE 晶振没起振, SystemInit 会退回 8 MHz HSI, 此时 Delay_us(1000)
+ *   实际是 9 ms, Delay_ms(30) 实际 270 ms —— 启动里 6 次就 1.6 s, 超过
+ *   1 s 的 IWDG, 板子进不了主循环, 而且现场只能看到"上电没数据"。
+ *
+ * 这里用 TIM2 的 1 ms 时基等, 并且带 guard:
+ *   时基如果停摆(只可能发生在 Tick_Init 之前, 而它是最先调的), guard 到 0
+ *   就返回 —— 宁可少等一会儿, 也绝不在启动路径里永久卡住。
+ *===================================================================*/
+static void Wait_Ms(uint32_t ms)
+{
+    uint32_t start = g_tick_ms;
+    uint32_t guard = ms * 20000u + 20000u;
+
+    while ((g_tick_ms - start) < ms)
+    {
+        if (--guard == 0)
+        {
+            return;                     /* 时基异常: 不在这里把整机拖死 */
+        }
+    }
+}
+
 /*=========================== 独立看门狗 ===============================
  * 为什么必须有 IWDG:
  *   软件看门狗 (命令超时) 本身就在主循环里。主循环一旦卡死, 它也跟着停,
@@ -236,7 +289,13 @@ static void IWDG_Init(void)
  * 只收标准帧: 达妙 DM 的控制帧/反馈帧都是 11 bit 标准帧, 旧固件的
  * 扩展帧 (IDE=1) 是 FOC 驱动器的协议, 已随旧驱动器一起删除。
  */
-static void CAN1_Init(void)
+/* 返回 1 = 初始化成功, 0 = 失败(超时/进不了初始化模式)。
+ * ★ 以前这里忽略 CAN_Init() 的返回值, 而且外面没有超时 —— 照标准库的写法,
+ *   只要调用方套一层 `while (CAN_InitStatus_Failed == CAN_Init(...))` 就是
+ *   永久卡死。本函数**不重试**: 失败就返回 0, 由调用方标记 boot_stage=2
+ *   后照常进主循环, 发送失败的帧由 canFail 计数反映。
+ *   标准库 CAN_Init 自己等 INAK 的上限是 INAK_TIMEOUT(0xFFFF 次), 有界。 */
+static uint8_t CAN1_Init(void)
 {
     GPIO_InitTypeDef gpio;
     CAN_InitTypeDef can;
@@ -271,7 +330,10 @@ static void CAN1_Init(void)
     can.CAN_BS1 = CAN_BS1_6tq;
     can.CAN_BS2 = CAN_BS2_2tq;
     can.CAN_Prescaler = 4;
-    CAN_Init(CAN1, &can);
+    if (CAN_Init(CAN1, &can) != CAN_InitStatus_Success)
+    {
+        return 0;                   /* 有界失败: 不重试, 不让启动卡在这里 */
+    }
 
     /* 接收全部通过, 软件里只认 0x11/0x12。总线上只有两台电机, 没必要
        为两个 ID 配硬件过滤; 过滤全开还能顺带看到参数写回帧, 便于排查。 */
@@ -285,6 +347,8 @@ static void CAN1_Init(void)
     filter.CAN_FilterFIFOAssignment = CAN_Filter_FIFO0;
     filter.CAN_FilterActivation = ENABLE;
     CAN_FilterInit(&filter);
+
+    return 1;
 }
 
 static void Can_TxFail(void)
@@ -474,7 +538,7 @@ static void CAN1_Poll(void)
  * 几毫秒, 不靠中断就会 ORE 丢命令字节。
  *=====================================================================*/
 #define RX_RING_SIZE        64
-#define USART_TX_TIMEOUT    20000
+#define USART_TX_TIMEOUT_MS 2           /* 单字节等 TXE 的硬上限, 正常只要 87 us */
 
 static volatile uint8_t g_rx_ring[RX_RING_SIZE];
 static volatile uint8_t g_rx_head;
@@ -498,24 +562,32 @@ void USART1_IRQHandler(void)
     }
 }
 
-/* 非阻塞发字节, 但带超时:
- * 原旧固件这里是 `while (TXE == RESET) {}` 死等, USART 一旦状态异常就
- * 永久卡死; 配合软件看门狗一起死, 车会保持最后速度。现在最多等
- * 20000 次循环 (~几 ms), 发不出去就丢这一字节, 由上位机的帧校验兜底。
+/* 发一个字节。返回 1 = 已写进 DR, 0 = 超时丢弃。
+ *
+ * ★ 这里是"发了 0x7B 就停"最值得怀疑的地方, 所以上限必须说清楚:
+ *   旧写法是 `while (TXE == RESET && --timeout)` 配 20000 次循环。它确实
+ *   有界, 但 -O0 下每次循环都要调用一次 USART_GetFlagStatus(), 20000 次
+ *   约 2~4 ms/字节; 一帧 68 字节最坏能吃掉 150~270 ms, 主循环看起来就像
+ *   "发到第 4 个字节卡住了"。现在改成 **2 ms 硬期限**(正常一字节只要
+ *   87 us, 差 20 倍), 超时就返回 0, 调用方立刻放弃本帧 —— 下一帧重新
+ *   同步, 绝不会停在半帧上。
+ *
+ *   注意: 真正"卡在第 4 个字节"还需要 MCU 本身被复位/挂死, 光靠本函数
+ *   是做不到的; 现场那次 4 字节的实测原因是主机侧抢串口(见交付说明)。
  */
-static void Port_SendByte(uint8_t value)
+static uint8_t Port_SendByte(uint8_t value)
 {
-    uint32_t timeout = USART_TX_TIMEOUT;
+    uint32_t start = g_tick_ms;
 
-    while ((USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET) &&
-           (--timeout != 0))
+    while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET)
     {
-    }
-    if (timeout == 0)
-    {
-        return;
+        if ((g_tick_ms - start) > USART_TX_TIMEOUT_MS)
+        {
+            return 0;
+        }
     }
     USART_SendData(USART1, value);
+    return 1;
 }
 
 static void USART1_Init(void)
@@ -748,7 +820,28 @@ static void PutU16(uint8_t *p, uint16_t v)
  *   地址扫描 (0x08~0x77) 只在"车停着"且最多 1 Hz 时做。因此即使 IMU
  *   拔掉/总线短路, 主循环也能在几十毫秒内回到顶部继续喂狗 ——
  *   不会出现"I2C 读失败 -> 主循环卡死 -> 狗咬"。
+ *
+ * ★ 启动路径里**一次 I2C 都不碰**: 见下面的 IMU_BootInit()。第一次真正的
+ *   读取发生在主循环 20 ms 任务里; 读失败只是 imu_ok=0, 帧照发。
  *=====================================================================*/
+
+/* IMU 的"初始化"= 什么都不做, 只把两个诊断时间戳拨到当前。
+ *
+ * 为什么不在这里读一次/扫一次:
+ *   - 位翻转 I2C 的单次等待都有界, 但"扫 0x08~0x77"最坏要 100 ms 量级;
+ *     把它放在启动路径里, 就等于让一个可能拔掉的 IMU 决定整机上电时间。
+ *   - 上电时 IMU 本身也可能还没启动完, 这时候读失败不代表坏了。
+ * 所以启动阶段只记时间戳: 第一次总线检查/地址扫描被推迟到进主循环 1 s
+ * 之后(而且仍然只在 g_eff_vx/wz == 0 的停车状态才扫), 寄存器体检同理。
+ */
+static void IMU_BootInit(void)
+{
+    imu_diag_ms = g_tick_ms;
+    imu_probe_ms = g_tick_ms;
+    imu_status = YBIMU_ST_OK;       /* 还没读过: 不冒充失败码, 真伪看 flags bit7 */
+    imu_found_addr = 0;
+}
+
 static void IMU_Tick(void)
 {
     float accel[3];
@@ -776,6 +869,7 @@ static void IMU_Tick(void)
         }
 
         imu_ok = 1;
+        imu_ever_ok = 1;
         imu_status = YBIMU_ST_OK;
         imu_found_addr = YBIMU_I2C_ADDR;
     }
@@ -903,8 +997,10 @@ static void Send_MainTelemetry(void)
     right_fresh = (uint8_t)(g_fb_seen[1] &&
                             ((g_tick_ms - g_last_fb_ms[1]) <= WHEEL_STALE_MS));
 
-    v_left = left_fresh ? (g_motor[0].vel_rad_s * WHEEL_R_M) : 0.0f;
-    v_right = right_fresh ? (g_motor[1].vel_rad_s * WHEEL_R_M) : 0.0f;
+    /* ★ 上报的 vx/wz 由**实际反馈**反解, 所以反馈也要乘 DM_DIR_SIGN ——
+       否则命令往前走、上报却说在往后。 */
+    v_left = left_fresh ? (DM_DIR_SIGN * g_motor[0].vel_rad_s * WHEEL_R_M) : 0.0f;
+    v_right = right_fresh ? (DM_DIR_SIGN * g_motor[1].vel_rad_s * WHEEL_R_M) : 0.0f;
 
     vx_mm = ClampToI16((v_left + v_right) * 0.5f * 1000.0f);
     wz_mrad = ClampToI16((v_right - v_left) / TRACK_WIDTH_M * 1000.0f);
@@ -936,7 +1032,11 @@ static void Send_MainTelemetry(void)
 
     for (i = 0; i < TEL_FRAME_SIZE; i++)
     {
-        Port_SendByte(f[i]);
+        if (!Port_SendByte(f[i]))
+        {
+            /* USART 状态异常: 放弃本帧, 下一帧重新发。绝不在这里拖住主循环 */
+            return;
+        }
     }
 }
 
@@ -994,9 +1094,9 @@ static void Control_Tick(void)
     v_left = vx - wz * (TRACK_WIDTH_M * 0.5f);
     v_right = vx + wz * (TRACK_WIDTH_M * 0.5f);
 
-    g_target_omega[0] = ClampF(v_left / WHEEL_R_M,
+    g_target_omega[0] = DM_DIR_SIGN * ClampF(v_left / WHEEL_R_M,
                                -MAX_OMEGA_RAD_S, MAX_OMEGA_RAD_S);
-    g_target_omega[1] = ClampF(v_right / WHEEL_R_M,
+    g_target_omega[1] = DM_DIR_SIGN * ClampF(v_right / WHEEL_R_M,
                                -MAX_OMEGA_RAD_S, MAX_OMEGA_RAD_S);
 
     /* 反馈超时的轮子目标清零: 驱动器可能已经掉线, 继续发旧目标没有意义,
@@ -1042,12 +1142,30 @@ static void Control_Tick(void)
  *   [38] IMU 扫描到的 I2C 地址 (0 = 没扫到)
  *   [39] IMU 体检标志: bit0 版本 bit1 陀螺 bit2 磁力
  *        bit7 = imu_gyro_ok (这次上电读到过非零角速度; 读失败会清)
- *   [40] IMU 版本号主字节             [41] 保留 0
+ *   [40] IMU 版本号主字节
+ *   [41] 启动阶段/错误码 (以前恒 0):
+ *        0=启动中(串口上不会出现, 帧都在主循环里发) 1=正常
+ *        2=CAN 初始化失败已降级  3=IMU 从没读到已跳过  4=两者都失败
+ *        ★ 这一字节只做诊断, 不改任何已有字段的含义。
  *   [42] BCC = XOR(f[0..41])         [43] 0x7D
  *
  * 为什么把"目标"也报上去: 上位机只有同时看到"目标"和"实际", 才能区分
  * "电机没执行"和"我正在被轮速上限夹"。目标已经是逆解+限幅后的最终值。
  *=====================================================================*/
+/* 启动阶段码, 只在诊断帧 [41] 里用:
+ *   CAN 初始化结果(g_boot_stage) 与 "IMU 上电后有没有成功读过一次" 组合。
+ *   imu_ever_ok 而不是 imu_ok: 偶发一次读失败不该把阶段码来回抖成 3。
+ */
+static uint8_t BootStage(void)
+{
+    if (!imu_ever_ok)
+    {
+        return (g_boot_stage == BOOT_STAGE_RUNNING) ? BOOT_STAGE_IMU_FAIL
+                                                    : BOOT_STAGE_BOTH_FAIL;
+    }
+    return g_boot_stage;
+}
+
 static uint16_t FbAge(uint8_t idx, uint32_t now)
 {
     uint32_t age;
@@ -1141,7 +1259,7 @@ static void Status_Send(uint32_t now)
     f[38] = imu_found_addr;
     f[39] = (uint8_t)(imu_probe_flags | (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));
     f[40] = imu_ver_major;
-    f[41] = 0;
+    f[41] = BootStage();            /* 启动阶段/错误码, 见帧格式说明 */
 
     for (i = 0; i < STATUS_FRAME_SIZE - 2; i++)
     {
@@ -1150,11 +1268,15 @@ static void Status_Send(uint32_t now)
     f[STATUS_FRAME_SIZE - 2] = bcc;
     f[STATUS_FRAME_SIZE - 1] = STATUS_TAIL;
 
-    /* 阻塞发送。115200 下 44 字节约 3.8 ms; 控制周期 20 ms, 留有余量。
+    /* 阻塞发送, 但每个字节都有 2 ms 硬上限(见 Port_SendByte):
+       115200 下 44 字节约 3.8 ms; 控制周期 20 ms, 留有余量。
        不引入 TX 中断/双缓冲, 是为了让这份"桥"尽量少的状态机。 */
     for (i = 0; i < STATUS_FRAME_SIZE; i++)
     {
-        Port_SendByte(f[i]);
+        if (!Port_SendByte(f[i]))
+        {
+            return;                     /* 同上: 丢帧, 不拖住主循环 */
+        }
     }
 }
 
@@ -1168,51 +1290,97 @@ static void Status_Send(uint32_t now)
  * 为什么每个都重复 3 次: CAN 只在链路层有 ACK, 应用层没有"参数已写入"
  * 的确认 (除非再读回)。驱动器上电/看门狗复位时可能还没准备好接收
  * 0x7FF 写帧, 单发一次会静默丢失。重复 3 次 + 30 ms 间隔, 覆盖这个窗口。
+ *
+ * ★ 这里**只发不等**: 不发读回、不等 0x7FF 应答, 所以不会出现"驱动器不理
+ *   我 -> 启动卡住"。等待只来自 CAN1_SendFrame 的发送完成轮询(8000 次上限)
+ *   和 30 ms 间隔。
+ * ★ 总预算 400 ms (tick 计): 就算 HSE 没起来导致时基慢 9 倍、或者 CAN 每次
+ *   都发不出去, 两轮重试也会在预算用完时提前收手, 保证启动一定走完。
+ *   每轮之间都喂狗, 30 ms 的等待不会变成 IWDG 复位。
  *=====================================================================*/
 static void Motors_Startup(void)
 {
     uint8_t i;
+    uint32_t start = g_tick_ms;
 
     for (i = 0; i < 3; i++)
     {
         DM_ParamWrite(MOTOR1_CAN_ID, DM_RID_CTRL_MODE, DM_MODE_VELOCITY);
         DM_ParamWrite(MOTOR2_CAN_ID, DM_RID_CTRL_MODE, DM_MODE_VELOCITY);
-        Delay_ms(30);
-        IWDG_ReloadCounter();
+        IWDG_ReloadCounter();           /* 先喂狗再等, 缩短喂狗间隔 */
+        Wait_Ms(30);
+        if ((g_tick_ms - start) > 400u)
+        {
+            break;                      /* 启动预算用完: 剩下的重试不再做 */
+        }
     }
 
     for (i = 0; i < 3; i++)
     {
         DM_SendEnable(MOTOR1_CAN_ID);
         DM_SendEnable(MOTOR2_CAN_ID);
-        Delay_ms(30);
         IWDG_ReloadCounter();
+        Wait_Ms(30);
+        if ((g_tick_ms - start) > 400u)
+        {
+            break;
+        }
     }
+
+    IWDG_ReloadCounter();
 }
 
-/*============================== main =================================*/
+/*============================== main =================================
+ * 启动顺序的原则: 每一步都有硬上限, 外设失败只降级、不阻塞。
+ *
+ *   Tick_Init        无等待
+ *   CAN1_Init        标准库等 INAK 上限 0xFFFF 次; 失败返回 0, **不重试**
+ *   0 速度帧        只等发送完成(8000 次上限), CAN 坏就计数
+ *   USART1_Init     无等待
+ *   LED_Init        无等待
+ *   IWDG_Init       无等待
+ *   Motors_Startup  3+3 次重试, 每轮喂狗; 总预算 400 ms, 只发不等应答
+ *   IMU_BootInit    **不做任何 I2C 访问**, 只记时间戳(扫描推迟到主循环)
+ *
+ * 也就是说: 从复位到进主循环的最坏路径 ≈ CAN 初始化几 ms + 启动 400 ms,
+ * 而且中间反复喂狗; 无论 IMU 插没插、CAN 通不通, 都一定能进主循环开始
+ * 发 0x7B/0x7E 帧。进不去只可能是时钟/供电这种更底层的问题 —— 那种情况下
+ * 44 字节帧的 [41] 也帮不上忙, 但至少不会"看起来像外设卡死"。
+ *===================================================================*/
 int main(void)
 {
     uint32_t now;
     uint32_t last_ctrl_ms;
     uint32_t last_status_ms;
 
-    Tick_Init();            /* 先有时基, 后面所有调度都靠它 */
-    CAN1_Init();            /* 1 Mbps, 标准帧 */
+    Tick_Init();            /* 先有时基, 后面所有调度/超时都靠它 */
+
+    /* CAN 初始化失败不拦启动: 标记 boot_stage=2, 帧照发, canFail 会反映。 */
+    g_can_init_ok = CAN1_Init();            /* 1 Mbps, 标准帧 */
+    g_boot_stage = g_can_init_ok ? BOOT_STAGE_RUNNING : BOOT_STAGE_CAN_FAIL;
 
     /* ★ CAN 一通先发 0 速度, 不等 USART/LED/看门狗初始化:
        看门狗复位时驱动器还在执行复位前最后一条速度命令, 每多等 1 ms
        车就多冲一点。DM 在速度模式下收到 0 会主动刹住; 若它还在 MIT
        模式, 这个 4 字节帧会被忽略, 不会造成动作。 */
-    DM_SendSpeed(MOTOR1_CAN_ID, 0.0f);
-    DM_SendSpeed(MOTOR2_CAN_ID, 0.0f);
+    if (g_can_init_ok)
+    {
+        DM_SendSpeed(MOTOR1_CAN_ID, 0.0f);
+        DM_SendSpeed(MOTOR2_CAN_ID, 0.0f);
+    }
 
     USART1_Init();          /* PA9/PA10, 115200, 中断收 */
     LED_Init();             /* PB9 心跳 */
     IWDG_Init();            /* 开狗; 后面初始化步骤都会喂 */
+    IWDG_ReloadCounter();
 
-    /* 写模式 + 使能。整个启动约 180 ms, 远小于 1 s 看门狗。 */
+    /* 写模式 + 使能。最长 400 ms, 每轮喂狗, 里面不等任何应答。 */
     Motors_Startup();
+
+    /* IMU: 启动阶段**不读、不扫**, 只把诊断时间戳拨到现在。
+       第一次真正读取在主循环 20 ms 任务里; 失败只是 imu_ok=0。 */
+    IMU_BootInit();
+    IWDG_ReloadCounter();
 
     /* 时基起点。启动期间上位机可能已经发了命令 (在环形缓冲里), 主循环
        第一圈就会解析并刷新 g_last_cmd_ms。 */
@@ -1249,8 +1417,9 @@ int main(void)
             Status_Send(now);       /* 44 字节诊断帧 */
         }
 
-        /* 1 ms 让出 CPU。所有周期任务都是基于 g_tick_ms 的非阻塞调度,
-           这里的延时只影响最小轮询粒度, 不影响控制/上报周期。 */
-        Delay_ms(1);
+        /* 1 ms 让出 CPU。用 Wait_Ms 而不是 Delay_ms:
+           后者写死 72 MHz, HSE 没起来时会慢 9 倍(1 ms -> 9 ms), 整个调度
+           节拍跟着歪; Wait_Ms 走 TIM2 时基, 而且有 guard 上限。 */
+        Wait_Ms(1);
     }
 }
