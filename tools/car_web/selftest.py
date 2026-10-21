@@ -977,7 +977,7 @@ def run(checker: Checker, base: str, args) -> None:
     post_json(base, "/api/stop", {"hard": True})
     time.sleep(0.15)
 
-    # wz 上限 1.5 rad/s：固件单轮需要 |wz|*TRACK/2/r = 3.73 rad/s，远小于 30。
+    # wz 上限 1.5 rad/s：按 456 mm 轮距，固件单轮需要 |wz|*TRACK/2/r = 4.00 rad/s，远小于 30。
     hold_cmd(base, 0.0, 9.0, 1.0)
     st = wait_state(base, lambda s: s["cmd"]["target_wz"] == 1.5
                     and abs(s["cmd"]["tx_wz"] - 1.5) <= 0.01, 1.5)

@@ -86,8 +86,12 @@ ACC_LSB = 1671.84        # raw / 1671.84 = m/s²
 GYRO_LSB = 0.00026644    # raw * 0.00026644 = rad/s
 
 # 底盘几何（只用于界面换算显示，不参与控制）
+# 轮距 456 mm 是 2026-10 新底盘实测值；旧值是 425 mm。
+# ⚠ 真正决定实车转弯/里程的是固件 firmware/stm32-chassis/user/main.c 里的
+#   TRACK_WIDTH_M；本文件的常量只影响 --sim 仿真和界面换算。固件没同步成
+#   0.456 之前，真机回转半径/里程仍按 0.425 计算。
 WHEEL_R_M = 0.0855
-TRACK_WIDTH_M = 0.425
+TRACK_WIDTH_M = 0.456
 WHEEL_OMEGA_MAX = 30.0   # 固件限幅，界面条形图按这个满量程画
 
 # 速度档位（6 档）：vx 上限 0.15 → 1.60 m/s；wz 同步收紧，
@@ -106,7 +110,7 @@ GEAR_ORDER = ("low", "mid", "high", "fast", "sprint", "ultra")
 # 硬上限：档位只能更小。**绝不能超过固件能力**：
 #   WHEEL_OMEGA_MAX 30 rad/s × WHEEL_R_M 0.0855 m = 2.565 m/s。
 # 这里取 2.0 m/s 留 0.565 m/s 余量；转向最坏情况
-#   |vx| + |wz|*TRACK/2 = 2.0 + 1.5*0.2125 = 2.319 m/s → 27.1 rad/s < 30，
+#   |vx| + |wz|*TRACK/2 = 2.0 + 1.5*0.228 = 2.342 m/s → 27.4 rad/s < 30，
 # 所以极限组合也不会被固件削。改大之前先把这条算式重算一遍。
 HARD_VX_LIMIT = 2.00
 HARD_WZ_LIMIT = 1.50
