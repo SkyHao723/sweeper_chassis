@@ -2,27 +2,34 @@
 # -*- coding: utf-8 -*-
 """car_web.py --sim 离线自测。
 
-覆盖两批断言：
+覆盖断言（共 39 项）：
   * 原有 22 项：页面/静态资源、24/44 字节帧解析、BCC、档位夹取、轮速跟随、
     里程、急停锁存/复位、500 ms 心跳超时、非法档位、NaN、WebSocket 断开清零、
     真实浏览器无 JS 异常 / 无横向溢出 / canvas 有绘制。
-  * 新增 11 项（23~33）：
+  * 方向/斜坡基础（23~33）：
     23 右推指令 → 真正发给串口的 wz < 0
     24 11 字节命令帧字段为 -500 mrad
-    25 真实浏览器：已连接、无横向溢出、canvas 有绘制、无 JS 异常
-    26 真实浏览器右推摇杆 → wz<0；松手 → 立刻回 0
+    25 真实浏览器：已连接、无横向溢出、canvas 有绘制、无 JS 异常、6 档按钮
+    26 真实浏览器右推摇杆 → wz<0；松手 → 目标 0，软停后回 0
     27 UI 开关能设置/查询缓启缓停（默认开→关→开）
     28 缓启缓停开：0→0.3 m/s 约 100 ms 时实发在 (0, 0.3)
     29 斜坡最终到 0.3 m/s
     30 关闭斜坡：指令立即阶跃到目标
     31 斜坡开时急停仍立即归零
     32 斜坡开时心跳超时仍立即归零
-    33 斜坡开时 /api/stop（松手/回中）仍立即归零
+    33 斜坡开时 /api/stop {"hard":true}（页面隐藏/失焦）立即归零
+  * 新增软停/高速档（34~39）：
+    34 软停：0.3 m/s 松手约 100 ms 时实发仍 >0 且 <0.3（证明在减速）
+    35 软停：最终到 0，用时符合 RAMP_VX_DEC（0.3 / 0.40 ≈ 0.75 s）
+    36 斜坡开、0.8 m/s 行驶时急停仍立即归零（不按 2 s 的软停斜率）
+    37 斜坡开、0.8 m/s 行驶时心跳超时仍立即归零
+    38 最高档 ultra：实发 vx = 1.60 m/s，且不超过硬夹 2.0 / 固件 2.565
+    39 最高档 ultra：实发 wz = 1.50 rad/s，且轮速不超固件 30 rad/s
 
 用法（Windows / Linux 均可，只需要 Python 标准库）：
     cd tools/car_web
     python selftest.py                 # 自动找端口、--sim、跑完自动退出
-    python selftest.py --no-browser    # 没有浏览器的机器上跳过第 22/23 项
+    python selftest.py --no-browser    # 没有浏览器的机器上跳过 25/26/27
 
 退出码 0 = 全部 PASS（或有显式 SKIP），1 = 有 FAIL。
 """
@@ -47,6 +54,11 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 CAR_WEB = HERE / "car_web.py"
+
+# 为了直接引用 RAMP_VX_DEC / HARD_VX_LIMIT 等常量做断言（导入无副作用）。
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+import car_web  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -705,15 +717,22 @@ def run(checker: Checker, base: str, args) -> None:
                 canvasW: c.width, canvasH: c.height, painted: painted,
                 rampChecked: document.getElementById('rampToggle').checked,
                 rampState: document.getElementById('rampState').textContent,
+                gearCount: document.querySelectorAll('.gear-btn').length,
+                gearActive: (document.querySelector('.gear-btn.active') || {dataset: {}}).dataset.gear || '',
+                gearWarnHidden: document.getElementById('gearWarn').hidden,
+                cmdVxClass: document.getElementById('cmdVx').className,
                 jsErrors: 0
               };
             })()""")
             errors = [e for e in browser.cdp.events
                       if e.get("method") == "Runtime.exceptionThrown"]
-            checker.check(25, "真实浏览器：已连接、无横向溢出、canvas 有绘制、无 JS 异常",
+            checker.check(25, "真实浏览器：已连接、无溢出、canvas 有绘制、6 档按钮、无 JS 异常",
                           ok and meta and meta["overflow"] <= 1
                           and meta["canvasW"] > 0 and meta["canvasH"] > 0
-                          and meta["painted"] > 0 and len(errors) == 0,
+                          and meta["painted"] > 0 and len(errors) == 0
+                          and meta["gearCount"] == 6
+                          and meta["gearActive"] == "low"
+                          and meta["gearWarnHidden"] is True,
                           "meta=%s errors=%s" % (meta,
                                                  [e.get("params", {}).get("exceptionDetails", {}).get("text")
                                                   for e in errors[:3]]))
@@ -733,7 +752,7 @@ def run(checker: Checker, base: str, args) -> None:
             st = get_json(base, "/api/state")
             right_ok = (st["cmd"]["wz"] < 0 and st["cmd"]["tx_wz"] < 0
                         and st["status"]["cmd_wz"] < 0)
-            # 松手：前端立刻发 0，服务端目标也应为 0
+            # 松手：前端发普通 0（不是 hard），后端目标立即 0，实发按 DEC 软停
             browser.cdp.eval("""(() => {
               const pad = document.getElementById('pad');
               pad.dispatchEvent(new PointerEvent('pointerup', {
@@ -741,12 +760,16 @@ def run(checker: Checker, base: str, args) -> None:
               }));
               return true;
             })()""")
-            time.sleep(0.25)
-            st2 = get_json(base, "/api/state")
-            checker.check(26, "真实浏览器右推摇杆 → wz<0；松手 → 立刻回 0",
+            st2 = wait_state(base, lambda s: s["cmd"]["wz"] == 0, 1.0)
+            # wz 从 -0.50 按 1.5 rad/s² 收回约需 0.33 s；网页 20 Hz 心跳还在，
+            # 不会被 500 ms 超时截断。
+            st3 = wait_state(base, lambda s: s["cmd"]["tx_wz"] == 0
+                             and s["cmd"]["tx_vx"] == 0, 1.5)
+            checker.check(26, "真实浏览器右推摇杆 → wz<0；松手 → 目标 0，软停后实发 0",
                           right_ok and st2["cmd"]["wz"] == 0
-                          and st2["cmd"]["tx_wz"] == 0,
-                          "right=%s release=%s" % (st["cmd"], st2["cmd"]))
+                          and st3["cmd"]["tx_wz"] == 0
+                          and st3["cmd"]["tx_vx"] == 0,
+                          "right=%s release=%s" % (st["cmd"], st3["cmd"]))
 
             # 浏览器里点开关：服务端 /api/ramp 跟着变，且默认是开
             ramp0 = get_json(base, "/api/ramp")
@@ -816,8 +839,8 @@ def run(checker: Checker, base: str, args) -> None:
     st = wait_state(base, lambda s: s["cmd"]["tx_vx"] > 0.25, 1.0)
     t_estop = time.monotonic()
     post_json(base, "/api/estop", {})
-    # 等 STM32 回读变成 0（状态帧 20 Hz，最多 ~50 ms）；若走斜坡，
-    # 从 0.3 降到 0 需要 300 ms，不可能在 250 ms 内精确回读 0。
+    # 等 STM32 回读变成 0（状态帧 20 Hz，最多 ~50 ms）；若走软停，
+    # 从 0.3 降到 0 需要 0.75 s，不可能在 250 ms 内精确回读 0。
     st = wait_state(base, lambda s: s["status"] and s["status"]["cmd_vx"] == 0
                     and s["cmd"]["reason"] == "estop", 0.35)
     elapsed = (time.monotonic() - t_estop) * 1000.0
@@ -842,16 +865,137 @@ def run(checker: Checker, base: str, args) -> None:
                   and st["status"]["cmd_vx"] == 0,
                   "cmd=%s echo=%s" % (st["cmd"], st["status"]["cmd_vx"]))
 
-    # 33：/api/stop 立即归零
-    hold_cmd(base, 0.3, 0.0, 0.6)
+    # 33：hard:true（页面隐藏/失焦）仍然立即归零 —— 和松手/回中的软停区分开
+    hold_cmd(base, 0.3, 0.0, 0.7)
     st = wait_state(base, lambda s: s["cmd"]["tx_vx"] > 0.25, 1.0)
-    post_json(base, "/api/stop", {})
-    time.sleep(0.08)
-    st = get_json(base, "/api/state")
-    checker.check(33, "斜坡开时 /api/stop（松手/回中）立即归零",
+    t_hard = time.monotonic()
+    post_json(base, "/api/stop", {"hard": True})
+    st = wait_state(base, lambda s: s["cmd"]["tx_vx"] == 0
+                    and s["status"] and s["status"]["cmd_vx"] == 0, 0.35)
+    elapsed = (time.monotonic() - t_hard) * 1000.0
+    checker.check(33, "斜坡开时 hard:true（页面隐藏/失焦）立即归零",
                   st["cmd"]["tx_vx"] == 0 and st["cmd"]["tx_wz"] == 0
-                  and st["status"]["cmd_vx"] == 0,
-                  "cmd=%s echo=%s" % (st["cmd"], st["status"]["cmd_vx"]))
+                  and st["status"]["cmd_vx"] == 0
+                  and st["ramp"]["mode"] == "hard"
+                  and elapsed < 250.0,
+                  "cmd=%s mode=%s echo=%s %.0fms" % (
+                      st["cmd"], st["ramp"]["mode"],
+                      st["status"]["cmd_vx"], elapsed))
+
+    # ---------------- 34~35：主动停车 → 减速斜坡（软停）----------------
+    # 先把硬停锁存清掉：重新给非零指令即可。目标 0.3 加速 0.3 s 到位。
+    hold_cmd(base, 0.3, 0.0, 0.7)
+    st = wait_state(base, lambda s: s["cmd"]["tx_vx"] > 0.29, 1.0)
+    dec_expected = 0.30 / car_web.RAMP_VX_DEC     # 0.3 / 0.40 = 0.75 s
+
+    # 关键：软停期间必须持续发 0 保住 500 ms 心跳（真实网页松手后就是 20 Hz 发 0）。
+    t0 = time.monotonic()
+    sample = None
+    sample_state = None
+    zero_at = None
+    st = {}
+    while time.monotonic() - t0 < 1.6:
+        post_json(base, "/api/stop", {})
+        st = get_json(base, "/api/state")
+        el = time.monotonic() - t0
+        if sample is None and el >= 0.10:
+            sample = st["cmd"]["tx_vx"]
+            sample_state = st
+        if st["cmd"]["tx_vx"] == 0 and st["cmd"]["tx_wz"] == 0:
+            zero_at = el
+            break
+        time.sleep(0.02)
+
+    checker.check(34, "软停：0.3 m/s 松手约 100 ms 时实发仍 >0 且 <0.3（正在减速）",
+                  sample is not None and 0.05 < sample < 0.29
+                  and sample_state is not None
+                  and sample_state["ramp"]["mode"] == "decel"
+                  and sample_state["ramp"]["stopping"] is True,
+                  "sample=%s mode=%s" % (
+                      sample, sample_state and sample_state["ramp"]["mode"]))
+
+    checker.check(35, "软停最终到 0，用时符合 DEC 斜率（0.3 / 0.40 ≈ 0.75 s）",
+                  zero_at is not None
+                  and st["cmd"]["tx_vx"] == 0 and st["cmd"]["tx_wz"] == 0
+                  and abs(zero_at - dec_expected) <= 0.20
+                  and zero_at > 0.50,
+                  "zero_at=%s expected=%.2fs" % (
+                      zero_at is not None and round(zero_at, 3), dec_expected))
+
+    # ---------------- 36：高速行驶时急停仍立即停 ----------------
+    post_json(base, "/api/gear", {"gear": "fast"})       # 0.80 m/s
+    hold_cmd(base, 0.8, 0.0, 1.2)
+    st = wait_state(base, lambda s: s["cmd"]["tx_vx"] > 0.75, 1.5)
+    t_estop = time.monotonic()
+    post_json(base, "/api/estop", {})
+    st = wait_state(base, lambda s: s["cmd"]["reason"] == "estop"
+                    and s["cmd"]["tx_vx"] == 0
+                    and s["status"] and s["status"]["cmd_vx"] == 0, 0.35)
+    elapsed = (time.monotonic() - t_estop) * 1000.0
+    checker.check(36, "0.8 m/s 行驶中急停仍立即归零（软停本需 2.0 s）",
+                  st["cmd"]["reason"] == "estop"
+                  and st["cmd"]["tx_vx"] == 0
+                  and st["status"]["cmd_vx"] == 0
+                  and elapsed < 250.0,
+                  "cmd=%s echo=%s %.0fms" % (st["cmd"],
+                                             st["status"]["cmd_vx"], elapsed))
+    post_json(base, "/api/estop/reset", {})
+    time.sleep(0.1)
+
+    # ---------------- 37：高速行驶时心跳超时仍立即停 ----------------
+    hold_cmd(base, 0.8, 0.0, 1.2)
+    st = wait_state(base, lambda s: s["cmd"]["tx_vx"] > 0.75, 1.5)
+    time.sleep(0.56)                       # 500 ms 超时 + 2 拍
+    st = get_json(base, "/api/state")
+    checker.check(37, "0.8 m/s 行驶中心跳超时仍立即归零（软停本需 2.0 s）",
+                  st["cmd"]["reason"] == "timeout"
+                  and st["cmd"]["tx_vx"] == 0
+                  and st["status"]["cmd_vx"] == 0
+                  and st["ramp"]["mode"] == "hard",
+                  "cmd=%s mode=%s echo=%s" % (
+                      st["cmd"], st["ramp"]["mode"], st["status"]["cmd_vx"]))
+
+    # ---------------- 38~39：最高档位与硬上限 ----------------
+    post_json(base, "/api/estop/reset", {})
+    post_json(base, "/api/gear", {"gear": "ultra"})
+    post_json(base, "/api/ramp", {"on": True})
+    # 先给非零指令清掉 hard_stop 锁存；目标会被夹到 ultra 的 1.60。
+    hold_cmd(base, 5.0, 0.0, 2.0)
+    st = wait_state(base, lambda s: s["cmd"]["target_vx"] == 1.6
+                    and s["cmd"]["tx_vx"] >= 1.59, 1.5)
+    checker.check(38, "最高档 ultra：目标/实发 vx=1.60，且不超硬夹 2.0 与固件 2.565",
+                  st["gear"]["key"] == "ultra"
+                  and st["gear"]["vx"] == 1.6
+                  and st["cmd"]["target_vx"] == 1.6
+                  and abs(st["cmd"]["tx_vx"] - 1.6) <= 0.01
+                  and car_web.HARD_VX_LIMIT == 2.0
+                  and car_web.HARD_VX_LIMIT <= car_web.FIRMWARE_VX_MAX
+                  and 1.6 <= car_web.FIRMWARE_VX_MAX,
+                  "gear=%s cmd=%s hard=%s fw=%.3f" % (
+                      st["gear"], st["cmd"],
+                      car_web.HARD_VX_LIMIT, car_web.FIRMWARE_VX_MAX))
+    post_json(base, "/api/stop", {"hard": True})
+    time.sleep(0.15)
+
+    # wz 上限 1.5 rad/s：固件单轮需要 |wz|*TRACK/2/r = 3.73 rad/s，远小于 30。
+    hold_cmd(base, 0.0, 9.0, 1.0)
+    st = wait_state(base, lambda s: s["cmd"]["target_wz"] == 1.5
+                    and abs(s["cmd"]["tx_wz"] - 1.5) <= 0.01, 1.5)
+    wheel_need = car_web.HARD_WZ_LIMIT * car_web.TRACK_WIDTH_M / 2.0 / car_web.WHEEL_R_M
+    checker.check(39, "最高档 ultra：wz=1.50，轮速需求 %.2f < 固件 30 rad/s" % wheel_need,
+                  st["cmd"]["target_wz"] == 1.5
+                  and abs(st["cmd"]["tx_wz"] - 1.5) <= 0.01
+                  and car_web.HARD_WZ_LIMIT == 1.5
+                  and wheel_need < car_web.WHEEL_OMEGA_MAX
+                  and st["status"] is not None
+                  and abs(st["status"]["left"]["target"]) < car_web.WHEEL_OMEGA_MAX
+                  and abs(st["status"]["right"]["target"]) < car_web.WHEEL_OMEGA_MAX,
+                  "cmd=%s wheel_need=%.2f echo L/R=%s/%s" % (
+                      st["cmd"], wheel_need,
+                      st["status"] and st["status"]["left"]["target"],
+                      st["status"] and st["status"]["right"]["target"]))
+    post_json(base, "/api/stop", {"hard": True})
+    post_json(base, "/api/gear", {"gear": "low"})
 
 
 def main() -> int:

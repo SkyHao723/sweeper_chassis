@@ -1,7 +1,8 @@
 /* 小车遥控器前端：原生 JS，无构建、无外网依赖。
  *
  * 三个不变量（改代码时别破坏）：
- *   1. 只有"摇杆被按住 / 键盘按住"时目标才非 0；松手、切后台、断连一律发 0。
+ *   1. 只有"摇杆被按住 / 键盘按住"时目标才非 0；松手/回中发 0（后端软停），
+ *      页面隐藏/失焦/关闭发 0 + hard:true（后端立即停），断连一律停发。
  *   2. 指令按 20 Hz 持续发，服务端据此判活；停发 = 500 ms 后服务端自己归零。
  *   3. 急停是锁存的：本地立刻归零 + 通知服务端锁存，必须点"复位"才恢复。
  */
@@ -19,12 +20,21 @@
   // 串口、遥测/轮速按实际值显示，都不再取反。以后方向要改，只改这里。
   const WZ_CMD_SIGN = -1;
 
-  // 与服务端 GEARS 一致；这里也夹一次，保证界面显示的就是实际会发的值。
+  // 与服务端 GEARS 一致（6 档）；这里也夹一次，保证界面显示的就是实际会发的值。
+  // 默认 low：第一次打开页面、第一次推杆不会蹿出去。
   const GEARS = {
-    low:  { name: "低速", vx: 0.15, wz: 0.50 },
-    mid:  { name: "中速", vx: 0.30, wz: 0.75 },
-    high: { name: "高速", vx: 0.50, wz: 1.00 },
+    low:    { name: "低速", vx: 0.15, wz: 0.50 },
+    mid:    { name: "中速", vx: 0.30, wz: 0.75 },
+    high:   { name: "高速", vx: 0.50, wz: 1.00 },
+    fast:   { name: "快速", vx: 0.80, wz: 1.15 },
+    sprint: { name: "极速", vx: 1.20, wz: 1.30 },
+    ultra:  { name: "超快", vx: 1.60, wz: 1.50 },
   };
+  const GEAR_KEYS = ["low", "mid", "high", "fast", "sprint", "ultra"];
+
+  // 高速视觉提示：≥0.8 m/s 橙、≥1.2 m/s 红（README 也写了"高速档请空旷场地测试"）。
+  const SPEED_WARN = 0.8;
+  const SPEED_DANGER = 1.2;
 
   // 条形图满量程：固件单轮上限是 30 rad/s（≈2.57 m/s），但正常遥控只会用到
   // 0~5 rad/s；按 30 画条子几乎看不出变化，所以显示用 ±6，超出贴边。
@@ -124,6 +134,14 @@
   // ---------------------------------------------------------------------
   function limits() { return GEARS[S.gear] || GEARS.low; }
 
+  function renderSpeedClass(vx) {
+    const el = $("cmdVx");
+    if (!el) return;
+    const a = Math.abs(vx);
+    el.classList.toggle("speed-warn", a >= SPEED_WARN && a < SPEED_DANGER);
+    el.classList.toggle("speed-danger", a >= SPEED_DANGER);
+  }
+
   function applyTarget(vx, wz, force) {
     if (S.estop) { vx = 0; wz = 0; }
     const g = limits();
@@ -131,6 +149,7 @@
     S.target.wz = clamp(wz, -g.wz, g.wz);
     $("cmdVx").textContent = fmt(S.target.vx, 3);
     $("cmdWz").textContent = fmt(S.target.wz, 3);
+    renderSpeedClass(S.target.vx);
     const now = performance.now();
     // 指针移动事件可能到 60~120 Hz，限到 30 Hz 再发；20 Hz 的定时器兜底。
     if (force || now - S.lastCmdSent >= 33) sendCmd();
@@ -153,12 +172,25 @@
     if (cmdTimer) { clearInterval(cmdTimer); cmdTimer = null; }
   }
 
+  // 普通停车（松手/回中/主动停止）：目标发 0，后端按减速斜率软停。
   function zeroTarget() {
     S.target.vx = 0;
     S.target.wz = 0;
     $("cmdVx").textContent = fmt(0, 3);
     $("cmdWz").textContent = fmt(0, 3);
+    renderSpeedClass(0);
     sendCmd();
+  }
+
+  // 安全停车（页面隐藏/失焦/pagehide）：带 hard:true 发 0，后端立即归零，
+  // 不经过减速斜坡 —— 此时用户可能已经看不到车了。
+  function hardStop() {
+    S.target.vx = 0;
+    S.target.wz = 0;
+    $("cmdVx").textContent = fmt(0, 3);
+    $("cmdWz").textContent = fmt(0, 3);
+    renderSpeedClass(0);
+    send({ t: "cmd", vx: 0, wz: 0, hard: true });
   }
 
   // ---------------------------------------------------------------------
@@ -269,8 +301,8 @@
       applyTarget(0, 0, true);
       return;
     }
-    if (ev.code === "Digit1" || ev.code === "Digit2" || ev.code === "Digit3") {
-      setGear(["low", "mid", "high"][Number(ev.code.slice(-1)) - 1]);
+    if (/^Digit[1-6]$/.test(ev.code)) {
+      setGear(GEAR_KEYS[Number(ev.code.slice(-1)) - 1]);
       return;
     }
     if (KEY_MAP[ev.code]) {
@@ -296,6 +328,20 @@
     });
     const g = limits();
     $("limitPill").textContent = `${g.name} · ${g.vx.toFixed(2)} m/s · ${g.wz.toFixed(2)} rad/s`;
+    const pill = $("limitPill");
+    pill.classList.toggle("warn", g.vx >= SPEED_WARN && g.vx < SPEED_DANGER);
+    pill.classList.toggle("danger", g.vx >= SPEED_DANGER);
+    // 高速档醒目标签：≥0.8 橙、≥1.2 红。
+    const warn = $("gearWarn");
+    if (warn) {
+      const fast = g.vx >= SPEED_DANGER ? "danger" : (g.vx >= SPEED_WARN ? "warn" : "");
+      warn.className = "gear-warn" + (fast ? " " + fast : "");
+      warn.hidden = !fast;
+      warn.textContent = g.vx >= SPEED_DANGER
+        ? `⚠ ${g.name} ${g.vx.toFixed(2)} m/s · 高速危险，只在空旷场地测试`
+        : (fast ? `⚠ ${g.name} ${g.vx.toFixed(2)} m/s · 请在空旷场地测试` : "");
+    }
+    renderSpeedClass(S.target.vx);
   }
 
   function setGear(key) {
@@ -328,8 +374,8 @@
     const hint = $("rampHint");
     if (hint) {
       hint.textContent = S.rampOn
-        ? "正常指令按受控斜率过渡；松手、切页、急停、超时仍立即归零"
-        : "已关闭：指令直接阶跃到目标（旧行为）";
+        ? "加速 1.0、减速 0.40 m/s²；松手/回中会“缓停中”，切页/失焦/急停/超时立即归零"
+        : "已关闭：加速和停车都直接阶跃到目标（旧行为）";
     }
   }
 
@@ -643,9 +689,19 @@
         renderRamp();
       }
       const live = $("rampLive");
-      if (live) live.textContent = m.ramp.active ? "斜坡中" : "";
+      const mode = m.ramp.mode || (m.ramp.active ? "accel" : "idle");
+      const slowing = mode === "decel";
+      if (live) {
+        live.textContent = slowing ? "缓停中"
+          : (mode === "accel" ? "斜坡中"
+            : (mode === "hard" && m.cmd && m.cmd.reason === "web" ? "立即停" : ""));
+        live.className = "ramp-live" + (slowing ? " warn" : "");
+      }
       const row = $("rampRow");
-      if (row) row.classList.toggle("ramping", !!m.ramp.active);
+      if (row) {
+        row.classList.toggle("ramping", !!m.ramp.active);
+        row.classList.toggle("stopping", slowing);
+      }
     }
 
     const wasEstop = S.estop;
@@ -739,7 +795,12 @@
   window.addEventListener("resize", () => { S.canvasW = S.canvasH = 0; drawWave(); });
 
   // ---------------------------------------------------------------------
-  // 页面生命周期：切后台/关闭 = 立刻停
+  // 页面生命周期：切后台/失焦/关闭 = **立即停**（安全停车，不软停）
+  //
+  // 和"松手/回中"的区别：
+  //   * 松手/回中：用户还在看着页面，走减速斜坡，手感软；
+  //   * 页面隐藏/失焦/关闭：用户可能已经看不到车了，必须立即归零。
+  // 实现上给后端发 hard:true，后端在 step_output() 里直接置 0。
   // ---------------------------------------------------------------------
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
@@ -747,18 +808,18 @@
       S.dragId = null;
       pad.classList.remove("active");
       resetKnob();
-      zeroTarget();
+      hardStop();
     }
   });
 
   window.addEventListener("blur", () => {
     S.keys.clear();
     if (S.dragId === null) resetKnob();
-    applyTarget(0, 0, true);
+    hardStop();
   });
 
   window.addEventListener("pagehide", () => {
-    zeroTarget();
+    hardStop();
     if (S.ws) { try { S.ws.close(); } catch (err) {} }
   });
 

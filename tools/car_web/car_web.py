@@ -19,16 +19,19 @@
     写命令帧、或者一边 read 一边 close 的经典崩法。
 
 安全层次（三层，任何一层失效都还能停住）
-    1. 前端：松手/切后台/页面隐藏 → 立刻发 0；WebSocket 断了就不再发。
-    2. 本程序：500 ms 没收到网页指令 → 发 0；急停锁存后只发 0；
-               |vx|<=0.5 m/s、|wz|<=1.0 rad/s 硬夹 + 档位夹。
+    1. 前端：松手/回中 → 发 0（后端软停）；切后台/失焦/关页 → 发 0 + hard:true
+       （后端立即归零）；WebSocket 断了就不再发。
+    2. 本程序：500 ms 没收到网页指令 → 立即发 0；急停锁存后只发 0；
+               |vx|<=2.0 m/s、|wz|<=1.5 rad/s 硬夹 + 档位夹（固件上限 2.565 m/s）。
     3. STM32：800 ms 收不到合法命令帧 → 目标清零（固件里已实现）。
 
-缓启缓停（默认开）
-    正常行驶指令在 step_output() 里按 vx 1.0 m/s²、wz 4.0 rad/s² 逼近目标；
-    但急停/心跳超时/目标为 0（松手、切页、失焦、回中、/api/stop）**不进斜坡**，
-    下一拍直接发 0。开关状态走 HTTP /api/ramp 或 WebSocket
-    {"t":"ramp","on":...}，/api/state 与 /status 都会回显。
+缓启缓停（默认开，加减速分开）
+    正常行驶指令在 step_output() 里按 vx 加速 1.0 / 减速 0.40 m/s²、
+    wz 加速 4.0 / 减速 1.50 rad/s² 逼近目标：
+      * 急停、心跳超时、前端断连、页面隐藏/失焦（hard:true）**立即归零**；
+      * 松手、摇杆回中、主动点“停止”、/api/stop 是**正常停车**，按减速斜率软停。
+    开关状态走 HTTP /api/ramp 或 WebSocket {"t":"ramp","on":...}，
+    /api/state 与 /status 都会回显。
 
 方向约定
     固件逆解 v_left=vx-wz*TRACK/2、v_right=vx+wz*TRACK/2，所以 wz>0 = 左转。
@@ -37,7 +40,7 @@
 
 自测
     python3 car_web.py --sim            # 不开串口，内部仿真产生 24/44 字节帧
-    python3 selftest.py                 # 33 项断言（需要浏览器；否则 --no-browser）
+    python3 selftest.py                 # 39 项断言（需要浏览器；否则 --no-browser）
     python3 car_web.py                  # 真机：/dev/wheeltec_controller @115200
 """
 
@@ -87,31 +90,59 @@ WHEEL_R_M = 0.0855
 TRACK_WIDTH_M = 0.425
 WHEEL_OMEGA_MAX = 30.0   # 固件限幅，界面条形图按这个满量程画
 
-# 速度档位：vx 上限按需求 0.15/0.30/0.50 m/s；wz 同步收紧，
+# 速度档位（6 档）：vx 上限 0.15 → 1.60 m/s；wz 同步收紧，
 # 否则低速档一推满摇杆就原地甩尾，手感很危险。
+# 默认仍是 low（0.15 m/s）：页面一打开、第一次推杆不会蹿出去。
 GEARS = {
-    "low":  {"name": "低速", "vx": 0.15, "wz": 0.50},
-    "mid":  {"name": "中速", "vx": 0.30, "wz": 0.75},
-    "high": {"name": "高速", "vx": 0.50, "wz": 1.00},
+    "low":    {"name": "低速", "vx": 0.15, "wz": 0.50},
+    "mid":    {"name": "中速", "vx": 0.30, "wz": 0.75},
+    "high":   {"name": "高速", "vx": 0.50, "wz": 1.00},
+    "fast":   {"name": "快速", "vx": 0.80, "wz": 1.15},
+    "sprint": {"name": "极速", "vx": 1.20, "wz": 1.30},
+    "ultra":  {"name": "超快", "vx": 1.60, "wz": 1.50},
 }
-GEAR_ORDER = ("low", "mid", "high")
+GEAR_ORDER = ("low", "mid", "high", "fast", "sprint", "ultra")
 
-HARD_VX_LIMIT = 0.50     # 与固件/需求一致的硬上限，档位只能更小
-HARD_WZ_LIMIT = 1.00
+# 硬上限：档位只能更小。**绝不能超过固件能力**：
+#   WHEEL_OMEGA_MAX 30 rad/s × WHEEL_R_M 0.0855 m = 2.565 m/s。
+# 这里取 2.0 m/s 留 0.565 m/s 余量；转向最坏情况
+#   |vx| + |wz|*TRACK/2 = 2.0 + 1.5*0.2125 = 2.319 m/s → 27.1 rad/s < 30，
+# 所以极限组合也不会被固件削。改大之前先把这条算式重算一遍。
+HARD_VX_LIMIT = 2.00
+HARD_WZ_LIMIT = 1.50
+FIRMWARE_VX_MAX = WHEEL_OMEGA_MAX * WHEEL_R_M   # 2.565 m/s，只用于注释/自测对照
 CMD_TIMEOUT_MS = 500     # 网页心跳超时（< 固件的 800 ms，保证先由我们清零）
 
 # ---- 缓启缓停（指令斜坡）------------------------------------------------
-# 只作用于"正常行驶指令"：目标 vx/wz 变化时按下面的加速度逐步逼近，
+# 只作用于"正常行驶指令"：目标 vx/wz 变化时按下面的斜率逐步逼近，
 # 避免摇杆一推到底时的阶跃（阶跃会让电机瞬间按最大加速度冲出去）。
 #
-# 取值理由（按低/中速档 100~300 ms 到位的手感选，且远快于固件 800 ms 看门狗）：
-#   vx 1.0 m/s²：低速 0.15 m/s → 150 ms，中速 0.30 → 300 ms，高速 0.50 → 500 ms
-#   wz 4.0 rad/s²：低速 0.50 rad/s → 125 ms，中速 0.75 → 188 ms，高速 1.00 → 250 ms
-# 这两个值只在"正常指令"上生效；急停/心跳超时/目标恰好为零（松手、切页、
-# 失焦、回中、/api/stop）一律立即归零，不进入斜坡（见 step_output 的注释）。
+# 为什么加减速要分开：
+#   加速可以快（要跟手），减速必须慢（才有"软停"的手感）。
+#   如果共用一个斜率：
+#     - 取 1.0：0.3 m/s 松手 0.3 s 就停，人几乎感觉不到；
+#     - 取 0.4：起步 0.3 m/s 要 0.75 s，推杆会明显发肉。
+#   所以 ACC=1.0 / DEC=0.40。从 0.30 m/s 松手：0.30 / 0.40 = 0.75 s，
+#   停止距离 v²/(2a) = 0.30² / 0.80 = 0.1125 m —— 能明显看到"滑一小段"。
+#   各档位满速软停时间/距离：
+#     0.15 → 0.375 s / 2.8 cm     0.50 → 1.25 s / 31 cm
+#     0.30 → 0.75 s  / 11 cm      0.80 → 2.00 s / 80 cm
+#     1.20 → 3.00 s  / 1.80 m     1.60 → 4.00 s / 3.20 m
+#   高速档软停距离长是物理必然（DEC 固定），所以 UI 对 ≥0.8 m/s 做橙色、
+#   ≥1.2 m/s 做红色提示，README 写明"高速档只在空旷场地测试"。
+#   真正危险时用急停/超时，那两条路径永远立即归零，不经过本斜坡。
+#
+#   wz 同理：ACC=4.0（1.00 rad/s → 0.25 s 到位），
+#            DEC=1.50（1.00 rad/s → 0.67 s 停下）。
+#
+# 停止分类（见 step_output）：
+#   立即归零：estop / timeout / 前端断连 / 页面隐藏·失焦（hard:true）。
+#   软停（DEC）：松手、摇杆回中、键盘松开/空格、主动点停止、/api/stop。
 RAMP_DEFAULT_ON = True
-RAMP_VX_ACC = 1.0        # m/s²
-RAMP_WZ_ACC = 4.0        # rad/s²
+RAMP_VX_ACC = 1.0        # m/s²：从 0 到 0.30 约 0.30 s，跟手
+RAMP_VX_DEC = 0.40       # m/s²：从 0.30 停下 0.75 s，人能明显感到"软停"
+RAMP_WZ_ACC = 4.0        # rad/s²：0→1.0 约 0.25 s
+RAMP_WZ_DEC = 1.5        # rad/s²：1.0→0 约 0.67 s
 RAMP_MAX_DT = 0.2        # s；串口/线程卡顿后单拍最多积分这么多，防止一次跳变
 
 # 方向约定（与 static/app.js 的 WZ_CMD_SIGN 一一对应）：
@@ -170,6 +201,26 @@ def slew(cur: float, target: float, max_step: float) -> float:
     if abs(delta) <= max_step:
         return target
     return cur + math.copysign(max_step, delta)
+
+
+def slew_axis(cur: float, target: float, dt: float,
+              acc: float, dec: float) -> float:
+    """单轴斜坡：加速用 acc，减速/回零/反向用 dec。
+
+    判定规则（每轴独立）：
+      * |target| < |cur|：在收油门 / 软停 → dec；
+      * 目标与当前反号（含从 0.3 直接给 -0.2）：先按 dec 收回，避免
+        过零时还按加速斜率冲；
+      * 其余（|target| >= |cur| 且同号）→ acc。
+    这样"缓启"快、"缓停"慢，两个方向的手感都符合预期。
+    """
+    if cur == target:
+        return cur
+    if abs(target) < abs(cur) or (target != 0.0 and (cur > 0.0) != (target > 0.0)):
+        rate = dec
+    else:
+        rate = acc
+    return slew(cur, target, rate * dt)
 
 
 def parse_onoff(v: Any) -> Optional[bool]:
@@ -385,10 +436,15 @@ class CarHub:
         self.estop = False
         self.estop_time = 0.0
         self.gear = "low"            # 默认最慢档：第一次打开页面不会蹿出去
+        # hard_stop=True 表示"这次目标是安全停车，必须立即归零"：
+        # 页面隐藏 / 窗口失焦 / pagehide 会带 hard:true 发 0；锁存到下一次
+        # 非零行驶指令为止。这样随后的 20 Hz 0 心跳不会把硬停又变回软停。
+        self.hard_stop = False
 
         # ---- 缓启缓停（斜坡）----
-        # 默认开启：更平顺，且不改变任何停止语义。out_* 是**真正写串口**
-        # 的值（LinkWorker.step_output 推进）；ramp_* 只给状态/诊断用。
+        # 默认开启：更平顺。out_* 是**真正写串口**的值（LinkWorker.step_output
+        # 推进）；ramp_* 只给状态/诊断用。正常停车走 DEC 软停，只有
+        # estop/timeout/hard_stop 立即归零（见 step_output 的注释）。
         self.ramp_on = RAMP_DEFAULT_ON
         self.out_vx = 0.0
         self.out_wz = 0.0
@@ -432,8 +488,11 @@ class CarHub:
         self._prev_fault = False
         self._prev_link: Optional[bool] = None
         self.note("程序启动（%s 模式）" % ("仿真" if self.sim else "真机"))
-        self.note("缓启缓停：%s（vx %.2f m/s²，wz %.2f rad/s²；停止指令仍立即归零）"
-                  % ("开" if self.ramp_on else "关", RAMP_VX_ACC, RAMP_WZ_ACC))
+        self.note("缓启缓停：%s（加速 vx %.2f / 减速 vx %.2f m/s²；"
+                  "加速 wz %.2f / 减速 wz %.2f rad/s²）"
+                  % ("开" if self.ramp_on else "关",
+                     RAMP_VX_ACC, RAMP_VX_DEC, RAMP_WZ_ACC, RAMP_WZ_DEC))
+        self.note("停车：急停/超时/断连/页面隐藏立即归零；松手/回中/主动停止走软停")
 
     # -- 事件 ---------------------------------------------------------------
     def note(self, msg: str) -> None:
@@ -441,8 +500,14 @@ class CarHub:
             self.events.append({"t": time.strftime("%H:%M:%S"), "msg": msg})
 
     # -- 指令 ---------------------------------------------------------------
-    def set_cmd(self, vx: float, wz: float, owner: int) -> None:
+    def set_cmd(self, vx: float, wz: float, owner: int,
+                hard: bool = False) -> None:
         """记录网页目标值。
+
+        hard=True 只对"目标为 0"的指令有意义：页面隐藏 / 窗口失焦 /
+        pagehide 走的是安全停车，必须立即归零；而松手、回中、主动点停止
+        发的是普通 0，走斜坡减速（软停）。hard 会锁存到下一次非零指令，
+        避免随后的 0 心跳把这次硬停又变回软停。
 
         **急停锁存期间不接受新目标**：否则复位后会把锁存期间收到的
         最后一帧指令放出来（"复位后必须重新推摇杆"的承诺就破了）。
@@ -466,19 +531,26 @@ class CarHub:
             self.cmd_vx = vx
             self.cmd_wz = wz
             self.cmd_time = time.monotonic()
+            if vx != 0.0 or wz != 0.0:
+                # 只要重新开始行驶，就清掉硬停锁存（下一次停车按新指令分类）。
+                self.hard_stop = False
+            elif hard:
+                self.hard_stop = True
 
     def drop_owner(self, owner: int) -> None:
         """某个网页断开：如果它正是最后发指令的人，立刻清零。
 
         为什么要判断 owner：同时开两个标签页看状态时，关掉"只看不控"的那个
         不应该把正在开的车停掉。反过来，控制端一断就必须停 —— 这是安全底线。
+        这里是**立即**归零：断连属于安全停止，不走缓停斜坡。
         """
         with self.lock:
             if self.cmd_owner == owner and not self.estop:
                 self.cmd_vx = 0.0
                 self.cmd_wz = 0.0
                 self.cmd_time = 0.0
-                self.note("控制端 WebSocket 断开，目标清零")
+                self.hard_stop = True
+                self.note("控制端 WebSocket 断开，立即归零")
 
     def set_gear(self, gear: str) -> bool:
         if gear not in GEARS:
@@ -503,10 +575,12 @@ class CarHub:
                 return False
             self.ramp_on = on
             if on:
-                self.note("缓启缓停已开启（vx %.2f m/s²，wz %.2f rad/s²）"
-                          % (RAMP_VX_ACC, RAMP_WZ_ACC))
+                self.note("缓启缓停已开启（加速 vx %.2f / 减速 vx %.2f m/s²，"
+                          "加速 wz %.2f / 减速 wz %.2f rad/s²）"
+                          % (RAMP_VX_ACC, RAMP_VX_DEC,
+                             RAMP_WZ_ACC, RAMP_WZ_DEC))
             else:
-                self.note("缓启缓停已关闭（指令直接阶跃到目标）")
+                self.note("缓启缓停已关闭（指令直接阶跃到目标，停车也立即归零）")
             return True
 
     def estop_on(self, why: str = "网页急停") -> None:
@@ -516,6 +590,7 @@ class CarHub:
             self.cmd_vx = 0.0
             self.cmd_wz = 0.0
             self.cmd_time = 0.0
+            self.hard_stop = True
             self.note("🛑 急停：%s（已锁存，需手动复位）" % why)
 
     def estop_off(self) -> None:
@@ -569,13 +644,24 @@ class CarHub:
     def step_output(self, now: float) -> tuple[float, float, str, bool]:
         """推进一拍斜坡，返回这一拍真正写串口的 (vx, wz, 原因, 夹取)。
 
-        ★ 停止不进斜坡：以下三种情况一律立即把 out_* 置 0，不等斜率：
-          1. 急停锁存（reason=estop）；
-          2. 网页心跳超时（reason=timeout，500 ms 没收到指令）；
-          3. 目标恰好是 (0, 0)：松手 / 切后台 / 失焦 / 回中 / /api/stop
-             都会让网页发 0，目标为零就意味着"停"，必须立刻停。
-        只有目标非零的正常行驶指令（含倒车、原地转）才走 ramp_on 的斜坡。
-        这样"缓启缓停"不会把任何一条安全停止路径变慢。
+        ★ 停车分两类（这是"松手能感觉到软停、急停绝不拖泥带水"的关键）：
+
+        A. 立即归零（安全停车，不积分、不保留残余）：
+           1. 急停锁存（reason=estop）；
+           2. 网页心跳超时（reason=timeout，500 ms 没收到指令）；
+           3. 前端断连（drop_owner 会把 cmd_time 清 0，等同于 timeout）；
+           4. 页面隐藏 / 窗口失焦 / pagehide：前端带 hard:true 发 0，
+              由 self.hard_stop 标记。
+           前三条是"可能没人看着车了"，必须立刻停；第 4 条是"用户已经
+           看不到车/页面失焦"，同样按安全停车处理。
+
+        B. 正常停车走缓停（只受 ramp_on 控制）：
+           松手、摇杆回中、键盘松开/空格、主动点"回中/停止"、/api/stop
+           都只是把目标置 0，没有 hard 标记；开了斜坡就按 RAMP_*_DEC
+           逐拍减速到 0。斜坡关闭时仍保持旧行为：下一拍直接置 0。
+
+        注意：软停期间必须继续有网页心跳（页面在后台仍按 20 Hz 发 0，
+        或脚本持续 POST /api/stop）；一旦心跳断了，500 ms 后按 A.2 立即归零。
         """
         with self.lock:
             tvx, twz, reason, clamped = self._target_locked(now)
@@ -586,19 +672,21 @@ class CarHub:
                 dt = clamp(now - self._ramp_t, 0.0, RAMP_MAX_DT)
             self._ramp_t = now
 
-            stopping = (reason in ("estop", "timeout")
-                        or (tvx == 0.0 and twz == 0.0))
-            if stopping:
+            hard_stop = (reason in ("estop", "timeout") or self.hard_stop)
+            if hard_stop:
                 # 立即归零：不积分、不保留残余，下一拍重新从 0 开始。
                 self.out_vx = 0.0
                 self.out_wz = 0.0
             elif not self.ramp_on:
-                # 关闭时保持旧行为：直接把目标值发给串口。
+                # 关闭时保持旧行为：直接把目标值发给串口（含目标 0 → 立即停）。
                 self.out_vx = tvx
                 self.out_wz = twz
             else:
-                self.out_vx = slew(self.out_vx, tvx, RAMP_VX_ACC * dt)
-                self.out_wz = slew(self.out_wz, twz, RAMP_WZ_ACC * dt)
+                # 加速用 ACC，减速/回零/反向用 DEC（见 slew_axis）。
+                self.out_vx = slew_axis(self.out_vx, tvx, dt,
+                                        RAMP_VX_ACC, RAMP_VX_DEC)
+                self.out_wz = slew_axis(self.out_wz, twz, dt,
+                                        RAMP_WZ_ACC, RAMP_WZ_DEC)
 
             self.ramp_step_count += 1
             return self.out_vx, self.out_wz, reason, clamped
@@ -677,15 +765,29 @@ class CarHub:
         with self.lock:
             g = GEARS[self.gear]
             target_vx, target_wz, reason, clamped = self._target_locked(now)
-            # 停止语义在显示上也立即生效：即使 LinkWorker 这一拍还没跑到，
-            # 也不能让界面/脚本看到"急停后还在斜坡下降"的假象。
-            stopped = (reason in ("estop", "timeout")
-                       or (target_vx == 0.0 and target_wz == 0.0))
-            out_vx = 0.0 if stopped else self.out_vx
-            out_wz = 0.0 if stopped else self.out_wz
-            ramp_active = (self.ramp_on and not stopped
+            # 立即停的语义在显示上也立即生效（即使 LinkWorker 这一拍还没跑到），
+            # 但不能把"软停中"也显示成 0，否则界面看不出缓停。只有
+            # estop / timeout / hard_stop 这三类才强制显示 0。
+            hard_stop = (reason in ("estop", "timeout") or self.hard_stop)
+            out_vx = 0.0 if hard_stop else self.out_vx
+            out_wz = 0.0 if hard_stop else self.out_wz
+            ramp_active = (self.ramp_on and not hard_stop
                            and (abs(out_vx - target_vx) > 1e-6
                                 or abs(out_wz - target_wz) > 1e-6))
+            # 正在减速 = 斜坡中且目标幅值小于当前输出幅值（含目标 0 的软停）
+            decelerating = (ramp_active
+                            and (abs(target_vx) < abs(out_vx) - 1e-9
+                                 or abs(target_wz) < abs(out_wz) - 1e-9))
+            if hard_stop:
+                ramp_mode = "hard"
+            elif not self.ramp_on:
+                ramp_mode = "off"
+            elif decelerating:
+                ramp_mode = "decel"
+            elif ramp_active:
+                ramp_mode = "accel"
+            else:
+                ramp_mode = "idle"
             tel = dict(self.tel) if self.tel else None
             st = dict(self.status) if self.status else None
             if st:
@@ -742,12 +844,18 @@ class CarHub:
                     "on": self.ramp_on,
                     "default_on": RAMP_DEFAULT_ON,
                     "vx_acc": RAMP_VX_ACC,
+                    "vx_dec": RAMP_VX_DEC,
                     "wz_acc": RAMP_WZ_ACC,
+                    "wz_dec": RAMP_WZ_DEC,
                     "out_vx": round(out_vx, 3),
                     "out_wz": round(out_wz, 3),
                     "target_vx": round(target_vx, 3),
                     "target_wz": round(target_wz, 3),
                     "active": ramp_active,
+                    # mode: accel / decel（软停中）/ hard（立即停）/ off / idle
+                    "mode": ramp_mode,
+                    "stopping": decelerating,
+                    "hard_stop": hard_stop,
                     "steps": self.ramp_step_count,
                 },
                 "safety": {
@@ -755,6 +863,8 @@ class CarHub:
                     "timeout_ms": CMD_TIMEOUT_MS,
                     "vx_limit": HARD_VX_LIMIT,
                     "wz_limit": HARD_WZ_LIMIT,
+                    # 固件单轮 30 rad/s × 0.0855 m = 2.565 m/s，硬上限必须低于它
+                    "firmware_vx_max": round(FIRMWARE_VX_MAX, 3),
                 },
                 "gear": {
                     "key": self.gear,
@@ -1101,8 +1211,8 @@ class LinkWorker(threading.Thread):
                 # ---- 定时发命令帧（20~50 Hz）----
                 now = time.monotonic()
                 if now >= next_tx:
-                    # step_output 是唯一推进斜坡的地方；停止（急停/超时/目标 0）
-                    # 在里面立即归零，不会因为开了缓启缓停而变慢。
+                    # step_output 是唯一推进斜坡的地方：急停/超时/硬停立即归零，
+                    # 松手/回中按 DEC 软停。只有串口线程能按固定节拍积分。
                     vx, wz, _reason, _clamped = self.hub.step_output(now)
                     try:
                         self.link.write(build_cmd_frame(vx, wz))
@@ -1250,7 +1360,7 @@ MIME = {
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CarWeb/1.0"
+    server_version = "CarWeb/1.2"
     protocol_version = "HTTP/1.1"
 
     hub: CarHub = None          # 由 make_server() 注入
@@ -1337,7 +1447,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/stop":
                 vx = wz = 0.0
-            self.hub.set_cmd(vx, wz, owner=0)       # owner=0 表示 HTTP 客户端
+            # hard=true 表示安全停车（页面隐藏/失焦/关页），立即归零；
+            # 不打 hard 的 0 是松手/回中/主动停止，走缓停斜坡。
+            hard = parse_onoff(body.get("hard")) is True
+            self.hub.set_cmd(vx, wz, owner=0, hard=hard)   # owner=0 表示 HTTP 客户端
             self._json({"ok": True, "cmd": self.hub.snapshot()["cmd"]})
             return
         if path == "/api/ramp":
@@ -1355,7 +1468,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/gear":
             gear = str(body.get("gear", ""))
             if not self.hub.set_gear(gear):
-                self._json({"ok": False, "error": "gear 必须是 low/mid/high"}, 400)
+                self._json({"ok": False,
+                            "error": "gear 必须是 low/mid/high/fast/sprint/ultra"}, 400)
                 return
             self._json({"ok": True, "gear": self.hub.snapshot()["gear"]})
             return
@@ -1406,10 +1520,15 @@ class Handler(BaseHTTPRequestHandler):
                 link["status_count"], link["bad_frames"]),
             "档位: %s  vx≤%.2f m/s  wz≤%.2f rad/s" %
             (s["gear"]["name"], s["gear"]["vx"], s["gear"]["wz"]),
-            "缓启缓停: %s  vx斜率=%.2f m/s²  wz斜率=%.2f rad/s²  输出=(%.3f, %.3f)%s" % (
-                "开" if s["ramp"]["on"] else "关", s["ramp"]["vx_acc"],
-                s["ramp"]["wz_acc"], s["ramp"]["out_vx"], s["ramp"]["out_wz"],
-                "  斜坡中" if s["ramp"]["active"] else ""),
+            "缓启缓停: %s  加速 vx=%.2f / 减速 vx=%.2f m/s²  "
+            "加速 wz=%.2f / 减速 wz=%.2f rad/s²  输出=(%.3f, %.3f)  %s" % (
+                "开" if s["ramp"]["on"] else "关",
+                s["ramp"]["vx_acc"], s["ramp"]["vx_dec"],
+                s["ramp"]["wz_acc"], s["ramp"]["wz_dec"],
+                s["ramp"]["out_vx"], s["ramp"]["out_wz"],
+                {"decel": "缓停中", "accel": "斜坡中",
+                 "hard": "立即停", "off": "斜坡关闭", "idle": "—"}[
+                     s["ramp"]["mode"]]),
             "指令: 网页=(%.3f, %.3f)  实发=(%.3f, %.3f)  原因=%s  夹取=%s  年龄=%sms" % (
                 cmd["vx"], cmd["wz"], cmd["tx_vx"], cmd["tx_wz"],
                 cmd["reason"], "是" if cmd["clamped"] else "否", cmd["age_ms"]),
@@ -1538,7 +1657,9 @@ class Handler(BaseHTTPRequestHandler):
                 wz = float(msg.get("wz", 0.0) or 0.0)
             except (TypeError, ValueError):
                 return
-            self.hub.set_cmd(vx, wz, owner=cid)
+            # hard=true：页面隐藏/失焦/关页的安全停车，后端立即归零。
+            hard = parse_onoff(msg.get("hard")) is True
+            self.hub.set_cmd(vx, wz, owner=cid, hard=hard)
         elif t == "gear":
             self.hub.set_gear(str(msg.get("gear", "")))
         elif t == "ramp":
@@ -1623,11 +1744,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(" 链路:   内部仿真（不占用任何串口）", flush=True)
     else:
         print(" 链路:   %s @ %d（独占打开）" % (args.serial, args.baud), flush=True)
-    print(" 命令帧: %.0f Hz   |vx|≤%.2f m/s  |wz|≤%.2f rad/s  网页心跳 %d ms" %
+    print(" 命令帧: %.0f Hz   |vx|<=%.2f m/s  |wz|<=%.2f rad/s  网页心跳 %d ms" %
           (args.tx_hz, HARD_VX_LIMIT, HARD_WZ_LIMIT, CMD_TIMEOUT_MS), flush=True)
     # 控制台在 Windows 上常是 GBK，别在这里用 ² 之类的字符（HTTP/JSON 里可以用）。
-    print(" 缓启缓停: 默认%s  vx %.2f m/s2  wz %.2f rad/s2（停止指令仍立即归零）" %
-          ("开" if RAMP_DEFAULT_ON else "关", RAMP_VX_ACC, RAMP_WZ_ACC), flush=True)
+    print(" 缓启缓停: 默认%s  加速 vx %.2f / 减速 vx %.2f m/s2  "
+          "加速 wz %.2f / 减速 wz %.2f rad/s2" %
+          ("开" if RAMP_DEFAULT_ON else "关",
+           RAMP_VX_ACC, RAMP_VX_DEC, RAMP_WZ_ACC, RAMP_WZ_DEC), flush=True)
+    print(" 停车:   急停/超时/断连/页面隐藏=立即归零；松手/回中/停止按钮=软停",
+          flush=True)
     print(" 停止:   Ctrl+C", flush=True)
     print(bar, flush=True)
 

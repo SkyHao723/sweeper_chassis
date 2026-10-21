@@ -89,26 +89,53 @@ h2 { font-size: 15px; }
 .badge.sim { color: var(--purple); border-color: #5b3f7a; background: rgba(192, 132, 252, .08); }
 @keyframes blink { 50% { opacity: .35; } }
 
-/* ---------------- 档位 ---------------- */
+/* ---------------- 档位（6 档，自适应网格） ---------------- */
+.gear-box { margin-bottom: 10px; }
+.gear-head {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; flex-wrap: wrap; margin-bottom: 5px;
+}
+.gear-title { font-size: 11px; color: var(--muted); letter-spacing: .3px; }
+.gear-warn {
+  font-size: 10.5px; font-weight: 600; font-family: var(--mono);
+  color: var(--orange);
+}
+.gear-warn.warn { color: var(--orange); }
+.gear-warn.danger { color: var(--red); }
 .gears {
-  display: inline-flex; padding: 3px; gap: 3px;
-  background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px;
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px;
+  padding: 3px; background: var(--bg-soft);
+  border: 1px solid var(--border); border-radius: 10px;
 }
 .gear-btn {
   display: flex; flex-direction: column; align-items: center; gap: 1px;
   border: 1px solid transparent; background: transparent;
-  color: var(--muted); font-family: inherit; font-size: 12px;
-  padding: 4px 12px; border-radius: 7px; cursor: pointer;
-  transition: all .15s; line-height: 1.25;
+  color: var(--muted); font-family: inherit; font-size: 11.5px;
+  padding: 5px 2px; border-radius: 7px; cursor: pointer;
+  transition: all .15s; line-height: 1.25; min-width: 0;
 }
-.gear-btn b { font-family: var(--mono); font-size: 11px; font-weight: 500; opacity: .8; }
+.gear-btn b { font-family: var(--mono); font-size: 10px; font-weight: 500; opacity: .8; }
 .gear-btn:hover { color: var(--text); background: rgba(255, 255, 255, .04); }
+/* 高速档就算没选中，数字也先染色，点之前就知道这档快 */
+.gear-btn[data-tier="3"] b { color: var(--orange); opacity: 1; }
+.gear-btn[data-tier="4"] b, .gear-btn[data-tier="5"] b { color: var(--red); opacity: 1; }
 .gear-btn.active {
   color: #03141a; border-color: #0a7c8c;
   background: linear-gradient(180deg, #22d3ee, #0e9fb4);
   box-shadow: 0 0 14px rgba(34, 211, 238, .3);
 }
-.gear-btn.active b { opacity: .85; }
+.gear-btn.active b { opacity: .85; color: inherit; }
+.gear-btn.active[data-tier="3"] {
+  color: #241003; border-color: #9a3412;
+  background: linear-gradient(180deg, #fb923c, #c2410c);
+  box-shadow: 0 0 14px rgba(251, 146, 60, .35);
+}
+.gear-btn.active[data-tier="4"], .gear-btn.active[data-tier="5"] {
+  color: #fff; border-color: #991b1b;
+  background: linear-gradient(180deg, #f87171, #b91c1c);
+  box-shadow: 0 0 16px rgba(248, 113, 113, .4);
+}
+.gear-hint { margin-top: 4px; font-size: 10.5px; color: var(--muted); line-height: 1.4; }
 
 /* ---------------- 急停 ---------------- */
 .estop {
@@ -172,7 +199,8 @@ h2 { font-size: 15px; }
   .brand h1 { font-size: 16px; }
   .logo { width: 36px; height: 36px; flex-basis: 36px; }
   .estop { padding: 10px 20px; font-size: 15px; }
-  .gear-btn { padding: 4px 9px; }
+  .gears { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .gear-btn { padding: 5px 2px; }
 }
 
 .card {
@@ -211,6 +239,13 @@ h2 { font-size: 15px; }
   font-family: var(--mono); font-size: 11px; color: var(--accent);
   border: 1px solid #0e6172; background: rgba(34, 211, 238, .07);
   padding: 3px 9px; border-radius: 999px; white-space: nowrap;
+}
+.pill.warn {
+  color: var(--orange); border-color: #9a3412; background: rgba(251, 146, 60, .1);
+}
+.pill.danger {
+  color: var(--red); border-color: #7f2b2b; background: rgba(248, 113, 113, .12);
+  font-weight: 700;
 }
 
 .pad-wrap { display: grid; place-items: center; padding: 4px 0 12px; }
@@ -287,7 +322,13 @@ h2 { font-size: 15px; }
   background: var(--bg-soft); border: 1px solid var(--border);
 }
 .axis .k { font-size: 11px; color: var(--muted); }
-.axis .v { font-family: var(--mono); font-size: 19px; font-weight: 600; text-align: right; color: var(--accent); }
+.axis .v { font-family: var(--mono); font-size: 19px; font-weight: 600; text-align: right; color: var(--accent); transition: color .15s; }
+/* 高速提示：≥0.8 m/s 橙、≥1.2 m/s 红（app.js 的 SPEED_WARN/SPEED_DANGER） */
+.axis .v.speed-warn { color: var(--orange); }
+.axis .v.speed-danger {
+  color: var(--red);
+  text-shadow: 0 0 10px rgba(248, 113, 113, .55);
+}
 .axis .u { font-size: 10px; color: var(--muted); }
 
 .send-state {
@@ -314,6 +355,10 @@ h2 { font-size: 15px; }
 }
 .ramp-row.ramping {
   box-shadow: 0 0 0 1px rgba(34, 211, 238, .25), 0 0 18px rgba(34, 211, 238, .12);
+}
+.ramp-row.stopping {
+  border-color: #7c5a12;
+  box-shadow: 0 0 0 1px rgba(251, 191, 36, .28), 0 0 16px rgba(251, 191, 36, .12);
 }
 .switch { position: relative; display: inline-flex; flex: 0 0 auto; cursor: pointer; }
 .switch input { position: absolute; opacity: 0; width: 0; height: 0; }
@@ -354,6 +399,7 @@ h2 { font-size: 15px; }
 }
 .ramp-state.off { color: var(--muted); }
 .ramp-live { font-size: 10.5px; color: var(--accent); font-family: var(--mono); }
+.ramp-live.warn { color: var(--yellow); font-weight: 600; }
 .ramp-hint { margin-top: 2px; font-size: 11px; color: var(--muted); line-height: 1.45; }
 
 .quick { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }

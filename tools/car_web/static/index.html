@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d1117" />
   <title>小车遥控器</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2322d3ee'/%3E%3Ctext x='16' y='23' font-size='15' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23051016'%3ERC%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/style.css?v=1.1.0" />
+  <link rel="stylesheet" href="/static/style.css?v=1.2.0" />
 </head>
 <body>
   <header class="topbar">
@@ -19,11 +19,6 @@
     </div>
 
     <div class="top-right">
-      <div class="gears" id="gears" role="group" aria-label="速度档位">
-        <button type="button" class="gear-btn" data-gear="low">低速<b>0.15</b></button>
-        <button type="button" class="gear-btn" data-gear="mid">中速<b>0.30</b></button>
-        <button type="button" class="gear-btn" data-gear="high">高速<b>0.50</b></button>
-      </div>
       <div class="badges">
         <span class="badge" id="wsBadge"><i class="dot"></i>网页</span>
         <span class="badge" id="linkBadge"><i class="dot"></i>串口</span>
@@ -72,13 +67,29 @@
         </div>
       </div>
 
+      <div class="gear-box">
+        <div class="gear-head">
+          <span class="gear-title">速度档位</span>
+          <span class="gear-warn" id="gearWarn" hidden></span>
+        </div>
+        <div class="gears" id="gears" role="group" aria-label="速度档位">
+          <button type="button" class="gear-btn" data-gear="low" data-tier="1">低速<b>0.15</b></button>
+          <button type="button" class="gear-btn" data-gear="mid" data-tier="1">中速<b>0.30</b></button>
+          <button type="button" class="gear-btn" data-gear="high" data-tier="2">高速<b>0.50</b></button>
+          <button type="button" class="gear-btn" data-gear="fast" data-tier="3">快速<b>0.80</b></button>
+          <button type="button" class="gear-btn" data-gear="sprint" data-tier="4">极速<b>1.20</b></button>
+          <button type="button" class="gear-btn" data-gear="ultra" data-tier="5">超快<b>1.60</b></button>
+        </div>
+        <div class="gear-hint">默认低速 0.15 m/s · 键盘 1~6 切换 · ≥0.8 m/s 橙色 / ≥1.2 m/s 红色</div>
+      </div>
+
       <div class="send-state" id="sendState">
         <span class="send-dot" id="sendDot"></span>
         <span id="sendText">等待连接…</span>
       </div>
 
       <div class="ramp-row on" id="rampRow">
-        <label class="switch" for="rampToggle" title="正常行驶指令按斜率过渡；松手、切页、急停、超时仍立即归零">
+        <label class="switch" for="rampToggle" title="正常行驶按斜率加速；松手/回中按较慢的减速斜率软停；切页/失焦/急停/超时立即归零">
           <input type="checkbox" id="rampToggle" checked />
           <span class="switch-track"><span class="switch-thumb"></span></span>
         </label>
@@ -88,7 +99,7 @@
             <span class="ramp-state on" id="rampState">开</span>
             <span class="ramp-live" id="rampLive"></span>
           </div>
-          <div class="ramp-hint" id="rampHint">正常指令按受控斜率过渡；松手、切页、急停、超时仍立即归零</div>
+          <div class="ramp-hint" id="rampHint">加速 1.0、减速 0.40 m/s²；松手/回中会“缓停中”，切页/失焦/急停/超时立即归零</div>
         </div>
       </div>
 
@@ -98,9 +109,11 @@
       </div>
 
       <p class="safety-note">
-        松手、切后台、断网都会立刻归零；服务端 500&nbsp;ms 没收到网页指令也会发 0。
+        松手/回中/点“停止”会按减速斜率<b>软停</b>（0.3&nbsp;m/s 约 0.75&nbsp;s）；
+        切后台、失焦、关页、断网、急停、服务端 500&nbsp;ms 心跳超时都会<b>立即归零</b>。
         <b>急停是锁存的</b>，必须点“复位”才能再走。<br />
-        缓启缓停只作用于正常行驶指令，<b>停止/急停/超时永远立即归零</b>，不会被斜坡拖慢。
+        ≥0.8&nbsp;m/s（快速/极速/超快）速度数字变橙、≥1.2&nbsp;m/s 变红；
+        <b>高速档请在空旷场地测试</b>，软停距离随速度明显变长。
       </p>
     </section>
 
@@ -239,11 +252,11 @@
 
       <footer class="footer">
         <span>RK3576 串口 → STM32 → 达妙 DM-H65 · 本页 20 Hz 推状态、20 Hz 发指令</span>
-        <span id="footerVer">car_web 1.1</span>
+        <span id="footerVer">car_web 1.2</span>
       </footer>
     </div>
   </main>
 
-  <script src="/static/app.js?v=1.1.0"></script>
+  <script src="/static/app.js?v=1.2.0"></script>
 </body>
 </html>
