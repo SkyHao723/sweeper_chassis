@@ -419,7 +419,16 @@ h2 { font-size: 15px; }
   background: var(--bg-soft); padding: 10px 12px;
   display: flex; flex-direction: column; gap: 8px;
   position: relative; overflow: hidden;
+  min-width: 0;
+  transition: border-color .2s, box-shadow .2s;
 }
+/* 温度/反馈年龄异常时整张轮卡描边：先看是哪一侧 */
+.wheel.warm { border-color: #7c5a12; box-shadow: inset 0 0 0 1px rgba(251, 191, 36, .12); }
+.wheel.hot {
+  border-color: #7f2b2b;
+  box-shadow: inset 0 0 0 1px rgba(248, 113, 113, .35), 0 0 18px rgba(248, 113, 113, .08);
+}
+.wheel.stale { border-style: dashed; }
 .wheel::before {
   content: ""; position: absolute; inset: 0 0 auto 0; height: 2px;
   background: linear-gradient(90deg, transparent, rgba(34, 211, 238, .6), transparent);
@@ -440,8 +449,51 @@ h2 { font-size: 15px; }
 
 .w-main { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .w-omega { font-family: var(--mono); font-size: 26px; font-weight: 600; letter-spacing: -.5px; color: var(--blue); }
+.w-unit { font-size: 10.5px; color: var(--muted); white-space: nowrap; }
 .w-target { font-size: 11px; color: var(--muted); }
 .w-target b { font-family: var(--mono); color: var(--accent); font-weight: 600; font-size: 12px; }
+.w-target-row {
+  display: flex; justify-content: space-between; align-items: baseline;
+  gap: 4px 10px; flex-wrap: wrap; font-size: 11px; color: var(--muted);
+}
+.w-target-row b { font-family: var(--mono); font-weight: 600; color: var(--accent); font-size: 12px; }
+.w-target-row b.ok, .w-target-row b.lvl.ok { color: var(--green); }
+.w-target-row b.warn, .w-target-row b.lvl.warn { color: var(--orange); }
+.w-target-row b.bad, .w-target-row b.lvl.bad { color: var(--red); font-weight: 700; }
+
+/* 扭矩行：数值 + 趋势条（满量程 ±10 Nm；接近 ±8 变橙） */
+.w-torque-head { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--muted); min-width: 0; }
+.w-torque-head b { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--orange); }
+.w-torque-head i { font-style: normal; font-size: 9.5px; color: var(--muted); }
+.w-torque-head .bar { flex: 1 1 40px; min-width: 0; }
+.bar-fill.hot { background: linear-gradient(90deg, #f59e0b, #ef4444); }
+
+/* 轮子的 6 个细节字段：两列网格（390px 也放得下），ERR 占整行 */
+.wheel-facts {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px; margin: 0;
+}
+.wheel-facts > div {
+  min-width: 0; padding: 4px 7px; border-radius: 7px;
+  background: rgba(255, 255, 255, .025); border: 1px solid rgba(38, 48, 61, .9);
+}
+.wheel-facts dt { font-size: 9.5px; color: var(--muted); margin-bottom: 1px; white-space: nowrap; }
+.wheel-facts dd {
+  margin: 0; font-family: var(--mono); font-size: 12px; color: #c6d3e2;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.wheel-facts b { font-weight: 600; color: var(--text); }
+.wheel-facts .span2 { grid-column: 1 / -1; }
+.wheel-facts .span2 dd { white-space: normal; overflow-wrap: anywhere; }
+.lvl.ok { color: var(--green); }
+.lvl.warn { color: var(--orange); }
+.lvl.bad { color: var(--red); font-weight: 700; }
+
+.card-note {
+  margin: 12px 0 0; padding-top: 9px; border-top: 1px dashed var(--border);
+  color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere;
+}
+.card-note b { color: #f4d58d; }
 
 .bar {
   position: relative; height: 9px; border-radius: 5px;
@@ -495,12 +547,31 @@ h2 { font-size: 15px; }
 .imu-body { display: grid; grid-template-columns: minmax(220px, 300px) minmax(0, 1fr); gap: 14px; align-items: stretch; }
 @media (max-width: 720px) { .imu-body { grid-template-columns: 1fr; } }
 
-.imu-nums { display: flex; flex-direction: column; gap: 10px; }
+.imu-nums { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
 .imu-row { display: flex; flex-direction: column; gap: 4px; }
 .imu-row .k { font-size: 11px; color: var(--muted); }
-.imu-row .v { display: flex; gap: 10px; font-family: var(--mono); }
+.imu-row .v { display: flex; gap: 10px; font-family: var(--mono); flex-wrap: wrap; }
 .imu-row .v b { font-weight: 600; font-size: 15px; min-width: 56px; color: var(--text); }
 .imu-row .v i { color: var(--muted); font-style: normal; font-size: 10px; align-self: flex-end; }
+
+/* 加速度模长：静止≈9.81；偏离说明振动/碰撞/姿态变化 */
+.imu-mag-box {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px;
+  padding: 8px 10px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--bg-soft);
+}
+.imu-mag-box .k { width: 100%; font-size: 11px; color: var(--muted); }
+.imu-mag-box .v { display: flex; align-items: baseline; gap: 6px; font-family: var(--mono); }
+.imu-mag-box .v b { font-size: 24px; font-weight: 600; color: var(--accent); letter-spacing: -.5px; }
+.imu-mag-box .v i { color: var(--muted); font-style: normal; font-size: 10px; }
+.imu-ref { font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.imu-ref b { color: var(--text); }
+
+.probe { display: flex; flex-direction: column; gap: 5px; }
+.probe .k { font-size: 11px; color: var(--muted); }
+.probe .flags { gap: 4px; }
+.probe .flag { padding: 3px 8px; font-size: 10.5px; }
+.probe .hint { font-family: var(--mono); font-size: 10px; overflow-wrap: anywhere; }
 
 .level { display: flex; align-items: center; gap: 12px; }
 .bubble {

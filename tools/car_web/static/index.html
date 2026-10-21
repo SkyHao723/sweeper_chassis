@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d1117" />
   <title>小车遥控器</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2322d3ee'/%3E%3Ctext x='16' y='23' font-size='15' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23051016'%3ERC%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/style.css?v=1.2.0" />
+  <link rel="stylesheet" href="/static/style.css?v=1.3.0" />
 </head>
 <body>
   <header class="topbar">
@@ -121,8 +121,8 @@
     <div class="right-col">
       <section class="card wheels">
         <div class="card-head">
-          <h2>轮速</h2>
-          <span class="hint">实际 ω / 目标 ω · rad/s（电机原始方向，前进为负；条形图 ±6）</span>
+          <h2>电机详情</h2>
+          <span class="hint">44B 状态帧 20 Hz · 实际/目标 ω、扭矩、累计位置、ERR、温度、反馈年龄</span>
         </div>
         <div class="wheel-grid">
           <div class="wheel" id="wheel0">
@@ -135,17 +135,27 @@
             </div>
             <div class="w-main">
               <span class="w-omega" id="w0omega">+0.00</span>
-              <span class="w-target">目标 <b id="w0target">+0.00</b></span>
+              <span class="w-unit">rad/s 实际</span>
             </div>
             <div class="bar"><div class="bar-fill" id="w0fill"></div><div class="bar-mark" id="w0mark"></div></div>
-            <div class="w-sub">
-              <span>τ <b id="w0torque">+0.00</b> Nm</span>
-              <span class="bar small"><div class="bar-fill" id="w0tqfill"></div></span>
+            <div class="w-target-row">
+              <span>目标 <b id="w0target">+0.00</b> rad/s</span>
+              <span>偏差 <b id="w0dev">0.00</b> · 跟随 <b id="w0follow">—</b></span>
             </div>
-            <div class="w-foot">
-              <span class="err" id="w0err">ERR —</span>
-              <span class="temp" id="w0temp">MOS — · 线圈 —</span>
+            <div class="w-torque">
+              <div class="w-torque-head">
+                <span>扭矩 τ</span>
+                <b id="w0torque">+0.00</b><i>Nm</i>
+                <span class="bar small"><div class="bar-fill" id="w0tqfill"></div></span>
+              </div>
             </div>
+            <dl class="wheel-facts">
+              <div><dt>累计位置</dt><dd><b id="w0pos">+0.00</b> rad</dd></div>
+              <div><dt>反馈年龄</dt><dd><b class="lvl" id="w0age">—</b></dd></div>
+              <div><dt>MOS 温度</dt><dd><b class="lvl" id="w0mos">—</b> ℃</dd></div>
+              <div><dt>线圈温度</dt><dd><b class="lvl" id="w0coil">—</b> ℃</dd></div>
+              <div class="span2"><dt>ERR</dt><dd><span class="err" id="w0err">ERR —</span></dd></div>
+            </dl>
           </div>
 
           <div class="wheel" id="wheel1">
@@ -158,19 +168,36 @@
             </div>
             <div class="w-main">
               <span class="w-omega" id="w1omega">+0.00</span>
-              <span class="w-target">目标 <b id="w1target">+0.00</b></span>
+              <span class="w-unit">rad/s 实际</span>
             </div>
             <div class="bar"><div class="bar-fill" id="w1fill"></div><div class="bar-mark" id="w1mark"></div></div>
-            <div class="w-sub">
-              <span>τ <b id="w1torque">+0.00</b> Nm</span>
-              <span class="bar small"><div class="bar-fill" id="w1tqfill"></div></span>
+            <div class="w-target-row">
+              <span>目标 <b id="w1target">+0.00</b> rad/s</span>
+              <span>偏差 <b id="w1dev">0.00</b> · 跟随 <b id="w1follow">—</b></span>
             </div>
-            <div class="w-foot">
-              <span class="err" id="w1err">ERR —</span>
-              <span class="temp" id="w1temp">MOS — · 线圈 —</span>
+            <div class="w-torque">
+              <div class="w-torque-head">
+                <span>扭矩 τ</span>
+                <b id="w1torque">+0.00</b><i>Nm</i>
+                <span class="bar small"><div class="bar-fill" id="w1tqfill"></div></span>
+              </div>
             </div>
+            <dl class="wheel-facts">
+              <div><dt>累计位置</dt><dd><b id="w1pos">+0.00</b> rad</dd></div>
+              <div><dt>反馈年龄</dt><dd><b class="lvl" id="w1age">—</b></dd></div>
+              <div><dt>MOS 温度</dt><dd><b class="lvl" id="w1mos">—</b> ℃</dd></div>
+              <div><dt>线圈温度</dt><dd><b class="lvl" id="w1coil">—</b> ℃</dd></div>
+              <div class="span2"><dt>ERR</dt><dd><span class="err" id="w1err">ERR —</span></dd></div>
+            </dl>
           </div>
         </div>
+        <p class="card-note">
+          <b>关于“电流”</b>：达妙 DM-H65 反馈的是<b>扭矩 τ（Nm）</b>（12 bit，量程 ±40 Nm），
+          不是相电流 A。固件只写控制模式，<b>没有读 KT 寄存器（0x01 KT_Value）</b>，
+          所以本页不显示“电流”，也不做 Nm→A 换算；要电流需先在固件里读 KT 再换算。
+          <br />扭矩/位置是<b>电机原始方向</b>（固件 DM_DIR_SIGN=-1，车前进时 ω 为负）。
+          ERR 0=失能、1=使能都算正常，其它码红色高亮。
+        </p>
       </section>
 
       <section class="card">
@@ -183,17 +210,22 @@
 
       <section class="card imu">
         <div class="card-head">
-          <h2>IMU</h2>
+          <h2>IMU / 姿态</h2>
           <span class="hint" id="imuHint">等待数据</span>
         </div>
         <div class="imu-body">
           <div class="imu-nums">
+            <div class="imu-mag-box">
+              <span class="k">加速度模长 |a|</span>
+              <span class="v"><b id="imuMag">—</b><i>m/s²</i></span>
+              <span class="imu-ref">静止参考 9.81 · 偏离 Δ<b id="imuMagDev">—</b> m/s²</span>
+            </div>
             <div class="imu-row">
-              <span class="k">加速度</span>
+              <span class="k">加速度 ax / ay / az</span>
               <span class="v"><b id="ax">—</b><b id="ay">—</b><b id="az">—</b> <i>m/s²</i></span>
             </div>
             <div class="imu-row">
-              <span class="k">角速度</span>
+              <span class="k">角速度 gx / gy / gz</span>
               <span class="v"><b id="gx">—</b><b id="gy">—</b><b id="gz">—</b> <i>rad/s</i></span>
             </div>
             <div class="level">
@@ -202,6 +234,16 @@
                 <span>倾角</span>
                 <b id="tilt">—</b>
               </div>
+            </div>
+            <div class="probe">
+              <span class="k">IMU 体检</span>
+              <div class="flags">
+                <span class="flag" id="imuProbeVersion"><i class="dot"></i>版本</span>
+                <span class="flag" id="imuProbeGyro"><i class="dot"></i>陀螺</span>
+                <span class="flag" id="imuProbeMag"><i class="dot"></i>磁力</span>
+                <span class="flag" id="imuProbeEver"><i class="dot"></i>陀螺曾读到</span>
+              </div>
+              <span class="hint" id="imuMeta">地址 — · 版本 —</span>
             </div>
           </div>
           <div class="wave-wrap">
@@ -235,14 +277,17 @@
         </div>
         <dl class="diag-grid">
           <div><dt>串口</dt><dd id="dPort">—</dd></div>
-          <div><dt>接收年龄</dt><dd id="dRxAge">—</dd></div>
+          <div><dt>遥测接收年龄</dt><dd id="dRxAge">—</dd></div>
+          <div><dt>状态帧年龄</dt><dd id="dStatusAge">—</dd></div>
           <div><dt>发送</dt><dd id="dTx">—</dd></div>
           <div><dt>帧计数</dt><dd id="dFrames">—</dd></div>
           <div><dt>坏帧 / 重同步</dt><dd id="dBad">—</dd></div>
           <div><dt>底盘回读指令</dt><dd id="dEcho">—</dd></div>
-          <div><dt>启动阶段</dt><dd id="dBoot">—</dd></div>
+          <div><dt>启动阶段</dt><dd class="lvl" id="dBoot">—</dd></div>
           <div><dt>IMU 诊断</dt><dd id="dImu">—</dd></div>
-          <div><dt>CAN 失败 / 反馈帧</dt><dd id="dCan">—</dd></div>
+          <div><dt>协议版本</dt><dd id="dProto">—</dd></div>
+          <div><dt>反馈年龄 左 / 右</dt><dd id="dFbAge">—</dd></div>
+          <div><dt>CAN 失败 / 反馈帧</dt><dd class="lvl" id="dCan">—</dd></div>
         </dl>
         <div class="events">
           <div class="events-head">最近事件</div>
@@ -252,11 +297,11 @@
 
       <footer class="footer">
         <span>RK3576 串口 → STM32 → 达妙 DM-H65 · 本页 20 Hz 推状态、20 Hz 发指令</span>
-        <span id="footerVer">car_web 1.2</span>
+        <span id="footerVer">car_web 1.3.0</span>
       </footer>
     </div>
   </main>
 
-  <script src="/static/app.js?v=1.2.0"></script>
+  <script src="/static/app.js?v=1.3.0"></script>
 </body>
 </html>

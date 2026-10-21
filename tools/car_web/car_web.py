@@ -40,7 +40,7 @@
 
 自测
     python3 car_web.py --sim            # 不开串口，内部仿真产生 24/44 字节帧
-    python3 selftest.py                 # 39 项断言（需要浏览器；否则 --no-browser）
+    python3 selftest.py                 # 45 项断言（需要浏览器；否则 --no-browser）
     python3 car_web.py                  # 真机：/dev/wheeltec_controller @115200
 """
 
@@ -67,6 +67,10 @@ from urllib.parse import unquote, urlparse
 # ---------------------------------------------------------------------------
 # 1. 协议常量与编解码
 # ---------------------------------------------------------------------------
+
+# 页面/接口版本：改前端静态资源时一定要一起改，index.html 的 ?v= 会跟着变，
+# 否则浏览器会拿缓存的旧 app.js 跑新 HTML（现场排查过好几次）。
+VERSION = "1.3.0"
 
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
@@ -185,6 +189,38 @@ BOOT_STAGE_NAMES = {
     0: "启动中", 1: "正常", 2: "CAN 初始化失败(已降级)",
     3: "IMU 从未读到(已跳过)", 4: "CAN 与 IMU 都失败",
 }
+
+
+# 颜色分级只在这里定义一次：后端把等级算进 /api/state，前端只负责套 CSS。
+# 阈值来自现场经验：MOS/线圈 >70℃ 橙、>85℃ 红（达妙反馈的原始字节就是 ℃）；
+# 反馈年龄 >200 ms 橙、>500 ms 红（200 ms 也是固件判轮速"新鲜"的门槛）。
+def temp_level(c: int) -> str:
+    if c > 85:
+        return "bad"
+    if c > 70:
+        return "warn"
+    return "ok"
+
+
+def age_level(ms: int) -> str:
+    if ms == 0xFFFF:                     # 固件用 0xFFFF 表示"从没收到过反馈"
+        return "bad"
+    if ms > 500:
+        return "bad"
+    if ms > 200:
+        return "warn"
+    return "ok"
+
+
+def boot_level(stage: int) -> str:
+    """启动阶段码 → 颜色等级（0 启动中按警告处理，1 正常，2/3 降级，4 双失败）。"""
+    if stage == 1:
+        return "ok"
+    if stage in (2, 3):
+        return "warn"
+    if stage == 4:
+        return "bad"
+    return "warn"
 
 
 def xor_bcc(data: bytes) -> int:
@@ -309,21 +345,40 @@ def decode_status(f: bytes) -> dict[str, Any]:
     def wheel(i: int) -> dict[str, Any]:
         base = 6 + i * 2
         err = f[18 + i]
+        omega = _i16(f, base) / 100.0
+        target = _i16(f, 10 + i * 2) / 100.0
+        mos = f[20 + i]
+        coil = f[22 + i]
+        age = _u16(f, 32 + i * 2)
+        dev = target - omega
+        # 跟随度：只在 |目标| ≥0.5 rad/s 时才有意义（目标接近 0 时分母太小，
+        # 100% 的抖动会被算成很大的跟随误差）。None = 不显示，不编数。
+        follow = None
+        if abs(target) >= 0.5:
+            follow = round(clamp(100.0 * (1.0 - abs(dev) / abs(target)),
+                                 0.0, 100.0), 1)
         return {
-            "omega": _i16(f, base) / 100.0,
-            "target": _i16(f, 10 + i * 2) / 100.0,
+            "omega": omega,
+            "target": target,
+            # 偏差 = 目标 - 实际（rad/s）；正=电机还没跟上，负=冲过头
+            "dev": round(dev, 2),
+            "follow_pct": follow,
             "torque": _i16(f, 14 + i * 2) / 100.0,
             "err": err,
             "err_text": ERR_NAMES.get(err, "未知故障 0x%X" % err),
             "fault": err > 1,
-            "mos_temp": f[20 + i],
-            "coil_temp": f[22 + i],
+            "mos_temp": mos,
+            "coil_temp": coil,
+            "mos_level": temp_level(mos),
+            "coil_level": temp_level(coil),
             "pos": _i16(f, 24 + i * 2) / 100.0,
-            "fb_age_ms": _u16(f, 32 + i * 2),
+            "fb_age_ms": age,
+            "age_level": age_level(age),
             "online": flags["left_online" if i == 0 else "right_online"],
             "enabled": flags["left_enabled" if i == 0 else "right_enabled"],
         }
 
+    boot = f[41]
     return {
         "flags_raw": raw_flags,
         "flags": flags,
@@ -340,9 +395,13 @@ def decode_status(f: bytes) -> dict[str, Any]:
         "imu_addr": f[38],
         "imu_probe": f[39],
         "imu_gyro_ok": bool(f[39] & 0x80),
+        "imu_probe_version": bool(f[39] & 0x01),
+        "imu_probe_gyro": bool(f[39] & 0x02),
+        "imu_probe_mag": bool(f[39] & 0x04),
         "imu_ver": f[40],
-        "boot_stage": f[41],
-        "boot_stage_text": BOOT_STAGE_NAMES.get(f[41], "未知(%d)" % f[41]),
+        "boot_stage": boot,
+        "boot_stage_text": BOOT_STAGE_NAMES.get(boot, "未知(%d)" % boot),
+        "boot_level": boot_level(boot),
     }
 
 
@@ -808,8 +867,37 @@ class CarHub:
                         "good": (on == good_on),
                     })
 
+            # IMU 派生量：全部由 24 字节帧的 ax/ay/az/gx/gy/gz 算出，
+            # 不是新增传感器字段。静止时 accel_mag 应≈9.81 m/s²，明显偏离
+            # 说明有振动/碰撞/模块没装平（或 az 被 ±2g 量程夹住）。
+            imu = None
+            if tel:
+                ax, ay, az = tel["ax"], tel["ay"], tel["az"]
+                gx, gy, gz = tel["gx"], tel["gy"], tel["gz"]
+                accel_mag = math.sqrt(ax * ax + ay * ay + az * az)
+                imu = {
+                    "accel_mag": round(accel_mag, 3),
+                    "gyro_mag": round(math.sqrt(gx * gx + gy * gy + gz * gz), 4),
+                    "tilt_deg": round(math.degrees(math.atan2(
+                        math.hypot(ax, ay), abs(az) or 1e-9)), 2),
+                }
+                if st:
+                    imu.update({
+                        "status": st["imu_status"],
+                        "status_text": st["imu_status_text"],
+                        "addr": st["imu_addr"],
+                        "version_major": st["imu_ver"],
+                        "probe": {
+                            "version": st["imu_probe_version"],
+                            "gyro": st["imu_probe_gyro"],
+                            "mag": st["imu_probe_mag"],
+                            "gyro_ever_ok": st["imu_gyro_ok"],
+                        },
+                    })
+
             return {
                 "ok": True,
+                "version": VERSION,
                 "ts": round(now - self.started, 3),
                 "sim": self.sim,
                 "link": {
@@ -878,6 +966,8 @@ class CarHub:
                 },
                 "telemetry": tel,
                 "status": st,
+                # IMU 派生量（模长/倾角/体检位）；没有遥测帧时为 None
+                "imu": imu,
                 "flags": flags,
                 "odom": {
                     "distance": round(self.distance, 3),
@@ -1364,7 +1454,7 @@ MIME = {
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "CarWeb/1.2"
+    server_version = "CarWeb/" + VERSION
     protocol_version = "HTTP/1.1"
 
     hub: CarHub = None          # 由 make_server() 注入
@@ -1515,8 +1605,8 @@ class Handler(BaseHTTPRequestHandler):
         st = s["status"]
         tel = s["telemetry"]
         lines = [
-            "car_web  模式=%s  时间=%.1fs  客户端=%d" %
-            ("SIM" if s["sim"] else "REAL", s["ts"], s["ws_clients"]),
+            "car_web %s  模式=%s  时间=%.1fs  客户端=%d" %
+            (VERSION, "SIM" if s["sim"] else "REAL", s["ts"], s["ws_clients"]),
             "串口: %s @%d %s  rx年龄=%s  tx=%d  tel=%d  st=%d  坏帧=%d" % (
                 link["port"], link["baud"], "OK" if link["open"] else "DOWN(%s)" % link["error"],
                 "—" if link["rx_age_ms"] is None else "%sms" % link["rx_age_ms"],
@@ -1538,9 +1628,11 @@ class Handler(BaseHTTPRequestHandler):
                 cmd["reason"], "是" if cmd["clamped"] else "否", cmd["age_ms"]),
         ]
         if tel:
+            imu = s["imu"] or {}
             lines.append("遥测: vx=%+.3f m/s  wz=%+.3f rad/s  IMU a=(%.2f,%.2f,%.2f) "
-                         "g=(%.3f,%.3f,%.3f)  stop=%s  bat=%dmV" % (
+                         "|a|=%.2f m/s²  g=(%.3f,%.3f,%.3f)  stop=%s  bat=%dmV" % (
                              tel["vx"], tel["wz"], tel["ax"], tel["ay"], tel["az"],
+                             imu.get("accel_mag", 0.0),
                              tel["gx"], tel["gy"], tel["gz"], tel["stop"], tel["bat_mv"]))
         else:
             lines.append("遥测: 还没有收到 0x7B 帧")
@@ -1548,16 +1640,21 @@ class Handler(BaseHTTPRequestHandler):
             lines.append("状态: flags=0x%02X %s" % (
                 st["flags_raw"], " ".join(
                     "%s=%d" % (f["label"], 1 if f["on"] else 0) for f in s["flags"])))
-            lines.append("  左: ω=%+.2f/目标%+.2f rad/s  τ=%+.2f Nm  ERR=%d(%s)  MOS=%d℃ 线圈=%d℃" % (
-                st["left"]["omega"], st["left"]["target"], st["left"]["torque"],
-                st["left"]["err"], st["left"]["err_text"],
-                st["left"]["mos_temp"], st["left"]["coil_temp"]))
-            lines.append("  右: ω=%+.2f/目标%+.2f rad/s  τ=%+.2f Nm  ERR=%d(%s)  MOS=%d℃ 线圈=%d℃" % (
-                st["right"]["omega"], st["right"]["target"], st["right"]["torque"],
-                st["right"]["err"], st["right"]["err_text"],
-                st["right"]["mos_temp"], st["right"]["coil_temp"]))
-            lines.append("  底盘回读指令=(%.3f, %.3f)  启动=%s  IMU=%s" % (
-                st["cmd_vx"], st["cmd_wz"], st["boot_stage_text"], st["imu_status_text"]))
+            for tag, w in (("左", st["left"]), ("右", st["right"])):
+                age = "从未收到" if w["fb_age_ms"] == 0xFFFF else "%dms" % w["fb_age_ms"]
+                lines.append(
+                    "  %s: ω=%+.2f/目标%+.2f (Δ%+.2f, 跟随%s) rad/s  τ=%+.2f Nm  "
+                    "位置=%+.2f rad  ERR=%d(%s)  MOS=%d℃(%s) 线圈=%d℃(%s)  反馈年龄=%s(%s)" % (
+                        tag, w["omega"], w["target"], w["dev"],
+                        "—" if w["follow_pct"] is None else "%.0f%%" % w["follow_pct"],
+                        w["torque"], w["pos"], w["err"], w["err_text"],
+                        w["mos_temp"], w["mos_level"], w["coil_temp"], w["coil_level"],
+                        age, w["age_level"]))
+            lines.append("  底盘回读指令=(%.3f, %.3f)  启动=%s(%s)  IMU=%s  "
+                         "CAN失败=%d 反馈帧=%d" % (
+                             st["cmd_vx"], st["cmd_wz"], st["boot_stage_text"],
+                             st["boot_level"], st["imu_status_text"],
+                             st["can_fail"], st["fb_count"]))
         else:
             lines.append("状态: 还没有收到 0x7E 帧")
         lines.append("里程: %.3f m  偏航=%.1f°  急停=%s" %

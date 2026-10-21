@@ -27,10 +27,10 @@ Web 端只用标准库 `http.server` + 自己实现的极简 WebSocket，**不�
 | 文件 | 作用 |
 |---|---|
 | `car_web.py` | 后端：串口收发（单线程）、帧同步/BCC 校验、解码、WebSocket 广播、HTTP API、安全状态机、`--sim` 仿真 |
-| `static/index.html` | 页面结构（驾驶区、轮速、flags、IMU、里程、链路诊断） |
+| `static/index.html` | 页面结构（驾驶区、电机详情、flags、IMU/姿态、里程、链路诊断） |
 | `static/style.css` | 深色卡片样式，无外网依赖，移动端适配 |
 | `static/app.js` | 摇杆/键盘输入、20 Hz 指令发送、状态渲染、IMU 波形、急停与页面生命周期 |
-| `selftest.py` | `--sim` 离线自测：39 项断言（含方向、加减速、停车分类、6 档、真实浏览器） |
+| `selftest.py` | `--sim` 离线自测：45 项断言（含方向、加减速、停车分类、6 档、新增信息显示、390px 移动端） |
 | `README.md` | 本文（启动、协议、安全、上车核对） |
 
 `--sim` 模式**不打开任何串口**，不需要 pyserial；真机模式才 `import serial`。
@@ -107,10 +107,31 @@ WantedBy=multi-user.target
   **软停**，状态行显示“缓停中”（不再是笼统的“斜坡中”）；关闭开关后恢复
   旧的阶跃行为（加速和停车都立即到位）。
   **切页、窗口失焦、页面关闭、急停、心跳超时仍然立即发 0，不走软停**（见 §4）。
-- **轮速条**：实心条 = 实际 ω，黄色竖线 = 目标 ω，满量程 ±6 rad/s（箭头贴边表示超出）。
+- **电机详情**（左右轮各一张，44 字节状态帧 20 Hz）：
+  - 大数字 = 实际 ω（rad/s），黄色竖线 = 目标 ω；条形图满量程 ±6 rad/s。
+  - **偏差 = |实际 ω − 目标 ω|**：`≤0.5` 绿、`≤2` 橙、`>2` 红；`|目标|≥0.5 rad/s`
+    时再显示**跟随度**百分比（目标太小时显示 `—`，避免除零误差）。
+    API 里的 `dev` 仍保留符号（目标−实际），界面只显示幅值以免和“前进为负”混淆。
+  - **扭矩 τ（Nm）** + 趋势条（±10 Nm，`|τ|≥8` 变橙）。这是达妙**反馈的扭矩**，
+    不是相电流（见 §3.1 后面的说明）。
+  - **累计位置**（rad，电机上电以来的累计角度，来自 `[24..27]`）。
+  - **ERR**：中文翻译；`0=失能 / 1=使能` 算正常，其它码（过流/过温/通讯丢等）红色高亮。
+  - **MOS / 线圈温度**：`>70℃` 橙、`>85℃` 红；任一超限整张轮卡描边。
+  - **反馈年龄**（ms）：`>200 ms` 橙、`>500 ms` 红/虚线描边；`从未收到` 直接红。
+    这是判断“电机掉线”最直接的指标（固件 `[32..35]`）。
 - **flags**：8 个中文字段，绿=正常、红=异常（在线/使能/命令超时/故障/IMU）。
-- **IMU**：六轴数值 + 水平泡（由 ax/ay 算）+ gz/ax 波形（最近 7.5 s）。
+- **IMU / 姿态**：六轴数值（m/s²、rad/s）+ **加速度模长 |a|**（静止应≈9.81，
+  偏离说明振动/碰撞/姿态变化或某轴被 ±2g 量程夹住）+ 水平泡 + gz/ax 波形 +
+  **IMU 体检**（版本/陀螺/磁力/陀螺是否读到过，来自 `[39]` 与 `[31][38][40]`）。
 - **里程**：用**实际** `vx/wz` 积分（不是命令值），可清零；偏航角折到 ±180°。
+- **链路诊断**：串口、遥测/状态帧年龄、发送/帧计数、坏帧/重同步、
+  底盘回读指令、**启动阶段**（中文，`[41]`）、IMU 诊断、**CAN 失败 / 反馈帧总数**
+  （`[28][29]`）、左右**反馈年龄**摘要。异常项按绿/橙/红分级。
+
+> **关于“电流”**：达妙 DM-H65 反馈帧里的 T 是 **12 bit 扭矩**（`TMAX=40 Nm`），
+> 不是相电流 A。本固件只写控制模式，**没有读 KT 寄存器（0x01 `KT_Value`）**，
+> 因此本页**不显示电流、也不做 Nm→A 换算**；需要电流请在固件里先读 KT 系数
+> 再自行换算，网页不会编一个假值。
 
 | 档位 | key | vx 上限 | wz 上限 | 提示 |
 |---|---|---|---|---|
@@ -300,29 +321,39 @@ v_right = vx + wz * TRACK/2
 
 ### 5.3 上行 44 字节状态帧（STM32 → 上位机，20 Hz）
 
-| 字节 | 含义 |
-|---|---|
-| 0 | `0x7E` |
-| 1 | flags（见下） |
-| 2..3 / 4..5 | STM32 **最近一次收到的** vx / wz（mm/s、mrad/s，不是超时后的 0） |
-| 6..7 / 8..9 | 左/右**实际** ω ×100，rad/s（电机原始方向） |
-| 10..11 / 12..13 | 左/右**目标** ω ×100，rad/s（逆解+限幅后的最终值） |
-| 14..15 / 16..17 | 左/右扭矩 ×100，Nm |
-| 18 / 19 | 左/右 ERR：**0=失能、1=使能都算正常**，其它为故障 |
-| 20 / 21 | 左/右 MOS 温度 ℃ |
-| 22 / 23 | 左/右线圈温度 ℃ |
-| 24..25 / 26..27 | 左/右位置 ×100，rad |
-| 28 / 29 | CAN 发送失败计数 / 反馈帧总数（饱和 8 位） |
-| 30 | 协议版本 = 1 |
-| 31 | IMU 诊断码（0 正常 / 1 SCL 拉不高 / 2 SDA 拉不高 / 3 总线死 / 4 无应答 / 5 读出错） |
-| 32..33 / 34..35 | 左/右反馈年龄 ms（0xFFFF = 从没收到） |
-| 36..37 | tick 低 16 位 |
-| 38 | IMU 扫描到的 I2C 地址（0 = 没扫到） |
-| 39 | IMU 体检：bit0 版本 / bit1 陀螺 / bit2 磁力 / bit7 = 读到过非零角速度 |
-| 40 | IMU 版本号 |
-| 41 | 启动阶段：0 启动中 / 1 正常 / 2 CAN 初始化失败 / 3 IMU 从未读到 / 4 两者都失败 |
-| 42 | `BCC = XOR([0..41])` |
-| 43 | `0x7D` |
+| 偏移 | 类型 | 缩放/单位 | 含义 | Web 显示 |
+|---|---|---|---|---|
+| 0 | u8 | — | `0x7E` 帧头 | 不显示（解析用） |
+| 1 | u8 | bitfield | flags（见下表） | 底盘标志位卡 |
+| 2..3 | i16 BE | ÷1000 → m/s | STM32 **最近一次收到的** vx（不是超时后的 0） | 链路诊断“底盘回读指令” |
+| 4..5 | i16 BE | ÷1000 → rad/s | 最近一次收到的 wz | 同上 |
+| 6..7 | i16 BE | ÷100 → rad/s | 左**实际** ω（电机原始方向） | 左轮大数字 + 条形图 |
+| 8..9 | i16 BE | ÷100 → rad/s | 右实际 ω | 右轮大数字 + 条形图 |
+| 10..11 | i16 BE | ÷100 → rad/s | 左**目标** ω（逆解+限幅后的最终值） | 左轮目标/偏差/跟随度 |
+| 12..13 | i16 BE | ÷100 → rad/s | 右目标 ω | 右轮目标/偏差/跟随度 |
+| 14..15 | i16 BE | ÷100 → Nm | 左扭矩 τ（达妙 12bit T，±40 Nm） | 左轮扭矩 + 趋势条 |
+| 16..17 | i16 BE | ÷100 → Nm | 右扭矩 | 右轮扭矩 + 趋势条 |
+| 18 | u8 | — | 左 ERR（0 失能 / 1 使能 / 5~E 故障） | ERR 中文 + 红/绿 |
+| 19 | u8 | — | 右 ERR | 同上 |
+| 20 | u8 | ℃ | 左 MOS 温度 | MOS 温度（>70 橙 / >85 红） |
+| 21 | u8 | ℃ | 右 MOS 温度 | 同上 |
+| 22 | u8 | ℃ | 左线圈温度 | 线圈温度（>70 橙 / >85 红） |
+| 23 | u8 | ℃ | 右线圈温度 | 同上 |
+| 24..25 | i16 BE | ÷100 → rad | 左累计位置 | 左轮“累计位置” |
+| 26..27 | i16 BE | ÷100 → rad | 右累计位置 | 右轮“累计位置” |
+| 28 | u8 | 饱和计数 | CAN 发送失败计数 | 链路“CAN 失败 / 反馈帧” |
+| 29 | u8 | 饱和计数 | 反馈帧总数 | 同上 |
+| 30 | u8 | — | 协议版本 = 1 | 链路诊断“协议版本” |
+| 31 | u8 | — | IMU 诊断码（0 正常 / 1 SCL 拉不高 / 2 SDA 拉不高 / 3 总线死 / 4 无应答 / 5 读出错） | IMU 提示 / 链路“IMU 诊断” |
+| 32..33 | u16 BE | ms | 左反馈年龄（0xFFFF = 从没收到） | 左轮“反馈年龄”（>200 橙 / >500 红） |
+| 34..35 | u16 BE | ms | 右反馈年龄 | 右轮“反馈年龄” |
+| 36..37 | u16 BE | ms | tick 低 16 位 | IMU 体检行末尾的 `tick` |
+| 38 | u8 | — | IMU 扫描到的 I2C 地址（0 = 没扫到） | IMU 提示“地址 0x6A” |
+| 39 | u8 | bitfield | IMU 体检：bit0 版本 / bit1 陀螺 / bit2 磁力 / bit7 读到过非零角速度 | IMU 体检 4 个标签 |
+| 40 | u8 | — | IMU 版本号主字节 | IMU 体检行“版本” |
+| 41 | u8 | — | 启动阶段：0 启动中 / 1 正常 / 2 CAN 初始化失败 / 3 IMU 从未读到 / 4 两者都失败 | 链路“启动阶段”（中文 + 分级） |
+| 42 | u8 | — | `BCC = XOR([0..41])` | 不显示（校验用） |
+| 43 | u8 | — | `0x7D` 帧尾 | 不显示（解析用） |
 
 flags 位：
 
@@ -404,20 +435,41 @@ WebSocket 客户端消息：
 `/api/state` 主要字段：
 
 ```text
-sim, link{open,port,baud,error,tx_hz,tx_count,telemetry_count,status_count,
-          bad_frames,resync_bytes,rx_age_ms}
+version, sim
+link{open,port,baud,error,tx_hz,tx_count,telemetry_count,status_count,
+     bad_frames,resync_bytes,rx_age_ms,status_age_ms}
 cmd{vx,wz,tx_vx,tx_wz,target_vx,target_wz,reason,clamped,age_ms,has_client}
 ramp{on,default_on,vx_acc,vx_dec,wz_acc,wz_dec,out_vx,out_wz,target_vx,target_wz,
      active,mode,stopping,hard_stop,steps}
 safety{estop,timeout_ms,vx_limit,wz_limit,firmware_vx_max}
 gear{key,name,vx,wz}
 telemetry{vx,vy,wz,ax..gz,bat_mv,stop}
-status{flags_raw,flags{},left{omega,target,torque,err,err_text,mos_temp,coil_temp,
-        pos,fb_age_ms,online,enabled},right{...},cmd_vx,cmd_wz,imu_status_text,
-        boot_stage_text,...}
+imu{accel_mag,gyro_mag,tilt_deg,status,status_text,addr,version_major,
+    probe{version,gyro,mag,gyro_ever_ok}}
+status{flags_raw,flags{},left{omega,target,dev,follow_pct,torque,pos,err,err_text,
+        fault,mos_temp,coil_temp,mos_level,coil_level,fb_age_ms,age_level,
+        online,enabled},right{...},cmd_vx,cmd_wz,can_fail,fb_count,
+        imu_status_text,imu_probe_version,imu_probe_gyro,imu_probe_mag,
+        imu_gyro_ok,imu_ver,boot_stage,boot_stage_text,boot_level,...}
 odom{distance,yaw}
 events[{t,msg}]
 ```
+
+其中新增的派生字段都**不是编的**：
+
+| 字段 | 来源 | 说明 |
+|---|---|---|
+| `imu.accel_mag` | 24B 帧 `ax/ay/az` | `sqrt(ax²+ay²+az²)`，静止≈9.81 m/s² |
+| `imu.gyro_mag` | 24B 帧 `gx/gy/gz` | 三轴角速度模长 |
+| `imu.tilt_deg` | `ax/ay/az` | 与水平面夹角 |
+| `left/right.dev` | 44B 帧目标 ω − 实际 ω | rad/s（有符号）；界面显示其幅值 |
+| `left/right.follow_pct` | 同上 | `|目标|≥0.5 rad/s` 时才算，否则 `null` |
+| `left/right.pos` | 44B 帧 `[24..27]` | 累计角度 rad |
+| `left/right.fb_age_ms` | 44B 帧 `[32..35]` | 0xFFFF = 从未收到 |
+| `left/right.mos_level` / `coil_level` | 温度字节 | `>70℃`→warn，`>85℃`→bad |
+| `left/right.age_level` | 反馈年龄 | `>200 ms`→warn，`>500 ms`/0xFFFF→bad |
+| `status.boot_level` | `[41]` | 1→ok，2/3→warn，4→bad |
+| `status.can_fail` / `fb_count` | `[28]` / `[29]` | 链路质量（8 位饱和计数） |
 
 其中 `cmd.tx_vx/tx_wz` 与 `ramp.out_vx/out_wz` 是**斜坡后真正写串口**的值，
 `cmd.target_vx/target_wz` 是夹取后的目标值。
@@ -441,7 +493,7 @@ cd tools\car_web
 python selftest.py                 # 需要 Edge/Chrome；没有就加 --no-browser
 ```
 
-`selftest.py` 共 **39 项断言**，全部通过时退出码 0：
+`selftest.py` 共 **45 项断言**，全部通过时退出码 0：
 
 - 原有 22 项：页面/CSS/JS 均 200；24/44 字节帧解析、BCC、`az≈9.8`；
   低档夹取 0.5→0.15、1.0→0.50；轮速跟随目标；里程增长；
@@ -463,6 +515,13 @@ python selftest.py                 # 需要 Edge/Chrome；没有就加 --no-brow
   - **超时不软停**：0.8 m/s 行驶中心跳超时立即归零；
   - **最高档 vx**：ultra 目标/实发 1.60 m/s，且 `1.6 ≤ 硬夹 2.0 ≤ 固件 2.565`；
   - **最高档 wz**：ultra 实发 1.50 rad/s，轮速需求 4.00 rad/s < 固件 30 rad/s。
+- 新增信息显示（40~45）：
+  - **版本 1.3.0**；IMU `|a|≈9.81`（由 24B 帧 ax/ay/az 计算）；
+  - 44B **新字段**齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段；
+  - **ERR 中文映射**完整（0/1 正常，5~E 按达妙错误码翻译）；
+  - **分级阈值**：温度 `>70` 橙 / `>85` 红；反馈年龄 `>200` 橙 / `>500` 红；
+  - **390px 移动端**无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在；
+  - 页面新增值确实渲染（年龄 ms、温度、ERR 使能、`|a|≈9.81`、版本 1.3.0）。
 
 > 软停用例会持续 POST `/api/stop` 维持 500 ms 心跳（真实网页松手后就是 20 Hz 发 0）；
 > 单次 `curl /api/stop` 只软停 0.5 s，随后被心跳超时立即归零，这是 §4.3 说明的安全行为。

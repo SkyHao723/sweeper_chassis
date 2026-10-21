@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """car_web.py --sim 离线自测。
 
-覆盖断言（共 39 项）：
+覆盖断言（共 45 项）：
   * 原有 22 项：页面/静态资源、24/44 字节帧解析、BCC、档位夹取、轮速跟随、
     里程、急停锁存/复位、500 ms 心跳超时、非法档位、NaN、WebSocket 断开清零、
     真实浏览器无 JS 异常 / 无横向溢出 / canvas 有绘制。
@@ -25,6 +25,13 @@
     37 斜坡开、0.8 m/s 行驶时心跳超时仍立即归零
     38 最高档 ultra：实发 vx = 1.60 m/s，且不超过硬夹 2.0 / 固件 2.565
     39 最高档 ultra：实发 wz = 1.50 rad/s，且轮速不超固件 30 rad/s
+  * 新增信息显示（40~45）：
+    40 版本号 1.3.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
+    41 44B 新字段齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段
+    42 ERR 中文映射完整（0/1 正常，5~E 按达妙错误码翻译）
+    43 颜色分级阈值：温度 >70 橙 / >85 红；反馈年龄 >200 橙 / >500 红
+    44 390px 移动端无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在
+    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.3.0）
 
 用法（Windows / Linux 均可，只需要 Python 标准库）：
     cd tools/car_web
@@ -343,10 +350,17 @@ def find_browser() -> str | None:
 
 
 class BrowserSession:
-    """启动一个 headless 浏览器，连到本机 car_web 页面。"""
+    """启动一个 headless 浏览器，连到本机 car_web 页面。
 
-    def __init__(self, base_url: str):
+    width/height/mobile 用来做移动端断言（390px 不允许横向溢出）。
+    """
+
+    def __init__(self, base_url: str, width: int = 1280, height: int = 900,
+                 mobile: bool = False):
         self.base = base_url
+        self.width = width
+        self.height = height
+        self.mobile = mobile
         self.proc: subprocess.Popen | None = None
         self.cdp: CDP | None = None
         self.profile = ""
@@ -394,8 +408,8 @@ class BrowserSession:
         self.cdp.call("Log.enable")
         self.cdp.call("Page.enable")
         self.cdp.call("Emulation.setDeviceMetricsOverride", {
-            "width": 1280, "height": 900, "deviceScaleFactor": 1,
-            "mobile": False,
+            "width": self.width, "height": self.height, "deviceScaleFactor": 1,
+            "mobile": self.mobile,
         })
         self.cdp.call("Page.navigate", {"url": self.base + "/"})
         self.cdp.wait_event("Page.loadEventFired", timeout=15.0)
@@ -996,6 +1010,162 @@ def run(checker: Checker, base: str, args) -> None:
                       st["status"] and st["status"]["right"]["target"]))
     post_json(base, "/api/stop", {"hard": True})
     post_json(base, "/api/gear", {"gear": "low"})
+
+    # ---------------- 40~43：新增信息显示的数据来源 / 分级 ----------------
+    # 先等车停稳，加速度模长才是"静止 ≈9.81"（行驶中 ax 含向心加速度）。
+    time.sleep(0.6)
+    st = wait_state(base, lambda s: s.get("imu") is not None
+                    and s["imu"].get("accel_mag") is not None
+                    and s["cmd"]["tx_vx"] == 0, 2.0)
+    imu = st.get("imu") or {}
+    checker.check(
+        40, "版本 1.3.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）",
+        st.get("version") == "1.3.0"
+        and 8.5 <= imu.get("accel_mag", 0.0) <= 11.0
+        and abs(imu.get("tilt_deg", 99.0)) < 5.0
+        and imu.get("gyro_mag", 99.0) < 0.5
+        and (imu.get("probe") or {}).get("version") is True,
+        "version=%s imu=%s" % (st.get("version"), imu))
+
+    status = st.get("status") or {}
+    lw = status.get("left") or {}
+    rw = status.get("right") or {}
+    wheel_fields = ("omega", "target", "dev", "follow_pct", "torque", "pos",
+                    "err", "err_text", "fault", "mos_temp", "coil_temp",
+                    "mos_level", "coil_level", "fb_age_ms", "age_level")
+    checker.check(
+        41, "44B 新字段齐全且数值合理（位置/偏差/跟随/温度分级/反馈年龄/CAN/启动）",
+        all(k in lw and k in rw for k in wheel_fields)
+        and lw.get("fb_age_ms") == 20 and rw.get("fb_age_ms") == 20
+        and 20 <= lw.get("mos_temp", 0) <= 85
+        and 20 <= lw.get("coil_temp", 0) <= 85
+        and lw.get("coil_temp") == lw.get("mos_temp") + 2
+        and abs(lw.get("dev", 99.0)) <= 1.0
+        and abs(rw.get("dev", 99.0)) <= 1.0
+        and lw.get("age_level") == "ok"
+        and lw.get("mos_level") == "ok"
+        and lw.get("follow_pct") is None
+        and math.isfinite(lw.get("pos", float("nan")))
+        and math.isfinite(lw.get("torque", float("nan")))
+        and status.get("can_fail") == 0 and status.get("fb_count", 0) > 0
+        and status.get("boot_stage") == 1
+        and status.get("boot_stage_text") == "正常"
+        and status.get("boot_level") == "ok",
+        "L=%s R=%s can=%s/%s boot=%s" % (
+            {k: lw.get(k) for k in wheel_fields},
+            {k: rw.get(k) for k in wheel_fields},
+            status.get("can_fail"), status.get("fb_count"),
+            status.get("boot_stage_text")))
+
+    expected_err = {
+        0: "失能", 1: "使能", 5: "读取校准数据错误", 6: "读取电机参数错误",
+        7: "传感器读取异常", 8: "超压", 9: "欠压", 0xA: "过电流",
+        0xB: "MOS 过温", 0xC: "线圈过温", 0xD: "通讯丢失", 0xE: "过载",
+    }
+    checker.check(
+        42, "ERR 中文映射完整（0/1 正常，其余故障码按 DM 表翻译）",
+        car_web.ERR_NAMES == expected_err
+        and lw.get("err") == 1 and lw.get("err_text") == "使能"
+        and lw.get("fault") is False
+        and car_web.ERR_NAMES[0xE] == "过载"
+        and rw.get("err_text") == "使能",
+        "names=%d L=%s/%s R=%s/%s" % (
+            len(car_web.ERR_NAMES), lw.get("err"), lw.get("err_text"),
+            rw.get("err"), rw.get("err_text")))
+
+    temps = [car_web.temp_level(x) for x in (69, 70, 71, 85, 86, 120)]
+    ages = [car_web.age_level(x) for x in (0, 200, 201, 500, 501, 0xFFFF)]
+    checker.check(
+        43, "分级阈值：温度 >70 橙 / >85 红；反馈年龄 >200 橙 / >500 红",
+        temps == ["ok", "ok", "warn", "warn", "bad", "bad"]
+        and ages == ["ok", "ok", "warn", "warn", "bad", "bad"],
+        "temp=%s age=%s" % (temps, ages))
+
+    # ---------------- 44~45：390px 移动端 + 新增显示确实渲染出来 ----------------
+    if args.no_browser:
+        checker.skip(44, "390px 移动端无横向溢出、新卡片都在", "--no-browser")
+        checker.skip(45, "新增字段在页面渲染（年龄/温度/ERR/|a|/版本）", "--no-browser")
+    else:
+        browser = BrowserSession(base, width=390, height=844, mobile=True)
+        try:
+            browser.start()
+            assert browser.cdp is not None
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if browser.cdp.eval(
+                        "!!document.getElementById('wsBadge')"
+                        " && document.getElementById('wsBadge').classList.contains('ok')"):
+                    break
+                time.sleep(0.1)
+            time.sleep(0.4)       # 等第一帧 /api/state 渲染完
+            meta = browser.cdp.eval("""(() => {
+              const de = document.documentElement;
+              const boxes = ['.layout', '.topbar', '.wheel-grid', '.wheel-facts',
+                             '.diag-grid', '.imu-body', '.card-note'];
+              const inner = [];
+              for (const sel of boxes) {
+                document.querySelectorAll(sel).forEach(el => {
+                  if (el.scrollWidth > el.clientWidth + 1) inner.push(sel);
+                });
+              }
+              return {
+                width: window.innerWidth,
+                overflow: de.scrollWidth - de.clientWidth,
+                bodyOverflow: document.body.scrollWidth - de.clientWidth,
+                inner: inner,
+                wheels: document.querySelectorAll('.wheel').length,
+                hasImuMag: !!document.getElementById('imuMag'),
+                hasAge: !!document.getElementById('w0age'),
+              };
+            })()""")
+            checker.check(
+                44, "390px 移动端：无横向溢出、左右轮详情 + IMU 模长 + 反馈年龄都在",
+                meta and abs(meta["width"] - 390) <= 1
+                and meta["overflow"] <= 1 and meta["bodyOverflow"] <= 1
+                and not meta["inner"]
+                and meta["wheels"] == 2
+                and meta["hasImuMag"] and meta["hasAge"],
+                "meta=%s" % (meta,))
+
+            vals = browser.cdp.eval("""(() => {
+              const t = id => (document.getElementById(id) || {}).textContent || '';
+              const c = id => (document.getElementById(id) || {}).className || '';
+              const css = document.querySelector('link[rel=stylesheet]');
+              const js = document.querySelector('script[src]');
+              return {
+                version: t('footerVer'),
+                cssHref: css ? css.href : '',
+                jsSrc: js ? js.src : '',
+                age: t('w0age'), ageCls: c('w0age'),
+                mos: t('w0mos'), coil: t('w0coil'),
+                pos: t('w0pos'), dev: t('w0dev'), follow: t('w0follow'),
+                torque: t('w0torque'), err: t('w0err'), errCls: c('w0err'),
+                imuMag: t('imuMag'), imuMagCls: c('imuMag'),
+                boot: t('dBoot'), can: t('dCan'), fbAge: t('dFbAge'),
+                note: (document.querySelector('.card-note') || {}).textContent || '',
+              };
+            })()""")
+            note = (vals or {}).get("note", "")
+            checker.check(
+                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.3.0",
+                vals
+                and "1.3.0" in vals["version"]
+                and "1.3.0" in vals["cssHref"] and "1.3.0" in vals["jsSrc"]
+                and vals["age"].endswith(" ms") and "ok" in vals["ageCls"]
+                and vals["mos"].isdigit() and vals["coil"].isdigit()
+                and math.isfinite(float(vals["pos"]))
+                and math.isfinite(float(vals["torque"]))
+                and math.isfinite(float(vals["dev"]))
+                and "使能" in vals["err"] and "ok" in vals["errCls"]
+                and 8.5 <= float(vals["imuMag"]) <= 11.0
+                and "ok" in vals["imuMagCls"]
+                and vals["boot"] == "正常" and vals["can"].startswith("0 /")
+                and "20 ms" in vals["fbAge"]
+                and "扭矩" in note and "KT" in note and "不是相电流" in note,
+                "vals=%s" % (vals,))
+        finally:
+            browser.close()
+            time.sleep(0.3)
 
 
 def main() -> int:

@@ -482,6 +482,11 @@
     $(id).style.left = (50 + clamp(value / max, -1, 1) * 50) + "%";
   }
 
+  // 后端已经把分级算好（temp_level / age_level / boot_level），前端只套 CSS。
+  // 这样阈值只有一份，不会出现"后端 70℃ 变橙、前端 75℃ 变橙"的漂移。
+  const lvlClass = (lvl) => "lvl " + (lvl || "ok");
+  const ageText = (ms) => (ms === 0xFFFF || ms === 65535 ? "从未收到" : `${ms} ms`);
+
   function renderWheel(i, w) {
     const p = "w" + i;
     text(p + "omega", fmt(w.omega, 2));
@@ -489,8 +494,22 @@
     setBar(p + "fill", w.omega, W_OMEGA_MAX);
     setMark(p + "mark", w.target, W_OMEGA_MAX);
 
+    // 偏差幅值 = |实际 − 目标|（44B 帧 [6..9] 与 [10..13]）；界面只显示大小，
+    // 方向看上面的实际/目标两个数（电机原始方向下前进为负，带符号反而容易误读）。
+    text(p + "dev", Math.abs(w.dev).toFixed(2));
+    const devEl = $(p + "dev");
+    if (devEl) {
+      const ad = Math.abs(w.dev);
+      devEl.className = ad <= 0.5 ? "ok" : (ad <= 2 ? "warn" : "bad");
+    }
+    // 跟随度只在 |目标|≥0.5 rad/s 时由后端给出，否则显示 "—"（不编 0%）
+    text(p + "follow", w.follow_pct === null || w.follow_pct === undefined
+      ? "—" : `${w.follow_pct.toFixed(0)}%`);
+
     text(p + "torque", fmt(w.torque, 2));
     setBar(p + "tqfill", w.torque, TQ_MAX);
+    const tqfill = $(p + "tqfill");
+    if (tqfill) tqfill.classList.toggle("hot", Math.abs(w.torque) >= 8);
 
     const on = $(p + "online");
     on.textContent = w.online ? "在线" : "离线";
@@ -500,22 +519,38 @@
     en.textContent = w.enabled ? "使能" : "失能";
     en.className = "chip " + (w.enabled ? "ok" : "");
 
+    // ERR：0=失能、1=使能都算正常（绿色/中性），其它码中文 + 红色高亮
     const err = $(p + "err");
     err.textContent = `ERR ${w.err} · ${w.err_text}`;
     err.className = "err " + (w.err > 1 ? "bad" : "ok");
 
-    const temp = $(p + "temp");
-    temp.textContent = `MOS ${w.mos_temp}℃ · 线圈 ${w.coil_temp}℃`;
-    const hottest = Math.max(w.mos_temp, w.coil_temp);
-    temp.className = "temp " + (hottest >= 75 ? "bad" : hottest >= 60 ? "warn" : "");
-
-    $("wheel" + i).classList.toggle("online", !!w.online);
-
-    // 反馈年龄：>500 ms 基本等于掉线，用黄色提示（红色交给"离线"chip）
-    if (w.fb_age_ms >= 500 || w.fb_age_ms === 0xFFFF) {
-      temp.classList.add("warn");
-      temp.textContent += " · 反馈陈旧";
+    const age = $(p + "age");
+    if (age) {
+      age.textContent = ageText(w.fb_age_ms);
+      age.className = lvlClass(w.age_level);
     }
+
+    const pos = $(p + "pos");
+    if (pos) pos.textContent = fmt(w.pos, 2);
+
+    const mos = $(p + "mos");
+    if (mos) {
+      mos.textContent = w.mos_temp;
+      mos.className = lvlClass(w.mos_level);
+    }
+    const coil = $(p + "coil");
+    if (coil) {
+      coil.textContent = w.coil_temp;
+      coil.className = lvlClass(w.coil_level);
+    }
+
+    const wheel = $("wheel" + i);
+    wheel.classList.toggle("online", !!w.online);
+    // 温度/反馈年龄异常时整张轮卡描边：一眼能看出是哪一侧出问题
+    wheel.classList.toggle("hot", w.mos_level === "bad" || w.coil_level === "bad");
+    wheel.classList.toggle("warm", !wheel.classList.contains("hot")
+      && (w.mos_level === "warn" || w.coil_level === "warn"));
+    wheel.classList.toggle("stale", w.age_level === "bad");
   }
 
   function renderFlags(m) {
@@ -575,11 +610,14 @@
     if (msg) txt.textContent = msg;
   }
 
-  function renderImu(tel, st) {
+  function renderImu(tel, st, imu) {
     if (!tel) {
       ["ax", "ay", "az", "gx", "gy", "gz"].forEach((k) => text(k, "—"));
       text("tilt", "—");
+      text("imuMag", "—");
+      text("imuMagDev", "—");
       text("imuHint", "等待数据");
+      text("imuMeta", "地址 — · 版本 —");
       return;
     }
     text("ax", tel.ax.toFixed(2));
@@ -596,8 +634,38 @@
     const tilt = Math.atan2(Math.hypot(tel.ax, tel.ay), Math.abs(tel.az) || 9.80665) * 180 / Math.PI;
     text("tilt", tilt.toFixed(1) + "°");
 
+    // 模长由 24B 帧 ax/ay/az 算出（后端 snapshot.imu.accel_mag）。
+    // 静止应≈9.81；偏离说明振动/碰撞/模块装歪，或某轴被 ±2g 量程夹住。
+    const mag = imu && Number.isFinite(imu.accel_mag)
+      ? imu.accel_mag : Math.hypot(tel.ax, tel.ay, tel.az);
+    const dev = mag - 9.80665;
+    text("imuMag", mag.toFixed(2));
+    text("imuMagDev", fmt(dev, 2));
+    const magEl = $("imuMag");
+    if (magEl) {
+      const ad = Math.abs(dev);
+      magEl.className = "lvl " + (ad <= 0.6 ? "ok" : (ad <= 2.0 ? "warn" : "bad"));
+    }
+
     if (st) {
-      text("imuHint", `${st.imu_status_text} · 地址 0x${st.imu_addr.toString(16).toUpperCase()} · ${st.imu_gyro_ok ? "陀螺已读到" : "陀螺未读到"}`);
+      const addr = st.imu_addr ? `0x${st.imu_addr.toString(16).toUpperCase()}` : "未扫到";
+      text("imuHint", `${st.imu_status_text} · 地址 ${addr} · ${st.imu_gyro_ok ? "陀螺已读到" : "陀螺未读到"}`);
+      const probe = (imu && imu.probe) || {};
+      const nProbe = ["version", "gyro", "mag", "gyro_ever_ok"]
+        .filter((k) => !!probe[k]).length;
+      text("imuMeta", `IMU 体检 ${nProbe}/4 · 版本 ${st.imu_ver} · tick ${st.tick}`);
+      const setProbe = (id, ok) => {
+        const el = $(id);
+        if (el) el.className = "flag " + (ok ? "ok" : "bad");
+      };
+      setProbe("imuProbeVersion", !!probe.version);
+      setProbe("imuProbeGyro", !!probe.gyro);
+      setProbe("imuProbeMag", !!probe.mag);
+      setProbe("imuProbeEver", !!probe.gyro_ever_ok);
+    } else {
+      ["imuProbeVersion", "imuProbeGyro", "imuProbeMag", "imuProbeEver"]
+        .forEach((id) => { const el = $(id); if (el) el.className = "flag"; });
+      text("imuMeta", "地址 — · 版本 —");
     }
   }
 
@@ -618,13 +686,43 @@
     const st = m.status;
     text("dPort", m.sim ? "内部仿真（不占用串口）" : `${link.port} @ ${link.baud}`);
     text("dRxAge", link.rx_age_ms === null || link.rx_age_ms === undefined ? "—" : `${link.rx_age_ms} ms`);
+    text("dStatusAge", link.status_age_ms === null || link.status_age_ms === undefined
+      ? "—" : `${link.status_age_ms} ms`);
+    const sa = $("dStatusAge");
+    if (sa && link.status_age_ms !== null && link.status_age_ms !== undefined) {
+      sa.className = "lvl " + (link.status_age_ms > 500 ? "bad"
+        : (link.status_age_ms > 200 ? "warn" : "ok"));
+    }
     text("dTx", `${link.tx_hz} Hz · ${link.tx_count} 帧`);
     text("dFrames", `遥测 ${link.telemetry_count} · 状态 ${link.status_count}`);
     text("dBad", `${link.bad_frames} / ${link.resync_bytes} B`);
     text("dEcho", st ? `vx ${fmt(st.cmd_vx, 3)} · wz ${fmt(st.cmd_wz, 3)}` : "—");
     text("dBoot", st ? st.boot_stage_text : "—");
+    const bootEl = $("dBoot");
+    if (bootEl) bootEl.className = "lvl " + (st ? (st.boot_level || "") : "");
     text("dImu", st ? `${st.imu_status_text} · ver ${st.imu_ver}` : "—");
+    text("dProto", st ? `v${st.version}` : "—");
+    // 反馈年龄是判断"电机掉线"最直接的指标：左右各一个，取更差的那个上色
+    text("dFbAge", st ? `L ${ageText(st.left.fb_age_ms)} · R ${ageText(st.right.fb_age_ms)}` : "—");
+    const fbEl = $("dFbAge");
+    if (fbEl && st) {
+      const levels = [st.left.age_level, st.right.age_level];
+      fbEl.className = "lvl " + (levels.includes("bad") ? "bad"
+        : (levels.includes("warn") ? "warn" : "ok"));
+    }
     text("dCan", st ? `${st.can_fail} / ${st.fb_count}` : "—");
+    const canEl = $("dCan");
+    if (canEl) {
+      canEl.className = "lvl " + (st
+        ? (st.can_fail > 10 ? "bad" : (st.can_fail > 0 ? "warn" : "ok")) : "");
+    }
+  }
+
+  function renderVersion(m) {
+    const el = $("footerVer");
+    if (!el) return;
+    const v = (m && m.version) || "1.3.0";
+    text("footerVer", `car_web ${v}`);
   }
 
   function renderEvents(m) {
@@ -720,12 +818,13 @@
       renderWheel(1, st.right);
     }
     renderFlags(m);
-    renderImu(tel, st);
+    renderImu(tel, st, m.imu);
     renderOdom(m);
     renderDiag(m);
     renderEvents(m);
     renderBanner(m);
     renderSendState(m);
+    renderVersion(m);
 
     if (tel) pushWave(tel);
     drawWave();
