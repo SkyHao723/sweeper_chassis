@@ -1,17 +1,23 @@
 #include "stm32f10x.h"
 #include "Delay.h"
+#include "YbImu.h"
 
 /*==========================================================================
  * 两驱差速底盘 —— 达妙 DM-H65 轮毂电机 (DM6540-1EC) 最小"忠实桥"固件
  *
- *   本文件只做两件事:
+ *   本文件做三件事:
  *     1. 忠实执行上位机命令 —— 收 11 字节速度帧, 差速逆解后原样下发给
  *        两台达妙电机 (CAN 标准帧, 1 Mbps, 速度模式)。
- *     2. 忠实上报电机状态 —— 20 Hz 发 44 字节二进制状态帧, 内容全部来自
- *        DM 的反馈帧, 不做滤波、不做外环、不做任何"智能"修正。
+ *     2. 20 Hz 发 44 字节诊断帧 (0x7E), 内容全部来自 DM 的反馈帧, 不做
+ *        滤波、不做外环、不做任何"智能"修正。
+ *     3. 20 Hz 发 24 字节主遥测帧 (0x7B), **IMU 六轴原始值就在这一帧**:
+ *        [8..19] = accel xyz / gyro xyz。字段偏移和缩放与旧 main 分支
+ *        逐字节一致 (见 Send_MainTelemetry), 上位机/工具不用改。
  *
  *   旧固件里的 Boost 助推、Trim 轮速外环、力矩模式、偏航捕获、上电自检、
- *   IMU、里程计、继电器、死锁保护、FOC 协议、扩展帧、500 kbps 全部删除。
+ *   里程计、继电器、死锁保护、FOC 协议、扩展帧、500 kbps 全部删除;
+ *   IMU (YbImu, PB10/PB11 位翻转 I2C) 保留并恢复上报 —— 它是上位机 EKF
+ *   的独立角速度来源, 和轮速无关, 删掉就没有姿态反馈了。
  *   原因很简单: 底盘电机换成了带自己速度环的达妙伺服, 上位机也换成了
  *   RK3588。STM32 再叠一层控制律, 只会和电机内部的速度环打架; 而"桥"
  *   越简单, 出问题时越容易定位是"命令没到"还是"电机没执行"。
@@ -19,11 +25,14 @@
  *   硬件连接:
  *     USART1  PA9(TX) / PA10(RX) <-> RK3588        115200 8N1
  *     CAN1    PA12(TX) / PA11(RX) -> 左 DM (ID 1) / 右 DM (ID 2), 1 Mbps
+ *     PB10/PB11                   <-> 亚博 YbImu (软件 I2C, 地址 0x23)
  *     PB9     LED 心跳, 500 ms 翻转
  *     IWDG    主循环卡死 -> 复位; 复位后重新写模式并使能
  *
- *   本文件不实现: IMU、里程计、继电器、OLED、参数读取、浮点 printf。
- *   状态帧是定长二进制, 上位机自己按小端/大端解析, 不需要 printf。
+ *   本文件不实现: 里程计、继电器、OLED、参数读取、浮点 printf。
+ *   两帧都是定长二进制, 上位机自己按大端解析, 不需要 printf。
+ *   24 字节帧的电池电压字段保留但填 0 —— 本板没有电池采样, 达妙协议
+ *   也没有对应量, 不猜、不编。
  *========================================================================*/
 
 /*============================== 配置 ====================================
@@ -46,6 +55,7 @@
  *-----------------------------------------------------------------------*/
 #define CMD_TIMEOUT_MS      800         /* 上位机命令超时 */
 #define FB_TIMEOUT_MS       2000        /* 电机反馈超时 */
+#define WHEEL_STALE_MS      200         /* 遥测帧轮速超过这么久没回码就按 0 报 */
 #define CTRL_PERIOD_MS      20          /* 控制/下发周期 */
 #define STATUS_PERIOD_MS    50          /* 状态上报周期 */
 
@@ -54,6 +64,22 @@
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
+
+/*--------------------- 24 字节主遥测帧 (旧协议) -------------------------
+ * 旧固件 Send_MainTelemetry 的格式, 原样恢复。帧头同样是 0x7B, 和 11 字节
+ * 命令帧"同头不同向/不同长": 命令帧是上位机 -> STM32, 本帧是 STM32 ->
+ * 上位机, 靠帧长和收发方向区分。
+ *
+ * 帧同步依赖"上一字节是帧尾 0x7D、本字节是帧头 0x7B"。所以发送顺序必须
+ * 是 **先 24 字节帧, 再 44 字节诊断帧**:
+ *   ... 0x7D (tel 尾) -> 0x7E (diag 头) -> ... -> 0x7D (diag 尾)
+ *       -> 0x7B (下一帧 tel 头)                    <- 接收端在这里入帧
+ * 诊断帧被完整跳过, 它的帧尾又给下一个 0x7B 当好"前导帧尾"。
+ * 反过来的话, 诊断帧头 0x7E 前面是 0x7B 而不是帧尾, 两端都可能失去同步。
+ *-----------------------------------------------------------------------*/
+#define TEL_FRAME_SIZE      24
+#define TEL_HEAD            0x7B
+#define TEL_TAIL            0x7D
 
 #define CMD_FRAME_SIZE      11
 #define CMD_HEAD            0x7B
@@ -87,6 +113,19 @@
 
 #define DM_PARAM_ID         0x7FF       /* 参数读写广播 ID */
 
+/*------------------------------ IMU ------------------------------------
+ * YbImu 的原始量程是 ±16g / ±2000dps, 而 24 字节遥测帧里的 IMU 字段
+ * 必须是上位机约定的 ±2g / ±500dps 原始值 —— 上位机按固定系数换算:
+ *     m/s²  = 原始值 / 1671.84
+ *     rad/s = 原始值 * 0.00026644
+ * 所以这里必须先换算, 再限幅 (超量程夹住, 不能回绕)。
+ * 这两个常量与旧 main 分支完全一致, 改错不会报错, 只会让上位机数据全错。
+ *-----------------------------------------------------------------------*/
+#define IMU_ACCEL_G_TO_RAW  (9.80665f * 1671.84f)   /* g      -> ±2g   原始值 */
+#define IMU_GYRO_TO_RAW     (1.0f / 0.00026644f)    /* rad/s  -> ±500dps 原始值 */
+#define IMU_GYRO_Z_SIGN     1       /* 陀螺 Z 轴方向; 装反了就改成 -1 */
+#define IMU_DIAG_PERIOD_MS  1000    /* 读失败时, 总线检查/地址扫描最多 1 Hz */
+
 /*=========================== 全局状态 =================================*/
 volatile uint32_t g_tick_ms;            /* TIM2 1 ms 时基, 中断里自增 */
 
@@ -116,6 +155,24 @@ static uint32_t g_last_cmd_ms;          /* 最近一次合法速度帧的时刻 
 static uint8_t  g_cmd_timeout;          /* 1 = 超过 800 ms 没收到命令 */
 static float    g_target_omega[2];      /* 下发给电机的目标 rad/s */
 static uint8_t  g_can_tx_fail;          /* CAN 发送失败计数, 饱和 8 位 */
+
+/*------------------------------ IMU -----------------------------------*/
+static float    imu_accel_g[3];         /* 加速度, 单位 g (YbImu 原始量程) */
+static float    imu_gyro[3];            /* 角速度, 单位 rad/s */
+
+/* IMU 诊断状态 —— 从旧 main 分支原样搬来, 通过 44 字节诊断帧上报。
+   读失败时不清零 imu_accel_g/imu_gyro, 保留上一次的值 (旧行为)。 */
+static uint8_t  imu_ok;                 /* 1 = 最近一次读取成功(加速度有效) */
+static uint8_t  imu_gyro_ok;            /* 1 = 最近一次成功读取时角速度非零 */
+static uint8_t  imu_status;             /* YBIMU_ST_* 失败原因, 0 = 正常 */
+static uint8_t  imu_found_addr;         /* 扫描到的 I2C 地址, 0 = 没扫到 */
+static uint32_t imu_diag_ms;            /* 上次总线检查/地址扫描的时刻 */
+
+/* IMU 寄存器体检 (1 Hz)。陀螺仪恒 0 时靠它区分"只有陀螺仪坏"还是
+   "整个模块只剩加速度可用"。YbImu.c 里已不再读 0x16/0x26 长块。 */
+static uint8_t  imu_probe_flags;        /* bit0 版本 bit1 陀螺 bit2 磁力 */
+static uint8_t  imu_ver_major;          /* 模块版本号主字节 */
+static uint32_t imu_probe_ms;           /* 上次寄存器体检的时刻 */
 
 /*=========================== 1 ms 时基 ================================*/
 static void Tick_Init(void)
@@ -677,6 +734,212 @@ static void PutU16(uint8_t *p, uint16_t v)
     p[1] = (uint8_t)v;
 }
 
+/*=========================== IMU (YbImu) =============================
+ * 从旧 main 分支原样搬来的采样/有效性判定。按 20 ms 控制周期采一次,
+ * 一次 YbImu_ReadMotion 大约 1~3 ms (PB10/PB11 位翻转 I2C)。
+ *
+ * 读失败**不清零** imu_accel_g/imu_gyro —— 保留上一次的有效值, 上位机
+ * 通过 flags bit7 (以及诊断帧 [31] 的 YBIMU_ST_* 状态码) 判断可信度。
+ * 上电后从未读成功时, 数组是 0, 遥测帧就报 0: 这是"没有数据", 不是
+ * 编造出来的姿态。
+ *
+ * ★ IWDG 安全: YbImu.c 里每个等待都有上限 (SCL_WaitHigh 最多 2000 次,
+ *   读写函数的每条错误分支都会补 STOP), 没有无超时忙等; 唯一耗时长的
+ *   地址扫描 (0x08~0x77) 只在"车停着"且最多 1 Hz 时做。因此即使 IMU
+ *   拔掉/总线短路, 主循环也能在几十毫秒内回到顶部继续喂狗 ——
+ *   不会出现"I2C 读失败 -> 主循环卡死 -> 狗咬"。
+ *=====================================================================*/
+static void IMU_Tick(void)
+{
+    float accel[3];
+    float gyro[3];
+    uint8_t err;
+
+    err = YbImu_ReadMotion(accel, gyro);
+
+    if (err == YBIMU_ST_OK)
+    {
+        imu_accel_g[0] = accel[0];
+        imu_accel_g[1] = accel[1];
+        imu_accel_g[2] = accel[2];
+        imu_gyro[0] = gyro[0];
+        imu_gyro[1] = gyro[1];
+        /* Z 轴方向在这里生效: 从上往下看逆时针(左转)时 z 应为正。
+           装反了就改 IMU_GYRO_Z_SIGN = -1, 否则上位机 EKF 越纠越偏。 */
+        imu_gyro[2] = gyro[2] * (float)IMU_GYRO_Z_SIGN;
+
+        /* 静止时模块本来就把角速度归零, 所以"这一拍为 0"不是故障;
+           只记录"这次成功读取时读到过非零"。 */
+        if ((gyro[0] != 0.0f) || (gyro[1] != 0.0f) || (gyro[2] != 0.0f))
+        {
+            imu_gyro_ok = 1;
+        }
+
+        imu_ok = 1;
+        imu_status = YBIMU_ST_OK;
+        imu_found_addr = YBIMU_I2C_ADDR;
+    }
+    else
+    {
+        imu_ok = 0;
+        imu_gyro_ok = 0;
+        imu_status = err;
+
+        /* 失败了才诊断, 而且不要每次都跑; 更**只在车停着的时候**扫描。
+           地址扫描要遍历 112 个地址, 位翻转 I2C 全程 100~150 ms, 行驶中
+           做会把 CAN 下发拖顿。诊断是给停车排查用的。 */
+        if ((g_tick_ms - imu_diag_ms) >= IMU_DIAG_PERIOD_MS)
+        {
+            if ((g_eff_vx_mm == 0) && (g_eff_wz_mrad == 0))
+            {
+                uint8_t bus = YbImu_BusCheck();
+                imu_diag_ms = g_tick_ms;
+
+                if (bus != YBIMU_ST_OK)
+                {
+                    imu_status = bus;               /* 总线本身就不对 */
+                    imu_found_addr = 0;
+                }
+                else
+                {
+                    imu_found_addr = YbImu_Scan();  /* 总线好 -> 查地址/器件 */
+                    imu_status = (imu_found_addr == 0) ? YBIMU_ST_NO_ACK
+                                                       : YBIMU_ST_READ_ERR;
+                }
+            }
+            else
+            {
+                /* 在动, 先只记"读失败", 等停下来再重诊断 */
+                imu_diag_ms = g_tick_ms - IMU_DIAG_PERIOD_MS + 100;
+            }
+        }
+    }
+
+    /* 寄存器体检 (1 Hz)。放最后: 它读得最长, 不能影响上面那次关键读取。 */
+    if ((g_tick_ms - imu_probe_ms) >= IMU_DIAG_PERIOD_MS)
+    {
+        YbImu_Probe_t pr;
+
+        imu_probe_ms = g_tick_ms;
+        YbImu_Probe(&pr);
+        imu_probe_flags = (uint8_t)((pr.ver_ok   ? 0x01 : 0) |
+                                    (pr.gyro_ok  ? 0x02 : 0) |
+                                    (pr.mag_ok   ? 0x04 : 0) |
+                                    (pr.quat_ok  ? 0x08 : 0) |
+                                    (pr.euler_ok ? 0x10 : 0));
+        imu_ver_major = pr.ver[0];
+    }
+}
+
+/* 物理量 -> 协议规定的 ±2g / ±500dps 原始值, 带限幅(夹住, 不回绕)。 */
+static int16_t IMU_AccelToRaw(float accel_g)
+{
+    float v = accel_g * IMU_ACCEL_G_TO_RAW;
+
+    if (v > 32767.0f)
+    {
+        v = 32767.0f;
+    }
+    if (v < -32768.0f)
+    {
+        v = -32768.0f;
+    }
+    return (int16_t)v;
+}
+
+static int16_t IMU_GyroToRaw(float gyro_rad_s)
+{
+    float v = gyro_rad_s * IMU_GYRO_TO_RAW;
+
+    if (v > 32767.0f)
+    {
+        v = 32767.0f;
+    }
+    if (v < -32768.0f)
+    {
+        v = -32768.0f;
+    }
+    return (int16_t)v;
+}
+
+/*======================= 24 字节主遥测帧 =============================
+ * 旧协议, 20 Hz, 大端。**字段偏移/缩放必须和旧 main 分支完全一致**,
+ * 以 tools/decode_diag.py 的 tel_battery_mv / tel_gyro_raw /
+ * tel_accel_ms2 为准:
+ *   [0]     0x7B
+ *   [1]     Flag_Stop: 1 = 当前命令为停止 (超时也按停止算)
+ *   [2..3]  int16 BE 车体 vx  mm/s   (左右轮实际转速正解, 不是目标)
+ *   [4..5]  int16 BE 车体 vy  mm/s   (差速车恒 0)
+ *   [6..7]  int16 BE 车体 wz  mrad/s (左右轮差速正解)
+ *   [8..9]  int16 BE IMU ax 原始值   (±2g 量程; m/s² = 值 / 1671.84)
+ *   [10..11]        ay
+ *   [12..13]        az
+ *   [14..15]        gx               (±500dps 量程; rad/s = 值 * 0.00026644)
+ *   [16..17]        gy
+ *   [18..19]        gz
+ *   [20..21] uint16 BE 电池电压 mV   (本板无采样, 恒 0; 不编数)
+ *   [22]    BCC = XOR([0..21])
+ *   [23]    0x7D
+ *
+ * 为什么 [2..7] 报轮速正解而不是命令: 旧固件就是这么定义的, 上位机拿它
+ * 和"目标"对比才能判断底盘有没有做到; 目标看 44 字节诊断帧 [10..13]。
+ *===================================================================*/
+static void Send_MainTelemetry(void)
+{
+    uint8_t f[TEL_FRAME_SIZE];
+    uint8_t i;
+    uint8_t bcc = 0;
+    uint8_t left_fresh;
+    uint8_t right_fresh;
+    float v_left;
+    float v_right;
+    int16_t vx_mm;
+    int16_t wz_mrad;
+
+    /* 轮速用 200 ms 新鲜度(旧固件 RPM_STALE_MS), 不用控制环的 2 s 在线
+       判定: 掉线的轮子按 0 算, 否则上报的是掉线前最后一帧的残值, 看起来像在动。 */
+    left_fresh = (uint8_t)(g_fb_seen[0] &&
+                           ((g_tick_ms - g_last_fb_ms[0]) <= WHEEL_STALE_MS));
+    right_fresh = (uint8_t)(g_fb_seen[1] &&
+                            ((g_tick_ms - g_last_fb_ms[1]) <= WHEEL_STALE_MS));
+
+    v_left = left_fresh ? (g_motor[0].vel_rad_s * WHEEL_R_M) : 0.0f;
+    v_right = right_fresh ? (g_motor[1].vel_rad_s * WHEEL_R_M) : 0.0f;
+
+    vx_mm = ClampToI16((v_left + v_right) * 0.5f * 1000.0f);
+    wz_mrad = ClampToI16((v_right - v_left) / TRACK_WIDTH_M * 1000.0f);
+
+    f[0] = TEL_HEAD;
+    f[1] = (uint8_t)(((g_eff_vx_mm == 0) && (g_eff_wz_mrad == 0)) ? 1 : 0);
+    PutI16(&f[2], vx_mm);
+    PutI16(&f[4], 0);                       /* vy: 差速车没有横向速度 */
+    PutI16(&f[6], wz_mrad);
+
+    /* IMU 六轴: 读失败时保留上一次有效值 (见 IMU_Tick), 上电未读到时为 0。 */
+    PutI16(&f[8],  IMU_AccelToRaw(imu_accel_g[0]));
+    PutI16(&f[10], IMU_AccelToRaw(imu_accel_g[1]));
+    PutI16(&f[12], IMU_AccelToRaw(imu_accel_g[2]));
+    PutI16(&f[14], IMU_GyroToRaw(imu_gyro[0]));
+    PutI16(&f[16], IMU_GyroToRaw(imu_gyro[1]));
+    PutI16(&f[18], IMU_GyroToRaw(imu_gyro[2]));
+
+    /* 电池电压: 新板没有采样, 达妙反馈里也没有对应量。保留字段并填 0,
+       上位机 decode_diag.py 对 0 的处理就是"不显示 bat="。 */
+    PutU16(&f[20], 0);
+
+    for (i = 0; i < TEL_FRAME_SIZE - 2; i++)
+    {
+        bcc ^= f[i];
+    }
+    f[TEL_FRAME_SIZE - 2] = bcc;
+    f[TEL_FRAME_SIZE - 1] = TEL_TAIL;
+
+    for (i = 0; i < TEL_FRAME_SIZE; i++)
+    {
+        Port_SendByte(f[i]);
+    }
+}
+
 /* 1 ms 调一次, 把"命令超时"和"反馈在线"两个状态算好。
  *
  * ★ 命令超时只把速度清 0, **绝不发失能**:
@@ -756,6 +1019,10 @@ static void Control_Tick(void)
  *   [0] 0x7E
  *   [1] flags: bit0 左在线 bit1 右在线 bit2 左使能 bit3 右使能
  *              bit4 命令超时 bit5 左故障 bit6 右故障
+ *              bit7 IMU 最近一次读取成功 (1 = 加速度有效)
+ *        ★ 旧协议把 IMU 有效位放在 flags bit2/bit3; 本固件里 bit2/bit3
+ *          已经分配给了"左/右使能", 不能复用(同一位置 1 会被上位机误读成
+ *          使能)。所以 IMU 状态改放 bit7, 其余位含义一律不动。
  *   [2..3]  最近一次收到的 vx (mm/s) [4..5] 最近一次收到的 wz (mrad/s)
  *   [6..7]  左实际 omega x100        [8..9] 右实际 omega x100
  *   [10..11] 左目标 omega x100       [12..13] 右目标 omega x100
@@ -765,9 +1032,17 @@ static void Control_Tick(void)
  *   [22] 左线圈温度   [23] 右线圈温度
  *   [24..25] 左位置 x100 rad         [26..27] 右位置 x100 rad
  *   [28] CAN 发送失败计数 (饱和)     [29] 反馈帧总数 (饱和)
- *   [30] 版本号 = 1  [31] 保留 0
+ *   [30] 版本号 = 1
+ *   [31] IMU 诊断码 YBIMU_ST_*: 0 正常 1 SCL拉不高 2 SDA拉不高
+ *        3 总线死 4 无应答 5 读出错
+ *        ★ 旧协议把它放 [27]/[28], 但本固件 [27] 是右位置高字节、[28] 是
+ *          CAN 失败计数, 都已被占用; 所以改用原"保留 0"的 [31]。
  *   [32..33] 左反馈年龄 ms           [34..35] 右反馈年龄 ms
- *   [36..37] tick 低 16 位           [38..41] 保留 0
+ *   [36..37] tick 低 16 位
+ *   [38] IMU 扫描到的 I2C 地址 (0 = 没扫到)
+ *   [39] IMU 体检标志: bit0 版本 bit1 陀螺 bit2 磁力
+ *        bit7 = imu_gyro_ok (这次上电读到过非零角速度; 读失败会清)
+ *   [40] IMU 版本号主字节             [41] 保留 0
  *   [42] BCC = XOR(f[0..41])         [43] 0x7D
  *
  * 为什么把"目标"也报上去: 上位机只有同时看到"目标"和"实际", 才能区分
@@ -828,6 +1103,12 @@ static void Status_Send(uint32_t now)
     {
         flags |= 0x40;
     }
+    /* bit7 = IMU 最近一次读取成功。旧协议的 bit2/bit3 已被使能位占用,
+       所以 IMU 的"活/不活"只能借用 bit7, 详见上面的帧格式说明。 */
+    if (imu_ok)
+    {
+        flags |= 0x80;
+    }
 
     f[0] = STATUS_HEAD;
     f[1] = flags;
@@ -853,13 +1134,13 @@ static void Status_Send(uint32_t now)
     f[28] = g_can_tx_fail;
     f[29] = g_fb_count;
     f[30] = STATUS_VERSION;
-    f[31] = 0;
+    f[31] = imu_status;
     PutU16(&f[32], FbAge(0, now));
     PutU16(&f[34], FbAge(1, now));
     PutU16(&f[36], (uint16_t)g_tick_ms);
-    f[38] = 0;
-    f[39] = 0;
-    f[40] = 0;
+    f[38] = imu_found_addr;
+    f[39] = (uint8_t)(imu_probe_flags | (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));
+    f[40] = imu_ver_major;
     f[41] = 0;
 
     for (i = 0; i < STATUS_FRAME_SIZE - 2; i++)
@@ -954,13 +1235,18 @@ int main(void)
         if ((now - last_ctrl_ms) >= CTRL_PERIOD_MS)
         {
             last_ctrl_ms = now;
+            IMU_Tick();             /* 20 ms 采一次 IMU (旧固件 ODOM_PERIOD_MS) */
             Control_Tick();         /* 逆解 + 限幅 + 两帧速度命令 */
         }
 
+        /* 上报顺序不能反: 先 24 字节主遥测帧(0x7B), 再 44 字节诊断帧(0x7E)。
+           这样诊断帧永远夹在两个完整遥测帧之间, 接收端按"上一字节是帧尾
+           0x7D、本字节是帧头"同步时能把它整帧跳过, 下一个 0x7B 仍能入帧。 */
         if ((now - last_status_ms) >= STATUS_PERIOD_MS)
         {
             last_status_ms = now;
-            Status_Send(now);       /* 44 字节状态帧 */
+            Send_MainTelemetry();   /* 24 字节, 含 IMU 六轴 */
+            Status_Send(now);       /* 44 字节诊断帧 */
         }
 
         /* 1 ms 让出 CPU。所有周期任务都是基于 g_tick_ms 的非阻塞调度,
