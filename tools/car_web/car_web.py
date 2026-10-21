@@ -24,8 +24,20 @@
                |vx|<=0.5 m/s、|wz|<=1.0 rad/s 硬夹 + 档位夹。
     3. STM32：800 ms 收不到合法命令帧 → 目标清零（固件里已实现）。
 
+缓启缓停（默认开）
+    正常行驶指令在 step_output() 里按 vx 1.0 m/s²、wz 4.0 rad/s² 逼近目标；
+    但急停/心跳超时/目标为 0（松手、切页、失焦、回中、/api/stop）**不进斜坡**，
+    下一拍直接发 0。开关状态走 HTTP /api/ramp 或 WebSocket
+    {"t":"ramp","on":...}，/api/state 与 /status 都会回显。
+
+方向约定
+    固件逆解 v_left=vx-wz*TRACK/2、v_right=vx+wz*TRACK/2，所以 wz>0 = 左转。
+    "右推 = 右转"必须发 wz<0。唯一取反点是 static/app.js 的 WZ_CMD_SIGN=-1；
+    本文件不做符号变换，遥测/轮速也按实际值原样显示。
+
 自测
     python3 car_web.py --sim            # 不开串口，内部仿真产生 24/44 字节帧
+    python3 selftest.py                 # 33 项断言（需要浏览器；否则 --no-browser）
     python3 car_web.py                  # 真机：/dev/wheeltec_controller @115200
 """
 
@@ -88,6 +100,28 @@ HARD_VX_LIMIT = 0.50     # 与固件/需求一致的硬上限，档位只能更�
 HARD_WZ_LIMIT = 1.00
 CMD_TIMEOUT_MS = 500     # 网页心跳超时（< 固件的 800 ms，保证先由我们清零）
 
+# ---- 缓启缓停（指令斜坡）------------------------------------------------
+# 只作用于"正常行驶指令"：目标 vx/wz 变化时按下面的加速度逐步逼近，
+# 避免摇杆一推到底时的阶跃（阶跃会让电机瞬间按最大加速度冲出去）。
+#
+# 取值理由（按低/中速档 100~300 ms 到位的手感选，且远快于固件 800 ms 看门狗）：
+#   vx 1.0 m/s²：低速 0.15 m/s → 150 ms，中速 0.30 → 300 ms，高速 0.50 → 500 ms
+#   wz 4.0 rad/s²：低速 0.50 rad/s → 125 ms，中速 0.75 → 188 ms，高速 1.00 → 250 ms
+# 这两个值只在"正常指令"上生效；急停/心跳超时/目标恰好为零（松手、切页、
+# 失焦、回中、/api/stop）一律立即归零，不进入斜坡（见 step_output 的注释）。
+RAMP_DEFAULT_ON = True
+RAMP_VX_ACC = 1.0        # m/s²
+RAMP_WZ_ACC = 4.0        # rad/s²
+RAMP_MAX_DT = 0.2        # s；串口/线程卡顿后单拍最多积分这么多，防止一次跳变
+
+# 方向约定（与 static/app.js 的 WZ_CMD_SIGN 一一对应）：
+#   固件逆解 v_left = vx - wz*TRACK/2, v_right = vx + wz*TRACK/2，
+#   所以 wz > 0 = 左轮慢/右轮快 = 车向左转（逆时针）。
+#   "右推摇杆 = 右转"就必须发 wz < 0。
+# 本文件收到/发出的是**协议域**的 wz：只在 static/app.js 的 WZ_CMD_SIGN
+# 处取反一次；这里和遥测解码都不做符号变换（遥测是实际值，不能翻）。
+# 所以 build_cmd_frame() 里不要再写一个负号，否则会双重取反。
+
 # 状态帧 flags 位定义（与固件 Status_Send 一一对应）
 FLAG_BITS = (
     ("left_online",   "左在线",   True,  0x01),
@@ -130,6 +164,33 @@ def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
 
+def slew(cur: float, target: float, max_step: float) -> float:
+    """向 target 靠近最多 max_step（斜坡的单拍积分）。"""
+    delta = target - cur
+    if abs(delta) <= max_step:
+        return target
+    return cur + math.copysign(max_step, delta)
+
+
+def parse_onoff(v: Any) -> Optional[bool]:
+    """把 HTTP/WS 里常见的开关写法归一成 bool；不认识返回 None。
+
+    显式接受 0/1、"on"/"off"、true/false，避免前端/脚本传字符串时
+    bool("false") == True 这种经典坑。
+    """
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and v in (0, 1):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("1", "on", "true", "yes", "开", "开启"):
+            return True
+        if s in ("0", "off", "false", "no", "关", "关闭"):
+            return False
+    return None
+
+
 def _i16(buf: bytes, off: int) -> int:
     return struct.unpack_from(">h", buf, off)[0]
 
@@ -143,6 +204,10 @@ def build_cmd_frame(vx_m_s: float, wz_rad_s: float) -> bytes:
 
     单位在"收发的边界"上换算一次：m/s → mm/s，rad/s → mrad/s。
     中间层统一用 m/s、rad/s，避免混单位（混单位是最难查的一类 bug）。
+
+    wz 是**协议域**符号：wz<0 = 右转（固件逆解 wz>0 为左转）。
+    "网页驾驶意图 → 协议值"的唯一取反点是 static/app.js 的 WZ_CMD_SIGN；
+    本函数只搬运，不再翻符号，否则右推会变成左转。
     """
     vx_mm = int(round(clamp(vx_m_s, -HARD_VX_LIMIT, HARD_VX_LIMIT) * 1000.0))
     wz_mrad = int(round(clamp(wz_rad_s, -HARD_WZ_LIMIT, HARD_WZ_LIMIT) * 1000.0))
@@ -321,6 +386,15 @@ class CarHub:
         self.estop_time = 0.0
         self.gear = "low"            # 默认最慢档：第一次打开页面不会蹿出去
 
+        # ---- 缓启缓停（斜坡）----
+        # 默认开启：更平顺，且不改变任何停止语义。out_* 是**真正写串口**
+        # 的值（LinkWorker.step_output 推进）；ramp_* 只给状态/诊断用。
+        self.ramp_on = RAMP_DEFAULT_ON
+        self.out_vx = 0.0
+        self.out_wz = 0.0
+        self._ramp_t = 0.0           # 上一次推进斜坡的 monotonic 时间（0=还没推过）
+        self.ramp_step_count = 0
+
         # ---- 串口 ----
         self.link_open = False
         self.link_error = ""
@@ -358,6 +432,8 @@ class CarHub:
         self._prev_fault = False
         self._prev_link: Optional[bool] = None
         self.note("程序启动（%s 模式）" % ("仿真" if self.sim else "真机"))
+        self.note("缓启缓停：%s（vx %.2f m/s²，wz %.2f rad/s²；停止指令仍立即归零）"
+                  % ("开" if self.ramp_on else "关", RAMP_VX_ACC, RAMP_WZ_ACC))
 
     # -- 事件 ---------------------------------------------------------------
     def note(self, msg: str) -> None:
@@ -366,7 +442,12 @@ class CarHub:
 
     # -- 指令 ---------------------------------------------------------------
     def set_cmd(self, vx: float, wz: float, owner: int) -> None:
-        """记录网页目标值。急停锁存时也照记，但 effective() 会压成 0。"""
+        """记录网页目标值。
+
+        **急停锁存期间不接受新目标**：否则复位后会把锁存期间收到的
+        最后一帧指令放出来（"复位后必须重新推摇杆"的承诺就破了）。
+        急停时只保留 owner/count 用于诊断，目标与时间戳都保持 0。
+        """
         vx = float(vx)
         wz = float(wz)
         # JSON 里的 NaN/Infinity 会被 Python 的 json 接受，但 int(round(nan))
@@ -375,11 +456,16 @@ class CarHub:
             vx = 0.0
             wz = 0.0
         with self.lock:
+            self.cmd_owner = owner
+            self.cmd_recv_count += 1
+            if self.estop:
+                self.cmd_vx = 0.0
+                self.cmd_wz = 0.0
+                self.cmd_time = 0.0
+                return
             self.cmd_vx = vx
             self.cmd_wz = wz
-            self.cmd_owner = owner
             self.cmd_time = time.monotonic()
-            self.cmd_recv_count += 1
 
     def drop_owner(self, owner: int) -> None:
         """某个网页断开：如果它正是最后发指令的人，立刻清零。
@@ -404,6 +490,25 @@ class CarHub:
                           % (GEARS[gear]["name"], GEARS[gear]["vx"], GEARS[gear]["wz"]))
         return True
 
+    def set_ramp(self, on: bool) -> bool:
+        """开/关缓启缓停。返回是否真的发生了变化。
+
+        切换只改标志，不动 out_vx/out_wz：
+          - 运行中关闭：下一拍 step_output 直接把目标赋给输出（允许阶跃）；
+          - 运行中开启：从当前实际输出继续按斜率逼近，不会先跳一下。
+        """
+        on = bool(on)
+        with self.lock:
+            if on == self.ramp_on:
+                return False
+            self.ramp_on = on
+            if on:
+                self.note("缓启缓停已开启（vx %.2f m/s²，wz %.2f rad/s²）"
+                          % (RAMP_VX_ACC, RAMP_WZ_ACC))
+            else:
+                self.note("缓启缓停已关闭（指令直接阶跃到目标）")
+            return True
+
     def estop_on(self, why: str = "网页急停") -> None:
         with self.lock:
             self.estop = True
@@ -419,6 +524,11 @@ class CarHub:
                 return
             self.estop = False
             self.estop_time = 0.0
+            # 双保险：即使有绕过 set_cmd 的路径在锁存期间改了目标，
+            # 复位后也必须是 0，等用户重新推摇杆。
+            self.cmd_vx = 0.0
+            self.cmd_wz = 0.0
+            self.cmd_time = 0.0
             self.note("急停复位（目标仍为 0，需重新推摇杆）")
 
     def reset_odom(self) -> None:
@@ -429,23 +539,69 @@ class CarHub:
             self.note("里程清零")
 
     # -- 安全核心 -----------------------------------------------------------
-    def effective(self, now: float) -> tuple[float, float, str, bool]:
-        """算出这一拍真正要发给 STM32 的 vx/wz。
+    def _target_locked(self, now: float) -> tuple[float, float, str, bool]:
+        """算目标值（已过安全状态机 + 档位/硬上限夹取），不推进斜坡。
 
         返回 (vx, wz, 原因, 是否被夹取)。原因用于界面显示"为什么车不动"。
+        调用者必须已持有 self.lock（RLock 重入也行）。
+        """
+        if self.estop:
+            return 0.0, 0.0, "estop", False
+        if self.cmd_time <= 0.0 or (now - self.cmd_time) * 1000.0 > CMD_TIMEOUT_MS:
+            return 0.0, 0.0, "timeout", False
+        g = GEARS[self.gear]
+        vx_max = min(g["vx"], HARD_VX_LIMIT)
+        wz_max = min(g["wz"], HARD_WZ_LIMIT)
+        vx = clamp(self.cmd_vx, -vx_max, vx_max)
+        wz = clamp(self.cmd_wz, -wz_max, wz_max)
+        clamped = (abs(vx - self.cmd_vx) > 1e-9) or (abs(wz - self.cmd_wz) > 1e-9)
+        return vx, wz, "web", clamped
+
+    def effective(self, now: float) -> tuple[float, float, str, bool]:
+        """目标值（不含斜坡）。保留这个名字给状态/诊断用；**不要**在这里积分。
+
+        真正的串口输出由 LinkWorker 调 step_output() 推进，保证只有串口
+        线程按固定节拍推进斜坡，20 Hz 的 HTTP/WS 状态读取不会改变控制量。
         """
         with self.lock:
-            if self.estop:
-                return 0.0, 0.0, "estop", False
-            if self.cmd_time <= 0.0 or (now - self.cmd_time) * 1000.0 > CMD_TIMEOUT_MS:
-                return 0.0, 0.0, "timeout", False
-            g = GEARS[self.gear]
-            vx_max = min(g["vx"], HARD_VX_LIMIT)
-            wz_max = min(g["wz"], HARD_WZ_LIMIT)
-            vx = clamp(self.cmd_vx, -vx_max, vx_max)
-            wz = clamp(self.cmd_wz, -wz_max, wz_max)
-            clamped = (abs(vx - self.cmd_vx) > 1e-9) or (abs(wz - self.cmd_wz) > 1e-9)
-            return vx, wz, "web", clamped
+            return self._target_locked(now)
+
+    def step_output(self, now: float) -> tuple[float, float, str, bool]:
+        """推进一拍斜坡，返回这一拍真正写串口的 (vx, wz, 原因, 夹取)。
+
+        ★ 停止不进斜坡：以下三种情况一律立即把 out_* 置 0，不等斜率：
+          1. 急停锁存（reason=estop）；
+          2. 网页心跳超时（reason=timeout，500 ms 没收到指令）；
+          3. 目标恰好是 (0, 0)：松手 / 切后台 / 失焦 / 回中 / /api/stop
+             都会让网页发 0，目标为零就意味着"停"，必须立刻停。
+        只有目标非零的正常行驶指令（含倒车、原地转）才走 ramp_on 的斜坡。
+        这样"缓启缓停"不会把任何一条安全停止路径变慢。
+        """
+        with self.lock:
+            tvx, twz, reason, clamped = self._target_locked(now)
+
+            if self._ramp_t <= 0.0:
+                dt = 0.0
+            else:
+                dt = clamp(now - self._ramp_t, 0.0, RAMP_MAX_DT)
+            self._ramp_t = now
+
+            stopping = (reason in ("estop", "timeout")
+                        or (tvx == 0.0 and twz == 0.0))
+            if stopping:
+                # 立即归零：不积分、不保留残余，下一拍重新从 0 开始。
+                self.out_vx = 0.0
+                self.out_wz = 0.0
+            elif not self.ramp_on:
+                # 关闭时保持旧行为：直接把目标值发给串口。
+                self.out_vx = tvx
+                self.out_wz = twz
+            else:
+                self.out_vx = slew(self.out_vx, tvx, RAMP_VX_ACC * dt)
+                self.out_wz = slew(self.out_wz, twz, RAMP_WZ_ACC * dt)
+
+            self.ramp_step_count += 1
+            return self.out_vx, self.out_wz, reason, clamped
 
     # -- 串口线程回调 -------------------------------------------------------
     def set_link(self, open_: bool, error: str = "") -> None:
@@ -520,7 +676,16 @@ class CarHub:
         now = time.monotonic() if now is None else now
         with self.lock:
             g = GEARS[self.gear]
-            vx, wz, reason, clamped = self.effective(now)
+            target_vx, target_wz, reason, clamped = self._target_locked(now)
+            # 停止语义在显示上也立即生效：即使 LinkWorker 这一拍还没跑到，
+            # 也不能让界面/脚本看到"急停后还在斜坡下降"的假象。
+            stopped = (reason in ("estop", "timeout")
+                       or (target_vx == 0.0 and target_wz == 0.0))
+            out_vx = 0.0 if stopped else self.out_vx
+            out_wz = 0.0 if stopped else self.out_wz
+            ramp_active = (self.ramp_on and not stopped
+                           and (abs(out_vx - target_vx) > 1e-6
+                                or abs(out_wz - target_wz) > 1e-6))
             tel = dict(self.tel) if self.tel else None
             st = dict(self.status) if self.status else None
             if st:
@@ -561,14 +726,29 @@ class CarHub:
                 "cmd": {
                     "vx": round(self.cmd_vx, 3),
                     "wz": round(self.cmd_wz, 3),
-                    "tx_vx": round(vx, 3),
-                    "tx_wz": round(wz, 3),
+                    # tx_* = 真正写串口的值（斜坡后的输出），不是网页目标。
+                    "tx_vx": round(out_vx, 3),
+                    "tx_wz": round(out_wz, 3),
+                    "target_vx": round(target_vx, 3),
+                    "target_wz": round(target_wz, 3),
                     "reason": reason,
                     "clamped": clamped,
                     "age_ms": round(self._cmd_age_ms(now) or 0.0, 0),
                     "has_client": self._cmd_age_ms(now) is not None
                                   and (now - self.cmd_time) * 1000.0 <= CMD_TIMEOUT_MS,
                     "recv_count": self.cmd_recv_count,
+                },
+                "ramp": {
+                    "on": self.ramp_on,
+                    "default_on": RAMP_DEFAULT_ON,
+                    "vx_acc": RAMP_VX_ACC,
+                    "wz_acc": RAMP_WZ_ACC,
+                    "out_vx": round(out_vx, 3),
+                    "out_wz": round(out_wz, 3),
+                    "target_vx": round(target_vx, 3),
+                    "target_wz": round(target_wz, 3),
+                    "active": ramp_active,
+                    "steps": self.ramp_step_count,
                 },
                 "safety": {
                     "estop": self.estop,
@@ -921,7 +1101,9 @@ class LinkWorker(threading.Thread):
                 # ---- 定时发命令帧（20~50 Hz）----
                 now = time.monotonic()
                 if now >= next_tx:
-                    vx, wz, _reason, _clamped = self.hub.effective(now)
+                    # step_output 是唯一推进斜坡的地方；停止（急停/超时/目标 0）
+                    # 在里面立即归零，不会因为开了缓启缓停而变慢。
+                    vx, wz, _reason, _clamped = self.hub.step_output(now)
                     try:
                         self.link.write(build_cmd_frame(vx, wz))
                         self.hub.on_tx(vx, wz, now)
@@ -1131,6 +1313,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state":
             self._json(self.hub.snapshot())
             return
+        if path == "/api/ramp":
+            self._json({"ok": True, "ramp": self.hub.snapshot()["ramp"]})
+            return
         if path == "/status":
             self._send(200, self._status_text().encode("utf-8"),
                        "text/plain; charset=utf-8")
@@ -1154,6 +1339,18 @@ class Handler(BaseHTTPRequestHandler):
                 vx = wz = 0.0
             self.hub.set_cmd(vx, wz, owner=0)       # owner=0 表示 HTTP 客户端
             self._json({"ok": True, "cmd": self.hub.snapshot()["cmd"]})
+            return
+        if path == "/api/ramp":
+            # 接受 {"on":true}，也兼容 {"enabled":...} 与 "on"/"off"/0/1。
+            raw = body["on"] if "on" in body else body.get("enabled")
+            on = parse_onoff(raw)
+            if on is None:
+                self._json({"ok": False,
+                            "error": "on 必须是 true/false（或 1/0、on/off）"}, 400)
+                return
+            changed = self.hub.set_ramp(on)
+            self._json({"ok": True, "changed": changed,
+                        "ramp": self.hub.snapshot()["ramp"]})
             return
         if path == "/api/gear":
             gear = str(body.get("gear", ""))
@@ -1209,6 +1406,10 @@ class Handler(BaseHTTPRequestHandler):
                 link["status_count"], link["bad_frames"]),
             "档位: %s  vx≤%.2f m/s  wz≤%.2f rad/s" %
             (s["gear"]["name"], s["gear"]["vx"], s["gear"]["wz"]),
+            "缓启缓停: %s  vx斜率=%.2f m/s²  wz斜率=%.2f rad/s²  输出=(%.3f, %.3f)%s" % (
+                "开" if s["ramp"]["on"] else "关", s["ramp"]["vx_acc"],
+                s["ramp"]["wz_acc"], s["ramp"]["out_vx"], s["ramp"]["out_wz"],
+                "  斜坡中" if s["ramp"]["active"] else ""),
             "指令: 网页=(%.3f, %.3f)  实发=(%.3f, %.3f)  原因=%s  夹取=%s  年龄=%sms" % (
                 cmd["vx"], cmd["wz"], cmd["tx_vx"], cmd["tx_wz"],
                 cmd["reason"], "是" if cmd["clamped"] else "否", cmd["age_ms"]),
@@ -1340,6 +1541,10 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.set_cmd(vx, wz, owner=cid)
         elif t == "gear":
             self.hub.set_gear(str(msg.get("gear", "")))
+        elif t == "ramp":
+            on = parse_onoff(msg["on"] if "on" in msg else msg.get("enabled"))
+            if on is not None:
+                self.hub.set_ramp(on)
         elif t == "estop":
             self.hub.estop_on("网页急停（%s）" % self._client_ip())
         elif t == "estop_reset":
@@ -1420,6 +1625,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(" 链路:   %s @ %d（独占打开）" % (args.serial, args.baud), flush=True)
     print(" 命令帧: %.0f Hz   |vx|≤%.2f m/s  |wz|≤%.2f rad/s  网页心跳 %d ms" %
           (args.tx_hz, HARD_VX_LIMIT, HARD_WZ_LIMIT, CMD_TIMEOUT_MS), flush=True)
+    # 控制台在 Windows 上常是 GBK，别在这里用 ² 之类的字符（HTTP/JSON 里可以用）。
+    print(" 缓启缓停: 默认%s  vx %.2f m/s2  wz %.2f rad/s2（停止指令仍立即归零）" %
+          ("开" if RAMP_DEFAULT_ON else "关", RAMP_VX_ACC, RAMP_WZ_ACC), flush=True)
     print(" 停止:   Ctrl+C", flush=True)
     print(bar, flush=True)
 

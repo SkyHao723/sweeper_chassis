@@ -8,6 +8,17 @@
 (() => {
   "use strict";
 
+  // 转向指令符号 —— 整个项目唯一一处"驾驶意图 → 协议 wz"的取反点。
+  //
+  // 固件逆解：v_left = vx - wz*TRACK/2，v_right = vx + wz*TRACK/2，
+  // 所以 wz > 0 = 左轮慢/右轮快 = 车向左转（逆时针）。
+  // 要让"网页右推摇杆 = 车右转"，就必须发 wz < 0。
+  //
+  // 约定：本文件的 nx / x 是**驾驶意图**（右为正）；WZ_CMD_SIGN 只在
+  // steerWz() 里乘一次，产生发给后端的协议值。后端 car_web.py 原样送到
+  // 串口、遥测/轮速按实际值显示，都不再取反。以后方向要改，只改这里。
+  const WZ_CMD_SIGN = -1;
+
   // 与服务端 GEARS 一致；这里也夹一次，保证界面显示的就是实际会发的值。
   const GEARS = {
     low:  { name: "低速", vx: 0.15, wz: 0.50 },
@@ -26,11 +37,20 @@
   const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
   const fmt = (v, n) => (v >= 0 ? "+" : "") + Number(v).toFixed(n);
 
+  // 驾驶意图（右为正，[-1,1]）→ 协议 wz。唯一取反点，见 WZ_CMD_SIGN。
+  function steerWz(steer, max) {
+    return WZ_CMD_SIGN * clamp(steer, -1, 1) * max;
+  }
+
   const S = {
     ws: null,
     connected: false,
     gear: localStorage.getItem("carweb.gear") || "low",
     estop: false,
+    // 缓启缓停：服务端默认开，这里只是界面镜像；以 /api/state 的 ramp.on 为准。
+    rampOn: true,
+    rampPending: null,          // 刚点开关、还没收到服务端回显时的期望值
+    rampPendingAt: 0,
     target: { vx: 0, wz: 0 },
     dragId: null,
     keys: new Set(),
@@ -181,8 +201,9 @@
       return;
     }
     const lim = limits();
-    // 屏幕坐标：上 = 前进(+vx)，右 = 右转(wz 为负，因为 wz>0 是逆时针/左转)
-    applyTarget(-ny * lim.vx, -nx * lim.wz);
+    // 屏幕坐标：上 = 前进(+vx)，右 = 右转。右转对应协议 wz<0，
+    // 由 steerWz() 里的 WZ_CMD_SIGN 统一取反，这里不要写裸负号。
+    applyTarget(-ny * lim.vx, steerWz(nx, lim.wz));
   }
 
   pad.addEventListener("pointerdown", (ev) => {
@@ -233,8 +254,9 @@
     moveKnob(x * g.max * 0.82, y * g.max * 0.82);
     if (x === 0 && y === 0) { applyTarget(0, 0); return; }
     const lim = limits();
-    // 斜向不做 0.707 缩放：键盘本来就是离散控制，满幅更直观
-    applyTarget(-y * lim.vx, -x * lim.wz);
+    // 斜向不做 0.707 缩放：键盘本来就是离散控制，满幅更直观。
+    // 键盘 D / → 是"右"，同样走 steerWz() 的唯一取反点。
+    applyTarget(-y * lim.vx, steerWz(x, lim.wz));
   }
 
   window.addEventListener("keydown", (ev) => {
@@ -289,6 +311,39 @@
   document.querySelectorAll(".gear-btn").forEach((btn) => {
     btn.addEventListener("click", () => setGear(btn.dataset.gear));
   });
+
+  // ---------------------------------------------------------------------
+  // 缓启缓停开关（真正的斜坡在后端；前端只负责开关状态和显示）
+  // ---------------------------------------------------------------------
+  function renderRamp() {
+    const sw = $("rampToggle");
+    if (sw) sw.checked = !!S.rampOn;
+    const state = $("rampState");
+    if (state) {
+      state.textContent = S.rampOn ? "开" : "关";
+      state.className = "ramp-state " + (S.rampOn ? "on" : "off");
+    }
+    const row = $("rampRow");
+    if (row) row.classList.toggle("on", !!S.rampOn);
+    const hint = $("rampHint");
+    if (hint) {
+      hint.textContent = S.rampOn
+        ? "正常指令按受控斜率过渡；松手、切页、急停、超时仍立即归零"
+        : "已关闭：指令直接阶跃到目标（旧行为）";
+    }
+  }
+
+  function setRamp(on) {
+    S.rampOn = !!on;
+    S.rampPending = !!on;
+    S.rampPendingAt = performance.now();
+    renderRamp();
+    // 服务端会在 20 Hz 的 state 里回显 ramp.on；断线时开关只改本地显示，
+    // 重连后以服务端状态为准。
+    send({ t: "ramp", on: S.rampOn });
+  }
+
+  $("rampToggle").addEventListener("change", (ev) => setRamp(ev.target.checked));
 
   $("btnEstop").addEventListener("click", () => {
     S.estop = true;               // 本地先禁摇杆，不等服务器往返
@@ -573,6 +628,26 @@
       renderGear();
     }
 
+    // 缓启缓停：以服务端为准；刚点开关的 ~1.5 s 内用本地期望值，
+    // 避免服务端回显慢半拍导致开关闪一下。
+    if (m.ramp) {
+      const srvOn = !!m.ramp.on;
+      if (S.rampPending !== null) {
+        if (srvOn === S.rampPending || performance.now() - S.rampPendingAt > 1500) {
+          S.rampPending = null;
+          S.rampOn = srvOn;
+          renderRamp();
+        }
+      } else if (srvOn !== S.rampOn) {
+        S.rampOn = srvOn;
+        renderRamp();
+      }
+      const live = $("rampLive");
+      if (live) live.textContent = m.ramp.active ? "斜坡中" : "";
+      const row = $("rampRow");
+      if (row) row.classList.toggle("ramping", !!m.ramp.active);
+    }
+
     const wasEstop = S.estop;
     S.estop = !!(m.safety && m.safety.estop);
     if (wasEstop && !S.estop) {
@@ -691,6 +766,7 @@
   // 启动
   // ---------------------------------------------------------------------
   renderGear();
+  renderRamp();
   updateEstopUI();
   updateBadges(null);
   renderSendState(null);

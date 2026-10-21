@@ -17,7 +17,7 @@ Web 端只用标准库 `http.server` + 自己实现的极简 WebSocket，**不�
 
 ![界面示意](docs/screenshot-sim.png)
 
-> 截图在 `--sim` 模式下用 Edge headless 拍的（中速档、按住 W 前进）。
+> 截图在 `--sim` 模式下用 headless Chrome 拍的（低速档、缓启缓停默认开）。
 
 ---
 
@@ -29,6 +29,7 @@ Web 端只用标准库 `http.server` + 自己实现的极简 WebSocket，**不�
 | `static/index.html` | 页面结构（驾驶区、轮速、flags、IMU、里程、链路诊断） |
 | `static/style.css` | 深色卡片样式，无外网依赖，移动端适配 |
 | `static/app.js` | 摇杆/键盘输入、20 Hz 指令发送、状态渲染、IMU 波形、急停与页面生命周期 |
+| `selftest.py` | `--sim` 离线自测：33 项断言（含方向、斜坡、停止语义、真实浏览器） |
 | `README.md` | 本文（启动、协议、安全、上车核对） |
 
 `--sim` 模式**不打开任何串口**，不需要 pyserial；真机模式才 `import serial`。
@@ -96,6 +97,10 @@ WantedBy=multi-user.target
 - **急停**：右上角大红按钮。按下立即发 0 并**锁存**，之后无论怎么推摇杆都只发 0；
   必须点“复位”才能再动，且复位后要重新推摇杆（不会自己恢复上一目标）。
 - **键盘**：`W A S D` / 方向键，空格 = 立即停。桌面调试很方便。
+- **缓启缓停**：驾驶卡里的滑动开关，**默认开**。开启时正常行驶指令按
+  `vx 1.0 m/s²`、`wz 4.0 rad/s²` 的斜率逼近目标（低/中速档约 100~300 ms 到位），
+  开关会亮起并在斜坡推进时显示“斜坡中”；关闭后恢复旧的阶跃行为。
+  **松手、切页、失焦、急停、心跳超时仍然立即发 0，不走斜坡**（见 §4）。
 - **轮速条**：实心条 = 实际 ω，黄色竖线 = 目标 ω，满量程 ±6 rad/s（箭头贴边表示超出）。
 - **flags**：8 个中文字段，绿=正常、红=异常（在线/使能/命令超时/故障/IMU）。
 - **IMU**：六轴数值 + 水平泡（由 ax/ay 算）+ gz/ax 波形（最近 7.5 s）。
@@ -109,6 +114,33 @@ WantedBy=multi-user.target
 
 硬上限永远存在：`|vx| ≤ 0.5 m/s`、`|wz| ≤ 1.0 rad/s`（服务端再夹一次，不信前端）。
 
+### 3.1 方向约定（改符号前先看这里）
+
+固件逆解是：
+
+```text
+v_left  = vx - wz * TRACK/2
+v_right = vx + wz * TRACK/2
+```
+
+所以 **`wz > 0` = 左轮慢/右轮快 = 车向左转（逆时针）**；
+“右推摇杆 = 右转”就必须发 **`wz < 0`**。
+
+- 前端 `static/app.js` 顶部有唯一取反点：
+
+  ```js
+  const WZ_CMD_SIGN = -1;
+  // steerWz(右推量, 档位上限) = WZ_CMD_SIGN * 右推量 * 上限
+  ```
+
+  摇杆和键盘 `D/→` 都调用 `steerWz()`，不要再在别处写裸负号。
+  以后要反方向，只改 `WZ_CMD_SIGN` 这一处。
+- **后端 `car_web.py` 不再二次取反**：它收到的是协议值，`build_cmd_frame()`
+  原样编码成 11 字节帧。否则会双重取反，右推变左转。
+- **遥测/轮速显示保持实际值**：24 字节帧的 `wz`、44 字节帧的左右轮 `ω`
+  都是固件按实际反馈算出来的，**不在显示层翻转**；界面上的符号就是车体真实方向。
+- `vx` 的前进方向由固件 `DM_DIR_SIGN = -1` 负责（前进为正），网页端不动它。
+
 ---
 
 ## 4. 安全设计（三层，任一层失效都还能停）
@@ -119,6 +151,8 @@ WantedBy=multi-user.target
 | 服务端 | 500 ms 没收到网页指令（WebSocket 断开也会立刻清） | 只发 0；`cmd.reason = timeout` |
 | 服务端 | 急停 | 锁存，只发 0，直到 `/api/estop/reset` |
 | 服务端 | 任何指令 | 先按档位、再按 ±0.5 / ±1.0 硬夹；NaN/Infinity 直接归零 |
+| 服务端 | 缓启缓停开启时的**正常行驶**指令 | 按 `vx 1.0 m/s²` / `wz 4.0 rad/s²` 斜坡逼近目标（默认开） |
+| 服务端 | 缓启缓停开启时的**停止** | **不走斜坡**：目标为 0 / 急停 / 超时都在下一拍直接归零 |
 | STM32 | 800 ms 没收到合法命令帧（固件） | 目标清零（不使能、不失能，保持零速） |
 
 其他实现细节：
@@ -129,8 +163,33 @@ WantedBy=multi-user.target
   这样现场可以先开网页排查接线。
 - WebSocket 断开时只有“最后发指令的那个客户端”会把目标清零；
   开第二个标签页只看状态，不会把正在开的车弄停。
+- **急停锁存期间收到的指令只计数、不生效**（目标保持 0、时间戳清零），
+  复位后不会把锁存期间最后一帧指令“放出来”，必须重新推摇杆。
 - 浏览器 20 Hz 持续发（包括 0），既是控制也是心跳；后台标签页被浏览器节流后
   自然超过 500 ms，服务端会归零 —— 这是期望行为。
+
+### 4.1 缓启缓停为什么放在后端
+
+斜坡在 `CarHub.step_output()` 里推进，只有 `LinkWorker` 这个串口线程按 20~50 Hz
+调用它；`snapshot()` / HTTP 线程只读，不积分。这样做的好处：
+
+1. 前端断网/卡顿/标签页被节流时，后端仍按自己的节拍平滑过渡，不会因为
+   网页 20 Hz 抖动而一冲一冲；
+2. 与 500 ms 心跳、800 ms 固件看门狗在同一层，不会出现“网页还在斜坡、
+   服务端已经超时归零”的互相打架；
+3. 前端只负责开关状态，控制律只有一份。
+
+**停止不进斜坡**是硬性安全语义：`step_output()` 里只要满足下面任一条件，
+就把 `out_vx/out_wz` 直接置 0，不按斜率下降：
+
+- `reason == "estop"`（急停锁存）；
+- `reason == "timeout"`（500 ms 没收到网页心跳）；
+- 目标恰好是 `(0, 0)`：松手、切页、失焦、回中、`/api/stop` 都会让网页发 0，
+  目标为零就按“停”处理。
+
+所以“缓启缓停”只影响**正常行驶指令的加速/减速过程**（例如从 0.1 推到 0.3，
+或用户自己慢慢把摇杆收回），绝不会把任何一条安全停止路径变慢。
+急停/超时目标被清零后，再给新指令会从 0 重新开始斜坡。
 
 > 没有登录/鉴权。**只放在可信局域网**，不要把端口映射到公网。
 
@@ -212,6 +271,11 @@ flags 位：
 > **方向**：固件里 `DM_DIR_SIGN = -1`（实测发 `vx=+0.1` 时两轮倒转，所以整体取反）。
 > 因此 44 字节帧里的 **ω 和扭矩是电机原始方向**：车前进时 ω 为负；而 24 字节帧的
 > `vx/wz` 已乘过方向系数，前进为正。界面按这个约定显示（轮速卡上标注了“前进为负”）。
+>
+> 命令帧的 `wz` 是**协议值**：`wz > 0` 左转、`wz < 0` 右转。网页的“右推”在
+> `static/app.js` 的 `WZ_CMD_SIGN = -1` 处转成负值；服务端和遥测都不再取反（§3.1）。
+> 如果实车右推仍左转，先按 §8 检查左右电机 CAN ID/接线是否互换，不要在前端或
+> 遥测显示层偷偷翻符号（那会让“实际值”和“指令值”对不上）。
 
 ### 5.4 帧同步与 BCC 的实现要点
 
@@ -240,6 +304,8 @@ flags 位：
 | GET | `/api/state` | 完整状态 JSON（~2.7 KB） |
 | GET | `/status` | 纯文本，`curl` 直接看，不需要 jq |
 | POST | `/api/cmd` | `{"vx":0.1,"wz":0.2}`，m/s、rad/s；也接受 `/api/stop` |
+| GET | `/api/ramp` | 查询缓启缓停：`{"ok":true,"ramp":{...}}` |
+| POST | `/api/ramp` | `{"on":true}` 开、`{"on":false}` 关；也接受 `enabled` / `1` / `0` / `"on"` / `"off"` |
 | POST | `/api/gear` | `{"gear":"low"\|"mid"\|"high"}` |
 | POST | `/api/estop` | 锁存急停 |
 | POST | `/api/estop/reset` | 解除锁存（目标仍为 0） |
@@ -251,11 +317,15 @@ WebSocket 客户端消息：
 ```json
 {"t":"cmd","vx":0.1,"wz":0.2}
 {"t":"gear","gear":"mid"}
+{"t":"ramp","on":true}
 {"t":"estop"}
 {"t":"estop_reset"}
 {"t":"odom_reset"}
 {"t":"ping"}
 ```
+
+> `wz` 遵循 **§3.1 协议约定**：右转为负。网页摇杆已经按这个约定换算；
+> 脚本直接调 API 时也要注意符号，不要和“驾驶意图（右为正）”混用。
 
 服务端 20 Hz 推送 `{"t":"state", ...}`，字段与 `/api/state` 相同。
 指令按 20 Hz 发即可；HTTP 客户端也能控制（`owner=0`），方便脚本自测。
@@ -265,7 +335,8 @@ WebSocket 客户端消息：
 ```text
 sim, link{open,port,baud,error,tx_hz,tx_count,telemetry_count,status_count,
           bad_frames,resync_bytes,rx_age_ms}
-cmd{vx,wz,tx_vx,tx_wz,reason,clamped,age_ms,has_client}
+cmd{vx,wz,tx_vx,tx_wz,target_vx,target_wz,reason,clamped,age_ms,has_client}
+ramp{on,default_on,vx_acc,wz_acc,out_vx,out_wz,target_vx,target_wz,active,steps}
 safety{estop,timeout_ms,vx_limit,wz_limit}
 gear{key,name,vx,wz}
 telemetry{vx,vy,wz,ax..gz,bat_mv,stop}
@@ -276,21 +347,42 @@ odom{distance,yaw}
 events[{t,msg}]
 ```
 
+其中 `cmd.tx_vx/tx_wz` 与 `ramp.out_vx/out_wz` 是**斜坡后真正写串口**的值，
+`cmd.target_vx/target_wz` 是夹取后的目标值；`ramp.active=true` 表示当前正在斜坡中。
+关闭缓启缓停后 `tx_*` 会在下一拍直接等于 `target_*`。
+
 ---
 
-## 7. 离线自测（Windows，`--sim`）
+## 7. 离线自测（`--sim`）
+
+一条命令跑完（自动找空闲端口、自动启停 `car_web.py --sim`）：
 
 ```powershell
 cd tools\car_web
-python car_web.py --sim --port 8000 --verbose
+python selftest.py                 # 需要 Edge/Chrome；没有就加 --no-browser
 ```
 
-覆盖项（全部通过，详见交付报告）：页面/CSS/JS 均为 UTF-8 且 200；
-24/44 字节帧解析、BCC、`az≈9.8`；低档夹取 0.5→0.15、1.0→0.50；
-轮速跟随目标；里程增长；急停锁存后仍只发 0 且车在 500 ms 内停住；
-复位后必须重新给指令；200 ms 内有指令、700 ms 后 `reason=timeout` 且实发 0；
-非法档位 400、NaN/Infinity 不会污染控制；WebSocket 握手/推送/断开清零；
-真实浏览器无 JS 异常、无横向溢出、canvas 有绘制。
+`selftest.py` 共 **33 项断言**，全部通过时退出码 0：
+
+- 原有 22 项：页面/CSS/JS 均 200；24/44 字节帧解析、BCC、`az≈9.8`；
+  低档夹取 0.5→0.15、1.0→0.50；轮速跟随目标；里程增长；
+  急停锁存后仍只发 0 且车在 500 ms 内停住；复位后必须重新给指令；
+  200 ms 内有指令、700 ms 后 `reason=timeout` 且实发 0；
+  非法档位 400、NaN/Infinity 不污染控制；WebSocket 握手/推送/断开清零；
+  真实浏览器无 JS 异常、无横向溢出、canvas 有绘制。
+- 新增 11 项（23~33）：
+  - 右推指令真正发到串口的 `wz < 0`，11 字节帧字段为 `-500 mrad`；
+  - 真实浏览器右推摇杆 → `wz < 0`，松手 → 立刻回 0；
+  - UI 开关能设置/查询缓启缓停（默认开→关→开）；
+  - 缓启缓停开：0→0.3 m/s 约 100 ms 时实发值在 `(0, 0.3)`，最终到 0.3；
+  - 关闭斜坡：指令立即阶跃到 0.3；
+  - 斜坡开时急停 / 心跳超时 / `/api/stop` 仍然**立即归零**（不按斜率下降）。
+
+手动体验（自测之外的 UI 操作）：
+
+```powershell
+python car_web.py --sim --port 8000 --verbose
+```
 
 ---
 
@@ -304,6 +396,9 @@ python car_web.py --sim --port 8000 --verbose
    若 `tel` 有而 `st` 一直没有，说明固件还是旧版（没有 44 字节帧）。
 3. **方向**：低速档轻推前进，确认车真的向前；`DM_DIR_SIGN=-1` 是实测值，
    换电机/换接线后可能又要改（改固件，不改本程序）。同时确认 `wz`：右推应右转。
+   网页右推对应串口 `wz < 0`（`static/app.js` 的 `WZ_CMD_SIGN=-1`，见 §3.1）；
+   若串口确实是负值但车仍左转，检查左右电机 CAN ID / 接线是否互换（硬件/固件层），
+   **不要**在前端或遥测显示层再翻一次。
 4. **IMU**：静止时 `az≈9.8`、`ax/ay≈0`、`gz≈0`；右转时 `gz` 应为负、左转为正。
    水平泡偏差大说明模块装歪或坐标轴不同（固件里 `IMU_GYRO_Z_SIGN` 可改）。
 5. **里程**：拉尺走 2 m，看界面距离误差；里程来自固件的轮速正解，
@@ -330,6 +425,11 @@ python car_web.py --sim --port 8000 --verbose
   ERR>1 时固件不会输出。
 - **推前进车后退**：`DM_DIR_SIGN` 的符号问题，改固件；不要在前端偷偷取反，
   否则遥测帧的 `vx` 会和实际相反。
+- **右推左转**：先看 `/status` 的“实发 wz”是不是负数、`status.cmd_wz` 是不是同一个负数。
+  若已为负仍左转，说明左右轮/左右电机接反（硬件/固件层），按 §8.3 检查；
+  不要在 `app.js` 里把 `WZ_CMD_SIGN` 改成 `+1` 来“修”，那会和遥测实际值对不上。
+- **缓启缓停关不掉/开了没感觉**：看 `/api/ramp` 的 `on` 与 `active`；斜坡只在
+  目标非零的正常行驶指令上生效，松手/急停/超时都是立即 0，属正常。
 - **8000 端口被占用**：`--port 8001`；`tools/chassis_web.py` 默认占 8080。
 - **中文乱码**：本目录文件均为 UTF-8 无 BOM；若被 Windows PowerShell 5.1
   的 `Get-Content/Set-Content` 改写过，会坏掉，重新 checkout 该目录即可。

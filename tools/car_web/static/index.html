@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d1117" />
   <title>小车遥控器</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2322d3ee'/%3E%3Ctext x='16' y='23' font-size='15' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23051016'%3ERC%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/style.css?v=1.0.1" />
+  <link rel="stylesheet" href="/static/style.css?v=1.1.0" />
 </head>
 <body>
   <header class="topbar">
@@ -66,7 +66,7 @@
           <span class="u">m/s</span>
         </div>
         <div class="axis">
-          <span class="k">wz 转向</span>
+          <span class="k" title="右推 = 右转 = wz<0；左推 = 左转 = wz>0（固件逆解约定）">wz 转向</span>
           <span class="v" id="cmdWz">+0.000</span>
           <span class="u">rad/s</span>
         </div>
@@ -77,6 +77,21 @@
         <span id="sendText">等待连接…</span>
       </div>
 
+      <div class="ramp-row on" id="rampRow">
+        <label class="switch" for="rampToggle" title="正常行驶指令按斜率过渡；松手、切页、急停、超时仍立即归零">
+          <input type="checkbox" id="rampToggle" checked />
+          <span class="switch-track"><span class="switch-thumb"></span></span>
+        </label>
+        <div class="ramp-copy">
+          <div class="ramp-title">
+            缓启缓停
+            <span class="ramp-state on" id="rampState">开</span>
+            <span class="ramp-live" id="rampLive"></span>
+          </div>
+          <div class="ramp-hint" id="rampHint">正常指令按受控斜率过渡；松手、切页、急停、超时仍立即归零</div>
+        </div>
+      </div>
+
       <div class="quick">
         <button type="button" id="btnStop" class="btn wide">回中 / 停止</button>
         <span class="hint">键盘 W A S D / 方向键，空格停</span>
@@ -84,7 +99,8 @@
 
       <p class="safety-note">
         松手、切后台、断网都会立刻归零；服务端 500&nbsp;ms 没收到网页指令也会发 0。
-        <b>急停是锁存的</b>，必须点“复位”才能再走。
+        <b>急停是锁存的</b>，必须点“复位”才能再走。<br />
+        缓启缓停只作用于正常行驶指令，<b>停止/急停/超时永远立即归零</b>，不会被斜坡拖慢。
       </p>
     </section>
 
@@ -223,11 +239,11 @@
 
       <footer class="footer">
         <span>RK3576 串口 → STM32 → 达妙 DM-H65 · 本页 20 Hz 推状态、20 Hz 发指令</span>
-        <span id="footerVer">car_web 1.0</span>
+        <span id="footerVer">car_web 1.1</span>
       </footer>
     </div>
   </main>
 
-  <script src="/static/app.js?v=1.0.1"></script>
+  <script src="/static/app.js?v=1.1.0"></script>
 </body>
 </html>
