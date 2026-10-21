@@ -1,0 +1,1444 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""小车遥控器 Web 应用（RK3576 → STM32 → 达妙 DM-H65）。
+
+数据通路（和旧的 web_driver 完全不同）：
+    浏览器 --WebSocket/HTTP--> 本程序 --串口 115200--> STM32 桥
+    STM32 --CAN--> 两个达妙轮毂电机；STM32 再把遥测/状态原路回传。
+
+为什么只有标准库 + pyserial
+    目标机是 RK3576（aarch64）上的现场设备，装 FastAPI/uvicorn 要联网拉包、
+    还要管 systemd 里的 uvicorn 命令行；stdlib 的 ThreadingHTTPServer 足够
+    应付"一个遥控器 + 一两个看客"，而且出问题时 `python3 car_web.py` 就能起，
+    不用猜虚拟环境。WebSocket 的握手/分帧在下面自己实现（约 120 行），
+    也正因为我们只需要"收小 JSON、推状态"这一种用法。
+
+并发模型（硬性要求）
+    串口只有一根：**只由 LinkWorker 这一个线程读写**。HTTP/WebSocket 线程
+    只碰 CarHub 里加锁的共享状态，不碰串口。这样不会出现两个线程交错
+    写命令帧、或者一边 read 一边 close 的经典崩法。
+
+安全层次（三层，任何一层失效都还能停住）
+    1. 前端：松手/切后台/页面隐藏 → 立刻发 0；WebSocket 断了就不再发。
+    2. 本程序：500 ms 没收到网页指令 → 发 0；急停锁存后只发 0；
+               |vx|<=0.5 m/s、|wz|<=1.0 rad/s 硬夹 + 档位夹。
+    3. STM32：800 ms 收不到合法命令帧 → 目标清零（固件里已实现）。
+
+自测
+    python3 car_web.py --sim            # 不开串口，内部仿真产生 24/44 字节帧
+    python3 car_web.py                  # 真机：/dev/wheeltec_controller @115200
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import math
+import os
+import select
+import socket
+import struct
+import sys
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Optional
+from urllib.parse import unquote, urlparse
+
+# ---------------------------------------------------------------------------
+# 1. 协议常量与编解码
+# ---------------------------------------------------------------------------
+
+CMD_HEAD = 0x7B
+CMD_TAIL = 0x7D
+CMD_SIZE = 11
+
+TEL_HEAD = 0x7B          # 24 字节主遥测帧（含 IMU 六轴）
+TEL_TAIL = 0x7D
+TEL_SIZE = 24
+
+ST_HEAD = 0x7E           # 44 字节状态帧
+ST_TAIL = 0x7D
+ST_SIZE = 44
+
+# IMU 缩放：固件把 ±16g/±2000dps 换算成上位机约定的 ±2g/±500dps 原始值，
+# 所以这里的系数必须和 firmware/stm32-chassis/user/main.c 里的完全一致。
+ACC_LSB = 1671.84        # raw / 1671.84 = m/s²
+GYRO_LSB = 0.00026644    # raw * 0.00026644 = rad/s
+
+# 底盘几何（只用于界面换算显示，不参与控制）
+WHEEL_R_M = 0.0855
+TRACK_WIDTH_M = 0.425
+WHEEL_OMEGA_MAX = 30.0   # 固件限幅，界面条形图按这个满量程画
+
+# 速度档位：vx 上限按需求 0.15/0.30/0.50 m/s；wz 同步收紧，
+# 否则低速档一推满摇杆就原地甩尾，手感很危险。
+GEARS = {
+    "low":  {"name": "低速", "vx": 0.15, "wz": 0.50},
+    "mid":  {"name": "中速", "vx": 0.30, "wz": 0.75},
+    "high": {"name": "高速", "vx": 0.50, "wz": 1.00},
+}
+GEAR_ORDER = ("low", "mid", "high")
+
+HARD_VX_LIMIT = 0.50     # 与固件/需求一致的硬上限，档位只能更小
+HARD_WZ_LIMIT = 1.00
+CMD_TIMEOUT_MS = 500     # 网页心跳超时（< 固件的 800 ms，保证先由我们清零）
+
+# 状态帧 flags 位定义（与固件 Status_Send 一一对应）
+FLAG_BITS = (
+    ("left_online",   "左在线",   True,  0x01),
+    ("right_online",  "右在线",   True,  0x02),
+    ("left_enabled",  "左使能",   True,  0x04),
+    ("right_enabled", "右使能",   True,  0x08),
+    ("cmd_timeout",   "命令超时", False, 0x10),
+    ("left_fault",    "左故障",   False, 0x20),
+    ("right_fault",   "右故障",   False, 0x40),
+    ("imu_ok",        "IMU",      True,  0x80),
+)
+
+# 达妙反馈帧 ERR 码（0/1 都算正常，其它是故障）
+ERR_NAMES = {
+    0: "失能", 1: "使能", 5: "读取校准数据错误", 6: "读取电机参数错误",
+    7: "传感器读取异常", 8: "超压", 9: "欠压", 0xA: "过电流",
+    0xB: "MOS 过温", 0xC: "线圈过温", 0xD: "通讯丢失", 0xE: "过载",
+}
+
+IMU_STATUS_NAMES = {
+    0: "正常", 1: "SCL 拉不高", 2: "SDA 拉不高", 3: "总线死",
+    4: "无应答", 5: "读出错",
+}
+
+BOOT_STAGE_NAMES = {
+    0: "启动中", 1: "正常", 2: "CAN 初始化失败(已降级)",
+    3: "IMU 从未读到(已跳过)", 4: "CAN 与 IMU 都失败",
+}
+
+
+def xor_bcc(data: bytes) -> int:
+    """STM32 两侧共用的校验：逐字节异或（不含 BCC 自身和帧尾）。"""
+    x = 0
+    for b in data:
+        x ^= b
+    return x
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+def _i16(buf: bytes, off: int) -> int:
+    return struct.unpack_from(">h", buf, off)[0]
+
+
+def _u16(buf: bytes, off: int) -> int:
+    return struct.unpack_from(">H", buf, off)[0]
+
+
+def build_cmd_frame(vx_m_s: float, wz_rad_s: float) -> bytes:
+    """组 11 字节命令帧（大端）。
+
+    单位在"收发的边界"上换算一次：m/s → mm/s，rad/s → mrad/s。
+    中间层统一用 m/s、rad/s，避免混单位（混单位是最难查的一类 bug）。
+    """
+    vx_mm = int(round(clamp(vx_m_s, -HARD_VX_LIMIT, HARD_VX_LIMIT) * 1000.0))
+    wz_mrad = int(round(clamp(wz_rad_s, -HARD_WZ_LIMIT, HARD_WZ_LIMIT) * 1000.0))
+    vx_mm = int(clamp(vx_mm, -32768, 32767))
+    wz_mrad = int(clamp(wz_mrad, -32768, 32767))
+
+    f = bytearray(CMD_SIZE)
+    f[0] = CMD_HEAD
+    f[1] = 0                      # AutoRecharge，固件忽略
+    f[2] = 0                      # SecurityPLY，固件忽略
+    f[3] = (vx_mm >> 8) & 0xFF    # 负数用 Python 的算术右移 + &0xFF 即可得到补码高字节
+    f[4] = vx_mm & 0xFF
+    f[5] = 0                      # vy：差速车没有横向自由度，恒 0
+    f[6] = 0
+    f[7] = (wz_mrad >> 8) & 0xFF
+    f[8] = wz_mrad & 0xFF
+    f[9] = xor_bcc(bytes(f[0:9]))
+    f[10] = CMD_TAIL
+    return bytes(f)
+
+
+def decode_telemetry(f: bytes) -> dict[str, Any]:
+    """解析 24 字节主遥测帧。调用前必须已通过 帧头/帧尾/BCC 校验。"""
+    return {
+        "stop": bool(f[1]),
+        "vx": _i16(f, 2) / 1000.0,
+        "vy": _i16(f, 4) / 1000.0,
+        "wz": _i16(f, 6) / 1000.0,
+        "ax": _i16(f, 8) / ACC_LSB,
+        "ay": _i16(f, 10) / ACC_LSB,
+        "az": _i16(f, 12) / ACC_LSB,
+        "gx": _i16(f, 14) * GYRO_LSB,
+        "gy": _i16(f, 16) * GYRO_LSB,
+        "gz": _i16(f, 18) * GYRO_LSB,
+        "bat_mv": _u16(f, 20),
+    }
+
+
+def decode_status(f: bytes) -> dict[str, Any]:
+    """解析 44 字节状态帧（偏移严格照 firmware main.c 的 Status_Send）。"""
+    raw_flags = f[1]
+    flags = {key: bool(raw_flags & bit) for key, _n, _g, bit in FLAG_BITS}
+
+    def wheel(i: int) -> dict[str, Any]:
+        base = 6 + i * 2
+        err = f[18 + i]
+        return {
+            "omega": _i16(f, base) / 100.0,
+            "target": _i16(f, 10 + i * 2) / 100.0,
+            "torque": _i16(f, 14 + i * 2) / 100.0,
+            "err": err,
+            "err_text": ERR_NAMES.get(err, "未知故障 0x%X" % err),
+            "fault": err > 1,
+            "mos_temp": f[20 + i],
+            "coil_temp": f[22 + i],
+            "pos": _i16(f, 24 + i * 2) / 100.0,
+            "fb_age_ms": _u16(f, 32 + i * 2),
+            "online": flags["left_online" if i == 0 else "right_online"],
+            "enabled": flags["left_enabled" if i == 0 else "right_enabled"],
+        }
+
+    return {
+        "flags_raw": raw_flags,
+        "flags": flags,
+        "cmd_vx": _i16(f, 2) / 1000.0,
+        "cmd_wz": _i16(f, 4) / 1000.0,
+        "left": wheel(0),
+        "right": wheel(1),
+        "can_fail": f[28],
+        "fb_count": f[29],
+        "version": f[30],
+        "imu_status": f[31],
+        "imu_status_text": IMU_STATUS_NAMES.get(f[31], "未知(%d)" % f[31]),
+        "tick": _u16(f, 36),
+        "imu_addr": f[38],
+        "imu_probe": f[39],
+        "imu_gyro_ok": bool(f[39] & 0x80),
+        "imu_ver": f[40],
+        "boot_stage": f[41],
+        "boot_stage_text": BOOT_STAGE_NAMES.get(f[41], "未知(%d)" % f[41]),
+    }
+
+
+class FrameParser:
+    """串口字节流 → 完整帧。
+
+    帧同步规则（固件里写死的）：**上一字节是帧尾 0x7D，本字节是帧头**。
+    固件先发 24 字节 0x7B 帧、再发 44 字节 0x7E 帧，所以两个帧头前面
+    都有 0x7D，正好都能用同一条规则识别。
+
+    为什么要"前一字节"而不是"见到 0x7B 就当帧头"：
+        帧体里的数据（比如某个 ω 的低字节）随时可能是 0x7B/0x7E，单看
+        当前字节会误入帧；有了前导 0x7D 约束，误判概率降一个量级，
+        剩下的交给 BCC + 帧尾兜底。
+
+    校验失败时只丢一个字节再重新找帧头，最多 N 个字节就能重新对齐，
+    不需要清空缓冲、更不需要复位。
+    """
+
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.prev = -1           # 上一个被消费的字节，用于跨 read() 的前导判断
+        self.bad = 0             # 校验失败次数
+        self.resync = 0          # 丢弃字节数（诊断用）
+
+    def feed(self, data: bytes) -> list[tuple[str, bytes]]:
+        self.buf.extend(data)
+        out: list[tuple[str, bytes]] = []
+        while True:
+            start = -1
+            for i, b in enumerate(self.buf):
+                if b == TEL_HEAD or b == ST_HEAD:
+                    prev = self.buf[i - 1] if i > 0 else self.prev
+                    if prev == 0x7D:
+                        start = i
+                        break
+            if start < 0:
+                # 没有任何候选帧头：只留最后 1 字节（它可能是下个帧头的 0x7D 前导）
+                if self.buf:
+                    self.prev = self.buf[-1]
+                    if len(self.buf) > 1:
+                        self.resync += len(self.buf) - 1
+                        del self.buf[:-1]
+                break
+
+            if start > 0:
+                self.prev = self.buf[start - 1]
+                self.resync += start
+                del self.buf[:start]
+
+            head = self.buf[0]
+            size = TEL_SIZE if head == TEL_HEAD else ST_SIZE
+            if len(self.buf) < size:
+                break                       # 半帧：等下一次串口数据
+
+            frame = bytes(self.buf[:size])
+            if frame[-1] == 0x7D and xor_bcc(frame[:-2]) == frame[-2]:
+                out.append(("tel" if head == TEL_HEAD else "status", frame))
+                self.prev = 0x7D
+                del self.buf[:size]
+            else:
+                # 头对、尾或 BCC 不对：这个"头"多半是数据字节，丢掉它重来
+                self.bad += 1
+                self.prev = self.buf[0]
+                del self.buf[:1]
+        return out
+
+
+# ---------------------------------------------------------------------------
+# 2. 共享状态（HTTP/WS 线程只读写这里，不碰串口）
+# ---------------------------------------------------------------------------
+
+
+class CarHub:
+    """一个遥控器进程的全部共享状态。
+
+    所有字段都在 self.lock 下访问。原则：**串口 I/O 绝不在持锁时做**，
+    否则一个慢写就会把 20 Hz 的状态推送拖死。
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.lock = threading.RLock()
+        self.args = args
+        self.sim = bool(args.sim)
+        self.started = time.monotonic()
+
+        # ---- 指令（网页给的目标，尚未夹取）----
+        self.cmd_vx = 0.0
+        self.cmd_wz = 0.0
+        self.cmd_owner: Optional[int] = None
+        self.cmd_time = 0.0          # 最近一次网页指令的 monotonic 时间（0=从没收到）
+        self.cmd_recv_count = 0
+
+        # ---- 安全 ----
+        self.estop = False
+        self.estop_time = 0.0
+        self.gear = "low"            # 默认最慢档：第一次打开页面不会蹿出去
+
+        # ---- 串口 ----
+        self.link_open = False
+        self.link_error = ""
+        # 仿真时不要把真实串口路径报给界面：否则 /status 会显示
+        # "/dev/wheeltec_controller OK"，现场很容易误判成串口已经通了。
+        self.link_port = "SIM" if args.sim else args.serial
+        self.tx_count = 0
+        self.tx_vx = 0.0
+        self.tx_wz = 0.0
+        self.tx_time = 0.0
+        self.tel_count = 0
+        self.status_count = 0
+        self.bad_frames = 0
+        self.resync_bytes = 0
+
+        # ---- 最新帧 ----
+        self.tel: Optional[dict[str, Any]] = None
+        self.tel_time = 0.0
+        self.status: Optional[dict[str, Any]] = None
+        self.status_time = 0.0
+
+        # ---- 里程（用实际轮速反解的 vx/wz 积分，不是命令值）----
+        self.distance = 0.0
+        self.yaw = 0.0
+        self._odom_last: Optional[tuple[float, float, float]] = None
+
+        # ---- WebSocket ----
+        self.ws_clients: dict[int, Any] = {}
+        self._next_client_id = 1
+        self.ws_connect_count = 0
+
+        # ---- 事件与边沿检测 ----
+        self.events: deque[dict[str, Any]] = deque(maxlen=24)
+        self._prev_timeout: Optional[bool] = None
+        self._prev_fault = False
+        self._prev_link: Optional[bool] = None
+        self.note("程序启动（%s 模式）" % ("仿真" if self.sim else "真机"))
+
+    # -- 事件 ---------------------------------------------------------------
+    def note(self, msg: str) -> None:
+        with self.lock:
+            self.events.append({"t": time.strftime("%H:%M:%S"), "msg": msg})
+
+    # -- 指令 ---------------------------------------------------------------
+    def set_cmd(self, vx: float, wz: float, owner: int) -> None:
+        """记录网页目标值。急停锁存时也照记，但 effective() 会压成 0。"""
+        vx = float(vx)
+        wz = float(wz)
+        # JSON 里的 NaN/Infinity 会被 Python 的 json 接受，但 int(round(nan))
+        # 会在组帧时抛异常；这里直接判掉，别让一个坏请求把串口线程带崩。
+        if not (math.isfinite(vx) and math.isfinite(wz)):
+            vx = 0.0
+            wz = 0.0
+        with self.lock:
+            self.cmd_vx = vx
+            self.cmd_wz = wz
+            self.cmd_owner = owner
+            self.cmd_time = time.monotonic()
+            self.cmd_recv_count += 1
+
+    def drop_owner(self, owner: int) -> None:
+        """某个网页断开：如果它正是最后发指令的人，立刻清零。
+
+        为什么要判断 owner：同时开两个标签页看状态时，关掉"只看不控"的那个
+        不应该把正在开的车停掉。反过来，控制端一断就必须停 —— 这是安全底线。
+        """
+        with self.lock:
+            if self.cmd_owner == owner and not self.estop:
+                self.cmd_vx = 0.0
+                self.cmd_wz = 0.0
+                self.cmd_time = 0.0
+                self.note("控制端 WebSocket 断开，目标清零")
+
+    def set_gear(self, gear: str) -> bool:
+        if gear not in GEARS:
+            return False
+        with self.lock:
+            if gear != self.gear:
+                self.gear = gear
+                self.note("切换到%s档（vx≤%.2f m/s，wz≤%.2f rad/s）"
+                          % (GEARS[gear]["name"], GEARS[gear]["vx"], GEARS[gear]["wz"]))
+        return True
+
+    def estop_on(self, why: str = "网页急停") -> None:
+        with self.lock:
+            self.estop = True
+            self.estop_time = time.monotonic()
+            self.cmd_vx = 0.0
+            self.cmd_wz = 0.0
+            self.cmd_time = 0.0
+            self.note("🛑 急停：%s（已锁存，需手动复位）" % why)
+
+    def estop_off(self) -> None:
+        with self.lock:
+            if not self.estop:
+                return
+            self.estop = False
+            self.estop_time = 0.0
+            self.note("急停复位（目标仍为 0，需重新推摇杆）")
+
+    def reset_odom(self) -> None:
+        with self.lock:
+            self.distance = 0.0
+            self.yaw = 0.0
+            self._odom_last = None
+            self.note("里程清零")
+
+    # -- 安全核心 -----------------------------------------------------------
+    def effective(self, now: float) -> tuple[float, float, str, bool]:
+        """算出这一拍真正要发给 STM32 的 vx/wz。
+
+        返回 (vx, wz, 原因, 是否被夹取)。原因用于界面显示"为什么车不动"。
+        """
+        with self.lock:
+            if self.estop:
+                return 0.0, 0.0, "estop", False
+            if self.cmd_time <= 0.0 or (now - self.cmd_time) * 1000.0 > CMD_TIMEOUT_MS:
+                return 0.0, 0.0, "timeout", False
+            g = GEARS[self.gear]
+            vx_max = min(g["vx"], HARD_VX_LIMIT)
+            wz_max = min(g["wz"], HARD_WZ_LIMIT)
+            vx = clamp(self.cmd_vx, -vx_max, vx_max)
+            wz = clamp(self.cmd_wz, -wz_max, wz_max)
+            clamped = (abs(vx - self.cmd_vx) > 1e-9) or (abs(wz - self.cmd_wz) > 1e-9)
+            return vx, wz, "web", clamped
+
+    # -- 串口线程回调 -------------------------------------------------------
+    def set_link(self, open_: bool, error: str = "") -> None:
+        with self.lock:
+            changed = (self.link_open != open_) or (error != self.link_error)
+            self.link_open = open_
+            self.link_error = error
+            if open_:
+                self.link_error = ""
+            if changed and self._prev_link is not None:
+                if open_ and self.sim:
+                    self.note("仿真链路已就绪（不占用任何串口）")
+                elif open_:
+                    self.note("串口已打开：%s @ %d" % (self.link_port, self.args.baud))
+                else:
+                    self.note("串口断开：%s" % (error or "未知原因"))
+            self._prev_link = open_
+
+    def on_tx(self, vx: float, wz: float, now: float) -> None:
+        with self.lock:
+            self.tx_count += 1
+            self.tx_vx = vx
+            self.tx_wz = wz
+            self.tx_time = now
+
+    def on_frames(self, frames: list[tuple[str, bytes]], now: float) -> None:
+        with self.lock:
+            for kind, f in frames:
+                if kind == "tel":
+                    self.tel = decode_telemetry(f)
+                    self.tel_time = now
+                    self.tel_count += 1
+                else:
+                    self.status = decode_status(f)
+                    self.status_time = now
+                    self.status_count += 1
+            # 里程积分：只在遥测帧到达时推进，dt 取真实时间差并夹到 0.2 s，
+            # 防止串口卡顿后一次性把距离跳一大段。
+            if self.tel is not None and self.tel_time == now:
+                if self._odom_last is not None:
+                    last_t, last_d, last_y = self._odom_last
+                    dt = clamp(now - last_t, 0.0, 0.2)
+                    if dt > 0:
+                        self.distance += self.tel["vx"] * dt
+                        self.yaw += self.tel["wz"] * dt
+                self._odom_last = (now, self.distance, self.yaw)
+
+            # 边沿事件：只在状态变化时记一条，避免 20 Hz 刷屏
+            st = self.status
+            if st is not None:
+                timeout = st["flags"]["cmd_timeout"]
+                if timeout != self._prev_timeout:
+                    if timeout and self.cmd_time > 0:
+                        self.note("STM32 报告命令超时（800 ms 没收到合法帧）")
+                    self._prev_timeout = timeout
+                fault = st["left"]["fault"] or st["right"]["fault"]
+                if fault != self._prev_fault:
+                    if fault:
+                        self.note("电机故障：左=%s 右=%s"
+                                  % (st["left"]["err_text"], st["right"]["err_text"]))
+                    else:
+                        self.note("电机故障已清除")
+                    self._prev_fault = fault
+
+    # -- 状态快照 -----------------------------------------------------------
+    def _cmd_age_ms(self, now: float) -> Optional[float]:
+        if self.cmd_time <= 0.0:
+            return None
+        return max(0.0, (now - self.cmd_time) * 1000.0)
+
+    def snapshot(self, now: Optional[float] = None) -> dict[str, Any]:
+        now = time.monotonic() if now is None else now
+        with self.lock:
+            g = GEARS[self.gear]
+            vx, wz, reason, clamped = self.effective(now)
+            tel = dict(self.tel) if self.tel else None
+            st = dict(self.status) if self.status else None
+            if st:
+                # 浅拷贝够用：渲染只读，不改嵌套结构
+                st = json.loads(json.dumps(st))
+
+            flags = []
+            if st:
+                for key, label, good_on, _bit in FLAG_BITS:
+                    on = bool(st["flags"].get(key))
+                    flags.append({
+                        "key": key, "label": label, "on": on,
+                        # good_on=True 表示"这一位为 1 是好事"，界面据此上色
+                        "good": (on == good_on),
+                    })
+
+            return {
+                "ok": True,
+                "ts": round(now - self.started, 3),
+                "sim": self.sim,
+                "link": {
+                    "open": self.link_open,
+                    "port": self.link_port,
+                    "baud": self.args.baud,
+                    "error": self.link_error,
+                    "tx_hz": self.args.tx_hz,
+                    "tx_count": self.tx_count,
+                    "tx_vx": round(self.tx_vx, 3),
+                    "tx_wz": round(self.tx_wz, 3),
+                    "tx_age_ms": round((now - self.tx_time) * 1000.0, 0) if self.tx_time else None,
+                    "telemetry_count": self.tel_count,
+                    "status_count": self.status_count,
+                    "bad_frames": self.bad_frames,
+                    "resync_bytes": self.resync_bytes,
+                    "rx_age_ms": round((now - self.tel_time) * 1000.0, 0) if self.tel_time else None,
+                    "status_age_ms": round((now - self.status_time) * 1000.0, 0) if self.status_time else None,
+                },
+                "cmd": {
+                    "vx": round(self.cmd_vx, 3),
+                    "wz": round(self.cmd_wz, 3),
+                    "tx_vx": round(vx, 3),
+                    "tx_wz": round(wz, 3),
+                    "reason": reason,
+                    "clamped": clamped,
+                    "age_ms": round(self._cmd_age_ms(now) or 0.0, 0),
+                    "has_client": self._cmd_age_ms(now) is not None
+                                  and (now - self.cmd_time) * 1000.0 <= CMD_TIMEOUT_MS,
+                    "recv_count": self.cmd_recv_count,
+                },
+                "safety": {
+                    "estop": self.estop,
+                    "timeout_ms": CMD_TIMEOUT_MS,
+                    "vx_limit": HARD_VX_LIMIT,
+                    "wz_limit": HARD_WZ_LIMIT,
+                },
+                "gear": {
+                    "key": self.gear,
+                    "name": g["name"],
+                    "vx": g["vx"],
+                    "wz": g["wz"],
+                },
+                "telemetry": tel,
+                "status": st,
+                "flags": flags,
+                "odom": {
+                    "distance": round(self.distance, 3),
+                    "yaw": round(self.yaw, 4),
+                },
+                "ws_clients": len(self.ws_clients),
+                "events": list(self.events)[-8:],
+            }
+
+    # -- 客户端登记 ---------------------------------------------------------
+    def register_ws(self, client: Any) -> int:
+        with self.lock:
+            cid = self._next_client_id
+            self._next_client_id += 1
+            self.ws_clients[cid] = client
+            self.ws_connect_count += 1
+            self.note("网页已连接（%d 个在线）" % len(self.ws_clients))
+            return cid
+
+    def unregister_ws(self, cid: int) -> None:
+        with self.lock:
+            if cid in self.ws_clients:
+                del self.ws_clients[cid]
+                self.note("网页断开（剩 %d 个）" % len(self.ws_clients))
+        self.drop_owner(cid)
+
+
+# ---------------------------------------------------------------------------
+# 3. 链路：真实串口 / 内部仿真
+# ---------------------------------------------------------------------------
+
+
+class SerialLink:
+    """真实串口。独占打开（POSIX 上 TIOCEXCL），避免别的进程同时读。"""
+
+    def __init__(self, port: str, baud: int) -> None:
+        import serial  # 延迟导入：--sim 模式下不需要 pyserial
+
+        kwargs = dict(port=port, baudrate=baud, bytesize=8, parity="N",
+                      stopbits=1, timeout=0, write_timeout=0.2,
+                      xonxoff=False, rtscts=False, dsrdtr=False)
+        try:
+            # exclusive=True 是硬性要求：/dev/wheeltec_controller 只能有一个读者，
+            # 否则两边的 read 会互相抢字节，帧全废。
+            self.ser = serial.Serial(exclusive=True, **kwargs)
+        except TypeError:
+            # 极老的 pyserial 没有 exclusive 参数，退化成普通打开
+            self.ser = serial.Serial(**kwargs)
+        self.ser.reset_input_buffer()
+        self.ser.reset_output_buffer()
+
+    def read_available(self) -> bytes:
+        n = self.ser.in_waiting
+        return self.ser.read(n) if n else b""
+
+    def write(self, data: bytes) -> None:
+        self.ser.write(data)
+
+    def close(self) -> None:
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+class SimChassis:
+    """内部仿真：**产生和固件逐字节同格式的 24/44 字节帧**，并解析命令帧。
+
+    为什么连帧都照真格式造：
+        这样 sim 模式跑的是同一条 解析 → 解码 → 状态机 路径，
+        帧同步、BCC、缩放系数在 Windows 上就能验证，真机上只剩"线有没有接对"。
+    """
+
+    def __init__(self) -> None:
+        self.start = time.monotonic()
+        self.closed = False
+        self.last_cmd_t = 0.0
+        self.cmd_vx = 0.0
+        self.cmd_wz = 0.0
+        self.cmd_buf = bytearray()
+        self.cmd_bad = 0
+
+        # 轮子状态（电机原始 ω，注意固件 DM_DIR_SIGN=-1：车前进时 ω 为负）
+        self.omega = [0.0, 0.0]
+        self.pos = [0.0, 0.0]
+        self.torque = [0.0, 0.0]
+        self.temp = [31.0, 31.0]
+        self.tel_count = 0
+        self.st_count = 0
+        self._next_frame = self.start
+        self._last_step = self.start
+        self._yaw = 0.0
+        self._rng = 12345
+
+        # 固件里的一份"最近一次收到的指令"
+        self._st_cmd_vx_mm = 0
+        self._st_cmd_wz_mrad = 0
+        self._cmd_timeout = True
+        self._eff_vx = 0.0
+        self._eff_wz = 0.0
+
+    # -- 随机数：不用 random 模块是为了让 sim 完全可复现 ----------------
+    def _noise(self, scale: float) -> float:
+        self._rng = (1103515245 * self._rng + 12345) & 0x7FFFFFFF
+        return ((self._rng / 0x7FFFFFFF) - 0.5) * 2.0 * scale
+
+    # -- 命令解析：逐字节左移重试，和固件 Cmd_FeedByte 等价 -------------
+    def write(self, data: bytes) -> None:
+        for b in data:
+            if len(self.cmd_buf) >= CMD_SIZE:
+                del self.cmd_buf[0]
+            self.cmd_buf.append(b)
+            if len(self.cmd_buf) == CMD_SIZE:
+                f = bytes(self.cmd_buf)
+                if f[0] == CMD_HEAD and f[10] == CMD_TAIL and xor_bcc(f[:9]) == f[9]:
+                    vx_mm = struct.unpack_from(">h", f, 3)[0]
+                    wz_mrad = struct.unpack_from(">h", f, 7)[0]
+                    self.last_cmd_t = time.monotonic()
+                    self.cmd_vx = vx_mm / 1000.0
+                    self.cmd_wz = wz_mrad / 1000.0
+                    self._st_cmd_vx_mm = vx_mm
+                    self._st_cmd_wz_mrad = wz_mrad
+                    self.cmd_buf.clear()
+                else:
+                    self.cmd_bad += 1      # 丢最老字节，下一个字节进来继续对
+
+    # -- 读：按时间生成帧 ---------------------------------------------------
+    def read_available(self) -> bytes:
+        now = time.monotonic()
+        self._step(now)
+        if now < self._next_frame:
+            return b""
+        self._next_frame = now + 0.05           # 20 Hz，和固件一致
+        self.tel_count += 1
+        self.st_count += 1
+        # 顺序不能反：先 24 字节（0x7B）再 44 字节（0x7E），
+        # 这样 0x7B 前面永远是上一个 0x7D，接收端才能按"帧尾+帧头"同步。
+        return self._tel_frame(now) + self._status_frame(now)
+
+    def close(self) -> None:
+        # 仿真链路没有真实句柄，留一个空实现让 LinkWorker 的关闭路径统一
+        self.closed = True
+
+    def _step(self, now: float) -> None:
+        dt = clamp(now - self._last_step, 0.0, 0.1)
+        self._last_step = now
+        if dt <= 0:
+            return
+        self._cmd_timeout = (self.last_cmd_t <= 0.0
+                             or (now - self.last_cmd_t) * 1000.0 > 800.0)
+        if self._cmd_timeout:
+            self._eff_vx = 0.0
+            self._eff_wz = 0.0
+        else:
+            self._eff_vx = self.cmd_vx
+            self._eff_wz = self.cmd_wz
+
+        # 逆解 → 电机目标（固件 DM_DIR_SIGN = -1）
+        v_left = self._eff_vx - self._eff_wz * TRACK_WIDTH_M / 2.0
+        v_right = self._eff_vx + self._eff_wz * TRACK_WIDTH_M / 2.0
+        target = [-v_left / WHEEL_R_M, -v_right / WHEEL_R_M]
+
+        for i in range(2):
+            # 一阶滞后：真的直流电机也不会瞬间到目标
+            err = target[i] - self.omega[i]
+            self.omega[i] += err * min(1.0, dt / 0.18)
+            self.omega[i] = clamp(self.omega[i], -WHEEL_OMEGA_MAX, WHEEL_OMEGA_MAX)
+            self.pos[i] += self.omega[i] * dt
+            # 扭矩 ≈ 加速 + 摩擦（只为让读数看起来合理，不是物理模型）
+            self.torque[i] = 0.08 * err + 0.015 * self.omega[i] + self._noise(0.02)
+            self.temp[i] += (abs(self.omega[i]) * 0.02 - (self.temp[i] - 30.0) * 0.02) * dt
+
+        self._yaw += self._eff_wz * dt
+
+    def _tel_frame(self, now: float) -> bytes:
+        v_left = -self.omega[0] * WHEEL_R_M
+        v_right = -self.omega[1] * WHEEL_R_M
+        vx_mm = int(round((v_left + v_right) * 0.5 * 1000.0))
+        wz_mrad = int(round((v_right - v_left) / TRACK_WIDTH_M * 1000.0))
+
+        # 车体加速度：转弯时的向心加速度 + 噪声，az 是重力
+        ax = self._eff_vx * self._eff_wz + self._noise(0.06)
+        ay = self._noise(0.05)
+        az = 9.80665 + self._noise(0.04)
+        gx = self._noise(0.006)
+        gy = self._noise(0.006)
+        gz = self._eff_wz * 0.95 + self._noise(0.004)   # 陀螺主要就是偏航角速度
+
+        f = bytearray(TEL_SIZE)
+        f[0] = TEL_HEAD
+        f[1] = 1 if (self._eff_vx == 0.0 and self._eff_wz == 0.0) else 0
+        struct.pack_into(">h", f, 2, vx_mm)
+        struct.pack_into(">h", f, 4, 0)
+        struct.pack_into(">h", f, 6, wz_mrad)
+        struct.pack_into(">h", f, 8, int(ax * ACC_LSB))
+        struct.pack_into(">h", f, 10, int(ay * ACC_LSB))
+        struct.pack_into(">h", f, 12, int(az * ACC_LSB))
+        struct.pack_into(">h", f, 14, int(gx / GYRO_LSB))
+        struct.pack_into(">h", f, 16, int(gy / GYRO_LSB))
+        struct.pack_into(">h", f, 18, int(gz / GYRO_LSB))
+        struct.pack_into(">H", f, 20, 0)               # 新底盘没有电池采样
+        f[22] = xor_bcc(bytes(f[:22]))
+        f[23] = TEL_TAIL
+        return bytes(f)
+
+    def _status_frame(self, now: float) -> bytes:
+        flags = 0
+        # 仿真里两个轮子一直在线、使能；IMU 有效
+        flags |= 0x01 | 0x02 | 0x04 | 0x08 | 0x80
+        if self._cmd_timeout:
+            flags |= 0x10
+        f = bytearray(ST_SIZE)
+        f[0] = ST_HEAD
+        f[1] = flags
+        struct.pack_into(">h", f, 2, self._st_cmd_vx_mm)
+        struct.pack_into(">h", f, 4, self._st_cmd_wz_mrad)
+        struct.pack_into(">h", f, 6, int(self.omega[0] * 100))
+        struct.pack_into(">h", f, 8, int(self.omega[1] * 100))
+        # 目标 ω：固件里是逆解+限幅后的最终值
+        v_left = self._eff_vx - self._eff_wz * TRACK_WIDTH_M / 2.0
+        v_right = self._eff_vx + self._eff_wz * TRACK_WIDTH_M / 2.0
+        struct.pack_into(">h", f, 10, int(clamp(-v_left / WHEEL_R_M * 100, -32768, 32767)))
+        struct.pack_into(">h", f, 12, int(clamp(-v_right / WHEEL_R_M * 100, -32768, 32767)))
+        struct.pack_into(">h", f, 14, int(self.torque[0] * 100))
+        struct.pack_into(">h", f, 16, int(self.torque[1] * 100))
+        f[18] = 1                      # ERR=1 使能
+        f[19] = 1
+        f[20] = int(self.temp[0])
+        f[21] = int(self.temp[1])
+        f[22] = int(self.temp[0] + 2)
+        f[23] = int(self.temp[1] + 2)
+        struct.pack_into(">h", f, 24, int(clamp(self.pos[0] * 100, -32768, 32767)))
+        struct.pack_into(">h", f, 26, int(clamp(self.pos[1] * 100, -32768, 32767)))
+        f[28] = 0                      # canFail
+        f[29] = self.st_count & 0xFF
+        f[30] = 1                      # 版本号
+        f[31] = 0                      # IMU 诊断正常
+        struct.pack_into(">H", f, 32, 20)   # 反馈年龄 20 ms
+        struct.pack_into(">H", f, 34, 20)
+        struct.pack_into(">H", f, 36, int((now - self.start) * 1000) & 0xFFFF)
+        f[38] = 0x6A                   # 扫到的 IMU I2C 地址
+        f[39] = 0x87                   # bit0/1/2 体检通过 + bit7 陀螺读到过
+        f[40] = 1
+        f[41] = 1                      # 启动阶段：正常
+        f[42] = xor_bcc(bytes(f[:42]))
+        f[43] = ST_TAIL
+        return bytes(f)
+
+
+class LinkWorker(threading.Thread):
+    """唯一一个碰链路的线程：读帧 + 定时发命令帧。
+
+    为什么不用两个线程（一个读一个写）：
+        串口对象不是线程安全的；而且 pyserial 在 close 时会把阻塞中的
+        read 变成异常，双线程下很容易出现"写线程拿着已关闭的句柄"。
+        一个线程顺序做 read → 组帧 → write，代码短、状态少。
+    """
+
+    def __init__(self, hub: CarHub, args: argparse.Namespace) -> None:
+        super().__init__(name="link", daemon=True)
+        self.hub = hub
+        self.args = args
+        self.link: Any = None
+        self.parser = FrameParser()
+        self._stop_evt = threading.Event()
+        self._next_open = 0.0
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+
+    # -- 打开链路（失败不退出，1 秒后重试）--------------------------------
+    def _try_open(self, now: float) -> None:
+        if now < self._next_open:
+            return
+        self._next_open = now + 1.0
+        try:
+            if self.args.sim:
+                self.link = SimChassis()
+                self.hub.set_link(True)
+                print("[link] 仿真链路已启动（20 Hz 产生 24/44 字节帧）", flush=True)
+            else:
+                if not os.path.exists(self.args.serial):
+                    raise FileNotFoundError(
+                        "找不到 %s（确认 udev 符号链接已建立）" % self.args.serial)
+                self.link = SerialLink(self.args.serial, self.args.baud)
+                self.hub.set_link(True)
+                print("[link] 串口已打开：%s @ %d（独占）"
+                      % (self.args.serial, self.args.baud), flush=True)
+            self.parser = FrameParser()
+        except Exception as exc:                      # noqa: BLE001 - 现场要看原因
+            self.link = None
+            self.hub.set_link(False, str(exc))
+            print("[link] 打开失败：%s（1 秒后重试）" % exc, flush=True)
+
+    def _close(self, why: str) -> None:
+        if self.link is not None:
+            try:
+                self.link.close()
+            except Exception:
+                pass
+        self.link = None
+        self.hub.set_link(False, why)
+        self._next_open = time.monotonic() + 1.0
+        print("[link] 关闭：%s（1 秒后重开）" % why, flush=True)
+
+    def run(self) -> None:
+        period = 1.0 / self.args.tx_hz
+        next_tx = time.monotonic()
+        last_stats = time.monotonic()
+        try:
+            while not self._stop_evt.is_set():
+                now = time.monotonic()
+                if self.link is None:
+                    self._try_open(now)
+                    self._stop_evt.wait(0.2)
+                    continue
+
+                # ---- 读（非阻塞）----
+                try:
+                    data = self.link.read_available()
+                    if data:
+                        frames = self.parser.feed(data)
+                        if frames:
+                            self.hub.on_frames(frames, time.monotonic())
+                        if self.parser.bad or self.parser.resync:
+                            with self.hub.lock:
+                                self.hub.bad_frames += self.parser.bad
+                                self.hub.resync_bytes += self.parser.resync
+                            self.parser.bad = 0
+                            self.parser.resync = 0
+                except Exception as exc:              # noqa: BLE001
+                    self._close("读失败：%s" % exc)
+                    continue
+
+                # ---- 定时发命令帧（20~50 Hz）----
+                now = time.monotonic()
+                if now >= next_tx:
+                    vx, wz, _reason, _clamped = self.hub.effective(now)
+                    try:
+                        self.link.write(build_cmd_frame(vx, wz))
+                        self.hub.on_tx(vx, wz, now)
+                    except Exception as exc:          # noqa: BLE001
+                        self._close("写失败：%s" % exc)
+                        continue
+                    # 用固定周期推进，而不是 now+period，避免长期漂移；
+                    # 如果已经落后超过一个周期就直接对齐到现在。
+                    next_tx += period
+                    if next_tx < now:
+                        next_tx = now + period
+
+                if self.args.verbose and now - last_stats >= 1.0:
+                    last_stats = now
+                    snap = self.hub.snapshot(now)
+                    print("[stat] tx=%d tel=%d st=%d bad=%d tx=(%.3f,%.3f) %s"
+                          % (snap["link"]["tx_count"], snap["link"]["telemetry_count"],
+                             snap["link"]["status_count"], snap["link"]["bad_frames"],
+                             snap["cmd"]["tx_vx"], snap["cmd"]["tx_wz"],
+                             snap["cmd"]["reason"]), flush=True)
+
+                self._stop_evt.wait(0.004)
+        finally:
+            if self.link is not None:
+                try:
+                    self.link.write(build_cmd_frame(0.0, 0.0))
+                except Exception:
+                    pass
+                self.link.close()
+
+
+# ---------------------------------------------------------------------------
+# 4. 极简 WebSocket（RFC 6455）：只做"收文本 JSON / 推文本 JSON"
+# ---------------------------------------------------------------------------
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept_key(key: str) -> str:
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+class WsIf:
+    """一条 WebSocket 连接：发送带锁（广播线程可能并发），读只在自己的线程。"""
+
+    def __init__(self, cid: int) -> None:
+        self.cid = cid
+        self.sock: Optional[socket.socket] = None
+        self.send_lock = threading.Lock()
+        self.closed = False
+
+    def attach(self, sock: socket.socket) -> None:
+        self.sock = sock
+
+    def send_text(self, text: str) -> None:
+        data = text.encode("utf-8")
+        n = len(data)
+        if n < 126:
+            header = bytes((0x81, n))
+        elif n < 65536:
+            header = bytes((0x81, 126)) + struct.pack(">H", n)
+        else:
+            header = bytes((0x81, 127)) + struct.pack(">Q", n)
+        with self.send_lock:
+            if self.closed or self.sock is None:
+                raise ConnectionError("ws closed")
+            self.sock.sendall(header + data)
+
+    def send_control(self, opcode: int, payload: bytes = b"") -> None:
+        with self.send_lock:
+            if self.closed or self.sock is None:
+                raise ConnectionError("ws closed")
+            self.sock.sendall(bytes((0x80 | opcode, len(payload))) + payload)
+
+    def close(self) -> None:
+        with self.send_lock:
+            if self.closed:
+                return
+            self.closed = True
+            try:
+                if self.sock is not None:
+                    self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                if self.sock is not None:
+                    self.sock.close()
+            except OSError:
+                pass
+
+
+class WsReader:
+    """按需从 socket 读一个完整的客户端帧（客户端帧一定带 4 字节掩码）。"""
+
+    MAX_PAYLOAD = 1 << 20
+
+    def __init__(self, sock: socket.socket) -> None:
+        self.sock = sock
+        self.buf = bytearray()
+
+    def _need(self, n: int) -> bytes:
+        while len(self.buf) < n:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ConnectionError("peer closed")
+            self.buf.extend(chunk)
+        out = bytes(self.buf[:n])
+        del self.buf[:n]
+        return out
+
+    def read_frame(self) -> tuple[bool, int, bytes]:
+        b1, b2 = self._need(2)
+        fin = bool(b1 & 0x80)
+        opcode = b1 & 0x0F
+        masked = bool(b2 & 0x80)
+        length = b2 & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self._need(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self._need(8))[0]
+        if length > self.MAX_PAYLOAD:
+            raise ConnectionError("frame too large")
+        mask = self._need(4) if masked else b"\x00\x00\x00\x00"
+        payload = self._need(length) if length else b""
+        if masked:
+            payload = bytes(b ^ mask[i & 3] for i, b in enumerate(payload))
+        return fin, opcode, payload
+
+
+# ---------------------------------------------------------------------------
+# 5. HTTP 服务
+# ---------------------------------------------------------------------------
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+
+MIME = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".ico": "image/x-icon",
+}
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "CarWeb/1.0"
+    protocol_version = "HTTP/1.1"
+
+    hub: CarHub = None          # 由 make_server() 注入
+    args: argparse.Namespace = None
+
+    # 默认的访问日志会把每个 20 Hz 请求都打到终端，现场看日志反而更难。
+    def log_message(self, fmt: str, *a: Any) -> None:
+        if getattr(self.args, "verbose", False):
+            sys.stderr.write("[http] " + (fmt % a) + "\n")
+
+    # -- 工具 ---------------------------------------------------------------
+    def _send(self, code: int, body: bytes, ctype: str,
+              extra: Optional[dict[str, str]] = None) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _json(self, obj: Any, code: int = 200) -> None:
+        self._send(code, json.dumps(obj, ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8"),
+                   "application/json; charset=utf-8")
+
+    def _body(self) -> dict[str, Any]:
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        raw = self.rfile.read(n) if n > 0 else b""
+        if not raw:
+            return {}
+        try:
+            obj = json.loads(raw.decode("utf-8", "replace"))
+            return obj if isinstance(obj, dict) else {}
+        except (ValueError, UnicodeDecodeError):
+            return {}
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else "-"
+
+    # -- 路由 ---------------------------------------------------------------
+    def do_GET(self) -> None:                       # noqa: N802
+        path = urlparse(self.path).path
+        if path == "/ws":
+            self._handle_ws()
+            return
+        if path in ("/", "/index.html"):
+            self._serve_static("index.html")
+            return
+        if path.startswith("/static/"):
+            self._serve_static(unquote(path[len("/static/"):]))
+            return
+        if path == "/api/state":
+            self._json(self.hub.snapshot())
+            return
+        if path == "/status":
+            self._send(200, self._status_text().encode("utf-8"),
+                       "text/plain; charset=utf-8")
+            return
+        if path == "/favicon.ico":
+            self._send(204, b"", "image/x-icon")
+            return
+        self._json({"ok": False, "error": "not found: %s" % path}, 404)
+
+    def do_POST(self) -> None:                      # noqa: N802
+        path = urlparse(self.path).path
+        body = self._body()
+        if path in ("/api/cmd", "/api/stop"):
+            try:
+                vx = float(body.get("vx", 0.0) or 0.0)
+                wz = float(body.get("wz", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "vx/wz 必须是数字"}, 400)
+                return
+            if path == "/api/stop":
+                vx = wz = 0.0
+            self.hub.set_cmd(vx, wz, owner=0)       # owner=0 表示 HTTP 客户端
+            self._json({"ok": True, "cmd": self.hub.snapshot()["cmd"]})
+            return
+        if path == "/api/gear":
+            gear = str(body.get("gear", ""))
+            if not self.hub.set_gear(gear):
+                self._json({"ok": False, "error": "gear 必须是 low/mid/high"}, 400)
+                return
+            self._json({"ok": True, "gear": self.hub.snapshot()["gear"]})
+            return
+        if path == "/api/estop":
+            self.hub.estop_on("HTTP /api/estop")
+            self._json({"ok": True, "estop": True})
+            return
+        if path == "/api/estop/reset":
+            self.hub.estop_off()
+            self._json({"ok": True, "estop": False})
+            return
+        if path == "/api/odom/reset":
+            self.hub.reset_odom()
+            self._json({"ok": True})
+            return
+        self._json({"ok": False, "error": "not found: %s" % path}, 404)
+
+    # -- 静态文件 -----------------------------------------------------------
+    def _serve_static(self, name: str) -> None:
+        # 只允许 static/ 下的普通文件，防 ../ 穿越
+        target = (STATIC_DIR / name).resolve()
+        try:
+            target.relative_to(STATIC_DIR)
+        except ValueError:
+            self._json({"ok": False, "error": "forbidden"}, 403)
+            return
+        if not target.is_file():
+            self._json({"ok": False, "error": "not found: %s" % name}, 404)
+            return
+        data = target.read_bytes()
+        ctype = MIME.get(target.suffix.lower(), "application/octet-stream")
+        self._send(200, data, ctype, {"Cache-Control": "no-cache"})
+
+    # -- /status 纯文本：curl 一行就能看，不用 jq ---------------------------
+    def _status_text(self) -> str:
+        s = self.hub.snapshot()
+        link = s["link"]
+        cmd = s["cmd"]
+        st = s["status"]
+        tel = s["telemetry"]
+        lines = [
+            "car_web  模式=%s  时间=%.1fs  客户端=%d" %
+            ("SIM" if s["sim"] else "REAL", s["ts"], s["ws_clients"]),
+            "串口: %s @%d %s  rx年龄=%s  tx=%d  tel=%d  st=%d  坏帧=%d" % (
+                link["port"], link["baud"], "OK" if link["open"] else "DOWN(%s)" % link["error"],
+                "—" if link["rx_age_ms"] is None else "%sms" % link["rx_age_ms"],
+                link["tx_count"], link["telemetry_count"],
+                link["status_count"], link["bad_frames"]),
+            "档位: %s  vx≤%.2f m/s  wz≤%.2f rad/s" %
+            (s["gear"]["name"], s["gear"]["vx"], s["gear"]["wz"]),
+            "指令: 网页=(%.3f, %.3f)  实发=(%.3f, %.3f)  原因=%s  夹取=%s  年龄=%sms" % (
+                cmd["vx"], cmd["wz"], cmd["tx_vx"], cmd["tx_wz"],
+                cmd["reason"], "是" if cmd["clamped"] else "否", cmd["age_ms"]),
+        ]
+        if tel:
+            lines.append("遥测: vx=%+.3f m/s  wz=%+.3f rad/s  IMU a=(%.2f,%.2f,%.2f) "
+                         "g=(%.3f,%.3f,%.3f)  stop=%s  bat=%dmV" % (
+                             tel["vx"], tel["wz"], tel["ax"], tel["ay"], tel["az"],
+                             tel["gx"], tel["gy"], tel["gz"], tel["stop"], tel["bat_mv"]))
+        else:
+            lines.append("遥测: 还没有收到 0x7B 帧")
+        if st:
+            lines.append("状态: flags=0x%02X %s" % (
+                st["flags_raw"], " ".join(
+                    "%s=%d" % (f["label"], 1 if f["on"] else 0) for f in s["flags"])))
+            lines.append("  左: ω=%+.2f/目标%+.2f rad/s  τ=%+.2f Nm  ERR=%d(%s)  MOS=%d℃ 线圈=%d℃" % (
+                st["left"]["omega"], st["left"]["target"], st["left"]["torque"],
+                st["left"]["err"], st["left"]["err_text"],
+                st["left"]["mos_temp"], st["left"]["coil_temp"]))
+            lines.append("  右: ω=%+.2f/目标%+.2f rad/s  τ=%+.2f Nm  ERR=%d(%s)  MOS=%d℃ 线圈=%d℃" % (
+                st["right"]["omega"], st["right"]["target"], st["right"]["torque"],
+                st["right"]["err"], st["right"]["err_text"],
+                st["right"]["mos_temp"], st["right"]["coil_temp"]))
+            lines.append("  底盘回读指令=(%.3f, %.3f)  启动=%s  IMU=%s" % (
+                st["cmd_vx"], st["cmd_wz"], st["boot_stage_text"], st["imu_status_text"]))
+        else:
+            lines.append("状态: 还没有收到 0x7E 帧")
+        lines.append("里程: %.3f m  偏航=%.1f°  急停=%s" %
+                     (s["odom"]["distance"], s["odom"]["yaw"] * 57.2958,
+                      "是" if s["safety"]["estop"] else "否"))
+        return "\n".join(lines) + "\n"
+
+    # -- WebSocket ----------------------------------------------------------
+    def _handle_ws(self) -> None:
+        key = self.headers.get("Sec-WebSocket-Key")
+        if not key:
+            self._json({"ok": False, "error": "缺少 Sec-WebSocket-Key"}, 400)
+            return
+        accept = ws_accept_key(key)
+
+        iface = WsIf(0)
+        iface.attach(self.connection)
+
+        # 先回 101、再登记客户端：如果握手写失败（对端已经断了），
+        # 就不会在 hub 里留下一个永远发不出去的广播对象。
+        # 直接写裸响应，不走 send_response，避免多出重复头。
+        try:
+            self.wfile.write((
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                "Sec-WebSocket-Accept: %s\r\n\r\n" % accept
+            ).encode())
+            self.wfile.flush()
+        except OSError:
+            return
+        self.close_connection = True
+
+        cid = self.hub.register_ws(iface)
+        iface.cid = cid
+
+        reader = WsReader(self.connection)
+        self.connection.settimeout(1.0)
+        stop = threading.Event()
+
+        def sender() -> None:
+            """20 Hz 推状态。所有客户端共用同一份 JSON（只序列化一次）。"""
+            while not stop.is_set():
+                try:
+                    text = json.dumps({"t": "state", **self.hub.snapshot()},
+                                      ensure_ascii=False, separators=(",", ":"))
+                    iface.send_text(text)
+                except Exception:                 # noqa: BLE001
+                    break
+                stop.wait(0.05)
+            # 广播失败/退出：主动 shutdown，让下面的 read 立刻返回
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        th = threading.Thread(target=sender, name="ws-send-%d" % cid, daemon=True)
+        th.start()
+
+        try:
+            while not stop.is_set():
+                r, _, _ = select.select([self.connection], [], [], 0.5)
+                if not r:
+                    continue
+                fin, opcode, payload = reader.read_frame()
+                if opcode == 0x8:                 # close
+                    try:
+                        iface.send_control(0x8, payload[:2])
+                    except Exception:
+                        pass
+                    break
+                if opcode == 0x9:                 # ping
+                    iface.send_control(0xA, payload)
+                    continue
+                if opcode == 0xA:                 # pong
+                    continue
+                if opcode not in (0x1, 0x2):
+                    continue
+                if not fin:
+                    # 浏览器发的是小 JSON，不分片；真分片就忽略，
+                    # 不要为这个场景维护拼接状态机。
+                    continue
+                try:
+                    msg = json.loads(payload.decode("utf-8", "replace"))
+                except ValueError:
+                    continue
+                if isinstance(msg, dict):
+                    self._handle_ws_msg(msg, cid)
+        except (ConnectionError, OSError, TimeoutError, ValueError):
+            pass
+        finally:
+            stop.set()
+            self.hub.unregister_ws(cid)
+            iface.close()
+
+    def _handle_ws_msg(self, msg: dict[str, Any], cid: int) -> None:
+        t = msg.get("t")
+        if t == "cmd":
+            try:
+                vx = float(msg.get("vx", 0.0) or 0.0)
+                wz = float(msg.get("wz", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return
+            self.hub.set_cmd(vx, wz, owner=cid)
+        elif t == "gear":
+            self.hub.set_gear(str(msg.get("gear", "")))
+        elif t == "estop":
+            self.hub.estop_on("网页急停（%s）" % self._client_ip())
+        elif t == "estop_reset":
+            self.hub.estop_off()
+        elif t == "odom_reset":
+            self.hub.reset_odom()
+        elif t == "ping":
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 6. 启动
+# ---------------------------------------------------------------------------
+
+
+def local_ip() -> str:
+    """取本机对外的 IP（不真的发包，只让内核选路由）。"""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        return "127.0.0.1"
+
+
+def make_server(host: str, port: int, hub: CarHub, args: argparse.Namespace) -> ThreadingHTTPServer:
+    handler = type("BoundHandler", (Handler,), {"hub": hub, "args": args})
+    srv = ThreadingHTTPServer((host, port), handler)
+    srv.daemon_threads = True
+    return srv
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    ap = argparse.ArgumentParser(
+        description="小车遥控器 Web（RK3576 串口 → STM32 → 达妙电机）")
+    ap.add_argument("--host", default="0.0.0.0", help="监听地址（默认 0.0.0.0）")
+    ap.add_argument("--port", type=int, default=8000, help="监听端口（默认 8000）")
+    ap.add_argument("--serial", default="/dev/wheeltec_controller",
+                    help="串口设备（默认 /dev/wheeltec_controller）")
+    ap.add_argument("--baud", type=int, default=115200, help="波特率（默认 115200）")
+    ap.add_argument("--sim", action="store_true",
+                    help="仿真模式：不打开串口，内部产生遥测/状态帧")
+    ap.add_argument("--tx-hz", type=float, default=30.0,
+                    help="命令帧发送频率 Hz（20~50，默认 30）")
+    ap.add_argument("--verbose", action="store_true", help="打印每秒统计与 HTTP 日志")
+    a = ap.parse_args(argv)
+    if not (20.0 <= a.tx_hz <= 50.0):
+        ap.error("--tx-hz 必须在 20~50 之间（STM32 有 800 ms 看门狗）")
+    return a
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = parse_args(argv)
+    hub = CarHub(args)
+    ip = local_ip()
+
+    try:
+        srv = make_server(args.host, args.port, hub, args)
+    except OSError as exc:
+        print("端口 %d 起不来：%s\n换个端口：--port 8001" % (args.port, exc), flush=True)
+        return 2
+
+    worker = LinkWorker(hub, args)
+    worker.start()
+
+    bar = "=" * 68
+    print(bar, flush=True)
+    print(" 小车遥控器 Web  %s" % ("【仿真 SIM】" if args.sim else "【真机】"), flush=True)
+    print(" 监听:   http://%s:%d" % (args.host, args.port), flush=True)
+    print(" 本机:   http://127.0.0.1:%d" % args.port, flush=True)
+    print(" 局域网: http://%s:%d" % (ip, args.port), flush=True)
+    if args.sim:
+        print(" 链路:   内部仿真（不占用任何串口）", flush=True)
+    else:
+        print(" 链路:   %s @ %d（独占打开）" % (args.serial, args.baud), flush=True)
+    print(" 命令帧: %.0f Hz   |vx|≤%.2f m/s  |wz|≤%.2f rad/s  网页心跳 %d ms" %
+          (args.tx_hz, HARD_VX_LIMIT, HARD_WZ_LIMIT, CMD_TIMEOUT_MS), flush=True)
+    print(" 停止:   Ctrl+C", flush=True)
+    print(bar, flush=True)
+
+    srv_thread = threading.Thread(target=srv.serve_forever, name="http", daemon=True)
+    srv_thread.start()
+
+    try:
+        while True:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n[main] 收到 Ctrl+C，正在停止…", flush=True)
+    finally:
+        worker.stop()
+        worker.join(timeout=2.0)
+        srv.shutdown()
+        srv.server_close()
+        print("[main] 已停止（最后一帧已发 0）", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0d1117" />
+  <title>小车遥控器</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2322d3ee'/%3E%3Ctext x='16' y='23' font-size='15' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23051016'%3ERC%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/static/style.css?v=1.0.1" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">RC</span>
+      <div>
+        <h1>小车遥控器</h1>
+        <p class="sub" id="subtitle">正在连接…</p>
+      </div>
+    </div>
+
+    <div class="top-right">
+      <div class="gears" id="gears" role="group" aria-label="速度档位">
+        <button type="button" class="gear-btn" data-gear="low">低速<b>0.15</b></button>
+        <button type="button" class="gear-btn" data-gear="mid">中速<b>0.30</b></button>
+        <button type="button" class="gear-btn" data-gear="high">高速<b>0.50</b></button>
+      </div>
+      <div class="badges">
+        <span class="badge" id="wsBadge"><i class="dot"></i>网页</span>
+        <span class="badge" id="linkBadge"><i class="dot"></i>串口</span>
+        <span class="badge sim" id="simBadge" hidden>SIM</span>
+      </div>
+      <button type="button" id="btnEstop" class="estop" title="立即把 vx/wz 置 0 并锁存">
+        <span class="estop-icon">■</span>急停
+      </button>
+      <button type="button" id="btnReset" class="btn reset" hidden>复位</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden><span id="bannerText"></span></div>
+
+  <main class="layout">
+    <!-- ================= 驾驶区 ================= -->
+    <section class="card control">
+      <div class="card-head">
+        <h2>驾驶</h2>
+        <span class="pill" id="limitPill">低速 · 0.15 m/s</span>
+      </div>
+
+      <div class="pad-wrap">
+        <div class="pad" id="pad" aria-label="虚拟摇杆：上下为前后，左右为转向">
+          <span class="dir up">前</span>
+          <span class="dir down">后</span>
+          <span class="dir left">左</span>
+          <span class="dir right">右</span>
+          <div class="pad-axis h"></div>
+          <div class="pad-axis v"></div>
+          <div class="pad-center"></div>
+          <div class="knob" id="knob"></div>
+        </div>
+      </div>
+
+      <div class="axis-readout">
+        <div class="axis">
+          <span class="k">vx 前后</span>
+          <span class="v" id="cmdVx">+0.000</span>
+          <span class="u">m/s</span>
+        </div>
+        <div class="axis">
+          <span class="k">wz 转向</span>
+          <span class="v" id="cmdWz">+0.000</span>
+          <span class="u">rad/s</span>
+        </div>
+      </div>
+
+      <div class="send-state" id="sendState">
+        <span class="send-dot" id="sendDot"></span>
+        <span id="sendText">等待连接…</span>
+      </div>
+
+      <div class="quick">
+        <button type="button" id="btnStop" class="btn wide">回中 / 停止</button>
+        <span class="hint">键盘 W A S D / 方向键，空格停</span>
+      </div>
+
+      <p class="safety-note">
+        松手、切后台、断网都会立刻归零；服务端 500&nbsp;ms 没收到网页指令也会发 0。
+        <b>急停是锁存的</b>，必须点“复位”才能再走。
+      </p>
+    </section>
+
+    <!-- ================= 状态区 ================= -->
+    <div class="right-col">
+      <section class="card wheels">
+        <div class="card-head">
+          <h2>轮速</h2>
+          <span class="hint">实际 ω / 目标 ω · rad/s（电机原始方向，前进为负；条形图 ±6）</span>
+        </div>
+        <div class="wheel-grid">
+          <div class="wheel" id="wheel0">
+            <div class="wheel-head">
+              <span class="w-name">左轮</span>
+              <span class="w-chips">
+                <span class="chip" id="w0online">离线</span>
+                <span class="chip" id="w0enable">失能</span>
+              </span>
+            </div>
+            <div class="w-main">
+              <span class="w-omega" id="w0omega">+0.00</span>
+              <span class="w-target">目标 <b id="w0target">+0.00</b></span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="w0fill"></div><div class="bar-mark" id="w0mark"></div></div>
+            <div class="w-sub">
+              <span>τ <b id="w0torque">+0.00</b> Nm</span>
+              <span class="bar small"><div class="bar-fill" id="w0tqfill"></div></span>
+            </div>
+            <div class="w-foot">
+              <span class="err" id="w0err">ERR —</span>
+              <span class="temp" id="w0temp">MOS — · 线圈 —</span>
+            </div>
+          </div>
+
+          <div class="wheel" id="wheel1">
+            <div class="wheel-head">
+              <span class="w-name">右轮</span>
+              <span class="w-chips">
+                <span class="chip" id="w1online">离线</span>
+                <span class="chip" id="w1enable">失能</span>
+              </span>
+            </div>
+            <div class="w-main">
+              <span class="w-omega" id="w1omega">+0.00</span>
+              <span class="w-target">目标 <b id="w1target">+0.00</b></span>
+            </div>
+            <div class="bar"><div class="bar-fill" id="w1fill"></div><div class="bar-mark" id="w1mark"></div></div>
+            <div class="w-sub">
+              <span>τ <b id="w1torque">+0.00</b> Nm</span>
+              <span class="bar small"><div class="bar-fill" id="w1tqfill"></div></span>
+            </div>
+            <div class="w-foot">
+              <span class="err" id="w1err">ERR —</span>
+              <span class="temp" id="w1temp">MOS — · 线圈 —</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>底盘标志位</h2>
+          <span class="hint" id="flagsRaw">flags —</span>
+        </div>
+        <div class="flags" id="flags"></div>
+      </section>
+
+      <section class="card imu">
+        <div class="card-head">
+          <h2>IMU</h2>
+          <span class="hint" id="imuHint">等待数据</span>
+        </div>
+        <div class="imu-body">
+          <div class="imu-nums">
+            <div class="imu-row">
+              <span class="k">加速度</span>
+              <span class="v"><b id="ax">—</b><b id="ay">—</b><b id="az">—</b> <i>m/s²</i></span>
+            </div>
+            <div class="imu-row">
+              <span class="k">角速度</span>
+              <span class="v"><b id="gx">—</b><b id="gy">—</b><b id="gz">—</b> <i>rad/s</i></span>
+            </div>
+            <div class="level">
+              <div class="bubble" id="bubble"><div class="bubble-dot" id="bubbleDot"></div></div>
+              <div class="level-text">
+                <span>倾角</span>
+                <b id="tilt">—</b>
+              </div>
+            </div>
+          </div>
+          <div class="wave-wrap">
+            <canvas id="wave" class="wave"></canvas>
+            <div class="wave-legend">
+              <span><i style="background:#22d3ee"></i>gz</span>
+              <span><i style="background:#fb923c"></i>ax</span>
+              <span class="wave-range">gz ±2 rad/s · ax ±2 m/s²</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>里程</h2>
+          <button type="button" id="btnOdomReset" class="btn small ghost">清零</button>
+        </div>
+        <div class="odom">
+          <div class="readout"><span class="k">行走距离</span><span class="v" id="distance">0.00</span><span class="u">m</span></div>
+          <div class="readout"><span class="k">偏航角</span><span class="v" id="yaw">0.0</span><span class="u">°</span></div>
+          <div class="readout"><span class="k">车体速度</span><span class="v" id="bodyV">0.00</span><span class="u">m/s</span></div>
+          <div class="readout"><span class="k">电池</span><span class="v" id="battery">—</span><span class="u">mV</span></div>
+        </div>
+      </section>
+
+      <section class="card diag">
+        <div class="card-head">
+          <h2>链路诊断</h2>
+          <span class="hint">协议：命令 11B / 遥测 24B / 状态 44B，均 XOR 校验</span>
+        </div>
+        <dl class="diag-grid">
+          <div><dt>串口</dt><dd id="dPort">—</dd></div>
+          <div><dt>接收年龄</dt><dd id="dRxAge">—</dd></div>
+          <div><dt>发送</dt><dd id="dTx">—</dd></div>
+          <div><dt>帧计数</dt><dd id="dFrames">—</dd></div>
+          <div><dt>坏帧 / 重同步</dt><dd id="dBad">—</dd></div>
+          <div><dt>底盘回读指令</dt><dd id="dEcho">—</dd></div>
+          <div><dt>启动阶段</dt><dd id="dBoot">—</dd></div>
+          <div><dt>IMU 诊断</dt><dd id="dImu">—</dd></div>
+          <div><dt>CAN 失败 / 反馈帧</dt><dd id="dCan">—</dd></div>
+        </dl>
+        <div class="events">
+          <div class="events-head">最近事件</div>
+          <ul id="events"><li class="ev">—</li></ul>
+        </div>
+      </section>
+
+      <footer class="footer">
+        <span>RK3576 串口 → STM32 → 达妙 DM-H65 · 本页 20 Hz 推状态、20 Hz 发指令</span>
+        <span id="footerVer">car_web 1.0</span>
+      </footer>
+    </div>
+  </main>
+
+  <script src="/static/app.js?v=1.0.1"></script>
+</body>
+</html>
