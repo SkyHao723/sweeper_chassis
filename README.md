@@ -1126,3 +1126,32 @@ ros2 topic pub --once /chassis_relay std_msgs/msg/UInt8 "{data: 1}"
 **遗留的真实缺口**：EKF 目前**没有任何绝对偏航参照**（没融合磁力计、也没雷达），
 所以航向长期会漂。这个要等雷达装上、跑起 SLAM 才能治本。
 
+---
+
+## 主机功能帧 v2（2026-10-22）：上位机控制电机使能
+
+**背景**：DM 驱动器上电默认失能，只能由 STM32 发 `FFx7+0xFC` 使能。旧固件只在
+STM32 启动时发一次（3 次重试、总预算 400 ms），整车断电重启时 STM32 常比驱动器先起来，
+使能帧静默丢失 → 车一直不动（诊断 `err=[0,0]`、使能位=0），只能拆机复位/重新上电。
+
+**这次改的**（`firmware/stm32-chassis/user/main.c`，`STATUS_VERSION` 1 → 2）：
+
+1. **上电补使能**：主循环里，上电 10 s 内若"车停 + 仍失能 + 至少一个驱动器在线"，
+   每秒补一次 `Motors_Startup()`（写 CTRL_MODE=速度 + 使能 ×3），覆盖冷启动竞争。
+2. **主机功能帧**：11 字节帧（同头同尾同 BCC）`f[1]=0x06` = `FUNC_MOTOR_REINIT`
+   → 在**车已停**（目标为 0 且两轮实际转速 <2 rad/s）时重跑 `Motors_Startup()`；
+   非停车状态拒绝（`g_reinit_reject` 计数）。
+3. 诊断帧 `[30]` = 2，主机据此判断支持该功能；帧长/字段不变（44 字节，向后兼容）。
+
+**编出来的 hex**（两个 target 现在源码一致，hex 相同）：
+
+- `firmware_build/tb01-chassis-v2.hex`（33147 B，SHA256 `3C6C2C4BDCE6F8AAA7B51C4A980D1B7FE6308242DC3740ED79881FB231DA348D`）
+- Keil 命令行：`UV4 -b stm32-chassis.uvprojx -t scrubber -o build.log`（或 `-t sweeper`）
+- 烧录：ST-Link SWD。烧录前**必须把驱动电源断开或把轮子架空**；烧完读回校验。
+  `STM32_Programmer_CLI.exe -c port=SWD -w tb01-chassis-v2.hex -v -rst`
+- 验证：`ros2 topic echo /chassis_diag --once` 里 `"version": 2`，且 `err=[1,1]`、
+  `left_enabled/right_enabled=true`。
+
+主机侧配套见 `D:\github\damiao\ros2_ws\src\tb01_chassis`：服务 `/chassis_reinit_motors`、
+话题 `/chassis_motor_reinit`、网页按钮、`tb01_check_serial --reinit`、`auto_reinit` 参数。
+

@@ -73,7 +73,7 @@
 #define STATUS_PERIOD_MS    50          /* 状态上报周期 */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      1           /* 状态帧 [30] 版本号 */
+#define STATUS_VERSION      2           /* 状态帧 [30] 版本号: v2 = 支持主机功能帧(电机重新使能) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -183,6 +183,7 @@ static int16_t  g_cmd_wz_mrad;          /* 最近一次收到的 wz, mrad/s */
 static int16_t  g_eff_vx_mm;            /* 本拍实际执行的 vx (超时则 0) */
 static int16_t  g_eff_wz_mrad;          /* 本拍实际执行的 wz (超时则 0) */
 static uint32_t g_last_cmd_ms;          /* 最近一次合法速度帧的时刻 */
+static uint32_t g_boot_reinit_ms;       /* 上电后补使能的节流时刻 (见主循环) */
 static uint8_t  g_cmd_timeout;          /* 1 = 超过 800 ms 没收到命令 */
 static float    g_target_omega[2];      /* 下发给电机的目标 rad/s */
 static uint8_t  g_can_tx_fail;          /* CAN 发送失败计数, 饱和 8 位 */
@@ -642,10 +643,60 @@ static void USART1_Init(void)
 static uint8_t g_cmd_frame[CMD_FRAME_SIZE];
 static uint8_t g_cmd_len;
 
+/*===================== 主机功能帧 (v2 新增) ============================
+ * 11 字节帧和速度帧同头同尾同校验, 靠 f[1] 区分:
+ *   f[1] = 0x00/0x01: 普通速度帧 (0x01 是旧协议的"回充"标志, 本固件忽略)
+ *   f[1] = 0x06:      FUNC_MOTOR_REINIT —— 主机要求重新"写速度模式 + 使能"
+ *
+ * 为什么需要: DM 驱动器上电后默认失能, 只能由 STM32 发 FFx7+0xFC 使能。
+ * 而 STM32 只在**自己启动时**发一次(3 次重试, 总预算 400 ms)。整车断电
+ * 重启时 STM32 往往比驱动器先起来, 使能帧就静默丢了 —— 之后整车一直失能,
+ * 主机发什么速度都不动 (诊断帧 [18]/[19] ERR=0, flags 的使能位=0)。
+ * 有了这条功能帧, 主机在"停车"状态下随时可以让 STM32 重新补一次使能,
+ * 不再需要拆机按复位/重新上电。
+ *
+ * ★★ 硬安全约束: **只在车已停时接受**(目标为 0 且两轮实际转速很小)。
+ *    跑着的时候重写模式会让输出瞬间消失 = 失控。
+ *    主机的正确用法: 先发一帧全零速度帧, 再发这条功能帧。
+ *=====================================================================*/
+#define FUNC_MOTOR_REINIT          0x06
+#define REINIT_MAX_WHEEL_RAD_S     2.0f    /* 轮速超过这个值认为车在动, 拒绝 */
+static uint8_t  g_reinit_ok;               /* 成功执行次数 (饱和) */
+static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) */
+
+static void Motors_Startup(void);          /* 定义在文件后半, 这里先声明 */
+
 static void Cmd_Apply(const uint8_t *f)
 {
     /* 能进到这里说明帧头、帧尾、BCC 全对, 足以证明上位机活着。 */
     g_last_cmd_ms = g_tick_ms;
+
+    /* ---- 主机功能帧: f[1]=FUNC_MOTOR_REINIT, 重新写模式 + 使能 ---- */
+    if (f[1] == FUNC_MOTOR_REINIT)
+    {
+        /* 只在车已停时接受: 目标为 0(上一帧零速) 且两轮实际转速很小 */
+        if ((g_cmd_vx_mm == 0) && (g_cmd_wz_mrad == 0) &&
+            (g_eff_vx_mm == 0) && (g_eff_wz_mrad == 0) &&
+            (g_motor[0].vel_rad_s > -REINIT_MAX_WHEEL_RAD_S) &&
+            (g_motor[0].vel_rad_s < REINIT_MAX_WHEEL_RAD_S) &&
+            (g_motor[1].vel_rad_s > -REINIT_MAX_WHEEL_RAD_S) &&
+            (g_motor[1].vel_rad_s < REINIT_MAX_WHEEL_RAD_S))
+        {
+            Motors_Startup();
+            if (g_reinit_ok != 0xFF)
+            {
+                g_reinit_ok++;
+            }
+        }
+        else
+        {
+            if (g_reinit_reject != 0xFF)
+            {
+                g_reinit_reject++;
+            }
+        }
+        return;                     /* 功能帧不当速度帧用, 目标保持原值 */
+    }
 
     g_cmd_vx_mm = (int16_t)(((uint16_t)f[3] << 8) | f[4]);
     g_cmd_wz_mrad = (int16_t)(((uint16_t)f[7] << 8) | f[8]);
@@ -1136,7 +1187,7 @@ static void Control_Tick(void)
  *   [22] 左线圈温度   [23] 右线圈温度
  *   [24..25] 左位置 x100 rad         [26..27] 右位置 x100 rad
  *   [28] CAN 发送失败计数 (饱和)     [29] 反馈帧总数 (饱和)
- *   [30] 版本号 = 1
+ *   [30] 版本号 = 2 (v2 起支持主机功能帧 f[1]=0x06 电机重新使能)
  *   [31] IMU 诊断码 YBIMU_ST_*: 0 正常 1 SCL拉不高 2 SDA拉不高
  *        3 总线死 4 无应答 5 读出错
  *        ★ 旧协议把它放 [27]/[28], 但本固件 [27] 是右位置高字节、[28] 是
@@ -1403,6 +1454,21 @@ int main(void)
 
         now = g_tick_ms;
         Bridge_Update(now);         /* 命令超时 / 在线判断, 每 1 ms 刷新 */
+
+        /* ★ 上电后前 10 秒补使能: 驱动器可能比 STM32 晚就绪, 启动时那 3 次
+           "写模式+使能"会静默丢掉(使能帧没有应答, 丢了不会重发)。这里在
+           "车停 + 仍失能 + 至少有一个驱动器在线"时每秒补一次, 最多补到上电
+           10 秒。这解决了"整车断电重启后车一直不动 (ERR=0 失能)"的竞争,
+           不需要再拆机按复位/重新上电。 */
+        if ((now < 10000u) && (g_boot_stage == BOOT_STAGE_RUNNING) &&
+            ((g_motor[0].err == 0) || (g_motor[1].err == 0)) &&
+            (g_online[0] || g_online[1]) &&
+            (g_eff_vx_mm == 0) && (g_eff_wz_mrad == 0) &&
+            ((now - g_boot_reinit_ms) >= 1000u))
+        {
+            g_boot_reinit_ms = now;
+            Motors_Startup();
+        }
 
         if ((now - last_ctrl_ms) >= CTRL_PERIOD_MS)
         {

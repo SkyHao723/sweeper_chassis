@@ -1,0 +1,38 @@
+scrubber_damiao_chassis:
+  ros__parameters:
+    # ---- 串口（CH340 的 udev 软链接，见 README）----
+    port: /dev/wheeltec_controller
+    baud: 115200
+
+    # ---- 话题 ----
+    cmd_vel_topic: /cmd_vel
+    odom_topic: /odom
+    imu_topic: /imu/data_raw
+    power_topic: /PowerVoltage
+    diag_topic: /chassis_diag
+    diag_raw_topic: /chassis_diag_raw
+    joint_states_topic: /joint_states
+
+    # ---- 坐标系（与厂商栈一致：TF 由 robot_localization 的 EKF 发）----
+    odom_frame: odom
+    base_frame: base_footprint
+    imu_frame: gyro_link
+    publish_tf: false
+    publish_joint_states: false
+
+    # ---- 安全 ----
+    cmd_timeout: 0.5          # 超过这么久没 /cmd_vel 就持续发零速（显式停车；STM32 自己 800ms 看门狗兜底）
+    idle_zero_hz: 10.0        # 零速保活频率；0 = 超时只补发一次
+    stop_burst: 10            # 退出时连发零速帧数
+    max_vx: 0.6               # m/s，发送前夹紧（Nav2 param_nav.yaml 也是 0.6）
+    max_wz: 1.0               # rad/s
+    max_vy: 0.0               # 差速车恒 0
+
+    # ---- 其它 ----
+    publish_diagnostics: true
+    imu_publish_orientation: true
+    power_publish_every_n: 10
+
+    # ---- 上位机控制电机使能（需要底盘固件 v2+；见 firmware/stm32-chassis）----
+    auto_reinit: true           # 正在下发指令但两个驱动器都失能时，自动发"重新使能"
+    reinit_retry_sec: 3.0       # 自动重新使能的最小间隔（s）
