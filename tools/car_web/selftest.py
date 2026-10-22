@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """car_web.py --sim 离线自测。
 
-覆盖断言（共 45 项）：
+覆盖断言（共 52 项）：
   * 原有 22 项：页面/静态资源、24/44 字节帧解析、BCC、档位夹取、轮速跟随、
     里程、急停锁存/复位、500 ms 心跳超时、非法档位、NaN、WebSocket 断开清零、
     真实浏览器无 JS 异常 / 无横向溢出 / canvas 有绘制。
@@ -26,12 +26,21 @@
     38 最高档 ultra：实发 vx = 1.60 m/s，且不超过硬夹 2.0 / 固件 2.565
     39 最高档 ultra：实发 wz = 1.50 rad/s，且轮速不超固件 30 rad/s
   * 新增信息显示（40~45）：
-    40 版本号 1.3.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
+    40 版本号 1.4.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
     41 44B 新字段齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段
     42 ERR 中文映射完整（0/1 正常，5~E 按达妙错误码翻译）
     43 颜色分级阈值：温度 >70 橙 / >85 红；反馈年龄 >200 橙 / >500 红
     44 390px 移动端无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在
-    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.3.0）
+    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.4.0）
+  * 1.4.0 手机端顿挫 / 链路抖动诊断（46~52）：
+    46 摇杆 pad/knob/pad-wrap 都有 touch-action:none、页面禁下拉刷新、
+       摇杆 touch 监听 passive:false、pointercancel 有处理
+    47 指令发送是 rAF + pointermove 事件驱动（无裸 setInterval），每条带 seq/session
+    48 /api/state 有 jitter（到达间隔/原因分布/超时清零），/status 输出诊断行
+    49 心跳 300~500 ms 时分级衰减 70%/50%/30%，超时清零次数递增
+    50 旧序号 seq 被丢弃、换 session 后 seq 基线重置
+    51 390px 移动端 computed touch-action/overscroll、诊断行、rAF 心跳
+    52 pointermove 立即更新目标、pointercancel 立即归零并计数
 
 用法（Windows / Linux 均可，只需要 Python 标准库）：
     cd tools/car_web
@@ -47,6 +56,7 @@ import base64
 import json
 import math
 import os
+import re
 import shutil
 import socket
 import struct
@@ -702,6 +712,11 @@ def run(checker: Checker, base: str, args) -> None:
         checker.skip(26, "真实浏览器右推摇杆/松手回 0", "--no-browser")
         checker.skip(27, "UI 开关能设置/查询缓启缓停", "--no-browser")
     else:
+        # 前面的用例把档位切到过 mid；页面会以服务端档位为准。
+        # 不先复位的话，"默认 low"的断言会在首次 state 帧早到/晚到时随机成功，
+        # 是测试自身的竞态，不是页面 bug。
+        post_json(base, "/api/gear", {"gear": "low"})
+        time.sleep(0.1)
         browser = BrowserSession(base)
         try:
             browser.start()
@@ -1019,8 +1034,8 @@ def run(checker: Checker, base: str, args) -> None:
                     and s["cmd"]["tx_vx"] == 0, 2.0)
     imu = st.get("imu") or {}
     checker.check(
-        40, "版本 1.3.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）",
-        st.get("version") == "1.3.0"
+        40, "版本 1.4.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）",
+        st.get("version") == "1.4.0"
         and 8.5 <= imu.get("accel_mag", 0.0) <= 11.0
         and abs(imu.get("tilt_deg", 99.0)) < 5.0
         and imu.get("gyro_mag", 99.0) < 0.5
@@ -1147,10 +1162,10 @@ def run(checker: Checker, base: str, args) -> None:
             })()""")
             note = (vals or {}).get("note", "")
             checker.check(
-                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.3.0",
+                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.4.0",
                 vals
-                and "1.3.0" in vals["version"]
-                and "1.3.0" in vals["cssHref"] and "1.3.0" in vals["jsSrc"]
+                and "1.4.0" in vals["version"]
+                and "1.4.0" in vals["cssHref"] and "1.4.0" in vals["jsSrc"]
                 and vals["age"].endswith(" ms") and "ok" in vals["ageCls"]
                 and vals["mos"].isdigit() and vals["coil"].isdigit()
                 and math.isfinite(float(vals["pos"]))
@@ -1166,6 +1181,270 @@ def run(checker: Checker, base: str, args) -> None:
         finally:
             browser.close()
             time.sleep(0.3)
+
+
+    # =================================================================
+    # 46~52：1.4.0 手机端顿挫 / 链路抖动诊断
+    # =================================================================
+    code_html, _ct, html2 = get_text(base, "/")
+    code_css, _ct, css2 = get_text(base, "/static/style.css")
+    code_js, _ct, js2 = get_text(base, "/static/app.js")
+    css_n = re.sub(r"\s+", " ", css2)
+    js_n = re.sub(r"\s+", " ", js2)
+
+    def css_block(selector: str) -> str:
+        m = re.search(r"%s\s*\{([^}]*)\}" % re.escape(selector), css_n)
+        return m.group(1) if m else ""
+
+    pad_css = css_block(".pad")
+    knob_css = css_block(".knob")
+    wrap_css = css_block(".pad-wrap")
+    checker.check(
+        46, "摇杆手势加固：pad/knob/pad-wrap 都有 touch-action:none、页面禁下拉刷新、"
+            "touch 监听 passive:false、pointercancel 有处理",
+        code_html == 200 and code_css == 200 and code_js == 200
+        and "touch-action: none" in pad_css
+        and "touch-action: none" in knob_css
+        and "touch-action: none" in wrap_css
+        and "overscroll-behavior: none" in css_n
+        and "user-scalable=no" in html2
+        and "passive: false" in js_n
+        and "setPointerCapture" in js_n
+        and "pointercancel" in js_n,
+        "pad=%r knob=%r wrap=%r overscroll=%s passive=%s" % (
+            "touch-action: none" in pad_css,
+            "touch-action: none" in knob_css,
+            "touch-action: none" in wrap_css,
+            "overscroll-behavior: none" in css_n,
+            "passive: false" in js_n))
+
+    # 47：发送环必须是 rAF + 事件驱动，不是裸 setInterval；指令带 seq/session
+    checker.check(
+        47, "指令发送是 rAF 驱动 + pointermove 事件驱动（无 setInterval(sendCmd)），"
+            "且每条 cmd 带 seq/session 时间戳",
+        "requestAnimationFrame(" in js_n
+        and "cancelAnimationFrame(" in js_n
+        and "setInterval(sendCmd" not in js_n
+        and "CMD_GAP_MS" in js_n
+        and "applyTarget(vx, wz, force)" in js_n
+        and "updateFromPointer(ev, true)" in js_n
+        and "seq: S.seq" in js_n
+        and "session: S.session" in js_n,
+        "raf=%s cancel=%s bareSetInterval=%s seq=%s" % (
+            "requestAnimationFrame(" in js_n,
+            "cancelAnimationFrame(" in js_n,
+            "setInterval(sendCmd" in js_n,
+            "seq: S.seq" in js_n))
+
+    # 48：/api/state 与 /status 都有新的抖动诊断字段
+    st = get_json(base, "/api/state")
+    jit = st.get("jitter") or {}
+    arr = jit.get("arrival") or {}
+    rsn = jit.get("reason") or {}
+    code_st, _ct, status_text = get_text(base, "/status")
+    checker.check(
+        48, "/api/state 有 jitter(到达间隔/reason分布/超时清零)，/status 输出抖动诊断行",
+        all(k in jit for k in ("arrival", "reason", "timeout_zero_count",
+                               "degrade_steps", "hard_timeout_ms", "window_ms"))
+        and all(k in arr for k in ("min_ms", "avg_ms", "max_ms", "jitter_ms", "n"))
+        and all(k in rsn for k in ("web", "stale", "timeout", "hard", "estop", "frames"))
+        and all(k in st.get("cmd", {}) for k in
+                ("seq", "session", "degraded", "degrade_scale", "stale_packets"))
+        and code_st == 200
+        and "抖动" in status_text and "超时清零" in status_text
+        and "分级衰减" in status_text and "原因: web=" in status_text,
+        "jitter_keys=%s status_has=%s" % (
+            sorted(jit.keys()),
+            [w for w in ("抖动", "超时清零", "分级衰减", "原因: web=")
+             if w in status_text]))
+
+    # 49：心跳 300~500 ms 时分级衰减（不是一步到 0）；超时清零次数 +1
+    post_json(base, "/api/estop/reset", {})
+    post_json(base, "/api/gear", {"gear": "mid"})
+    post_json(base, "/api/ramp", {"on": True})
+    post_json(base, "/api/stop", {})
+    wait_state(base, lambda s: s["cmd"]["tx_vx"] == 0, 1.5)
+    before_zero = get_json(base, "/api/state")["jitter"]["timeout_zero_count"]
+    stale_state = None
+    for _attempt in range(3):
+        post_json(base, "/api/cmd", {"vx": 0.3, "wz": 0.0})
+        cand = wait_state(base, lambda s: s["cmd"]["age_ms"] >= 310, 1.0,
+                          interval=0.008)
+        if cand.get("cmd", {}).get("reason") == "stale":
+            # snapshot() 只算目标不推进 step_output；等一拍（≤33 ms）让串口线程
+            # 也记下 stale 分类，同时仍在 500 ms 硬超时之前。
+            time.sleep(0.06)
+            reread = get_json(base, "/api/state")
+            stale_state = (reread
+                           if reread.get("cmd", {}).get("reason") == "stale"
+                           else cand)
+            break
+        time.sleep(0.6)
+    st_to = wait_state(base, lambda s: s["cmd"]["reason"] == "timeout"
+                       and s["cmd"]["tx_vx"] == 0, 1.5)
+    # snapshot() 只算目标、不推进 step_output；"超时清零次数"由串口线程在
+    # 下一拍（≤33 ms）才 +1，所以这里要再等一拍读，否则会读到旧计数。
+    time.sleep(0.12)
+    st_to = get_json(base, "/api/state")
+    after_zero = st_to.get("jitter", {}).get("timeout_zero_count", before_zero)
+    stale_ok = bool(
+        stale_state
+        and 300 <= stale_state["cmd"]["age_ms"] <= 499
+        and staleness_scale_ok(stale_state["cmd"])
+        and stale_state["cmd"]["tx_vx"] > 0
+        and (stale_state["jitter"]["reason"]["stale"] >= 1
+             or stale_state["jitter"]["stale_frames_total"] >= 1))
+    checker.check(
+        49, "心跳 300~500 ms 时目标分级衰减（70%/50%/30%，不是一步到 0）；"
+            "超时清零次数递增",
+        stale_ok
+        and st_to["cmd"]["reason"] == "timeout"
+        and st_to["cmd"]["tx_vx"] == 0
+        and after_zero >= before_zero + 1
+        and st_to["jitter"]["reason"]["timeout"] >= 1,
+        "stale=%s before=%s after=%s timeout_reason=%s reason2s=%s" % (
+            stale_state and {k: stale_state["cmd"][k] for k in
+                             ("age_ms", "reason", "degrade_scale", "target_vx",
+                              "tx_vx")},
+            before_zero, after_zero, st_to.get("cmd", {}).get("reason"),
+            st_to.get("jitter", {}).get("reason")))
+
+    # 50：旧序号包被丢弃（不会把新目标覆盖回去）；换 session 后 seq 从 0 重来
+    post_json(base, "/api/cmd", {"vx": 0.12, "wz": 0.0,
+                                 "seq": 100, "session": "selftest-50"})
+    time.sleep(0.05)
+    post_json(base, "/api/cmd", {"vx": 0.22, "wz": 0.0,
+                                 "seq": 99, "session": "selftest-50"})
+    st_old = get_json(base, "/api/state")
+    post_json(base, "/api/cmd", {"vx": 0.18, "wz": 0.0,
+                                 "seq": 3, "session": "selftest-50b"})
+    st_new = get_json(base, "/api/state")
+    checker.check(
+        50, "旧序号/重复 seq 被丢弃（目标不被旧包覆盖）；换 session 后 seq 基线重置",
+        abs(st_old["cmd"]["vx"] - 0.12) < 1e-9
+        and st_old["cmd"]["seq"] == 100
+        and st_old["jitter"]["stale_packets"] >= 1
+        and st_old["jitter"]["arrival"]["n"] >= 2
+        and st_old["jitter"]["arrival"]["avg_ms"] is not None
+        and abs(st_new["cmd"]["vx"] - 0.18) < 1e-9
+        and st_new["cmd"]["session"] == "selftest-50b"
+        and st_new["jitter"]["session_resets"] >= 1,
+        "old=%s new=%s stale_packets=%s resets=%s" % (
+            st_old["cmd"], st_new["cmd"],
+            st_old["jitter"]["stale_packets"],
+            st_new["jitter"]["session_resets"]))
+    post_json(base, "/api/stop", {"hard": True})
+
+    # 51~52：390px 移动端浏览器里验证计算样式 + 诊断行 + 触摸事件计数
+    if args.no_browser:
+        checker.skip(51, "移动端 computed touch-action/overscroll + 诊断行 + rAF 心跳",
+                     "--no-browser")
+        checker.skip(52, "pointermove 立即发指令 + pointercancel 归零/计数",
+                     "--no-browser")
+    else:
+        browser = BrowserSession(base, width=390, height=844, mobile=True)
+        try:
+            browser.start()
+            assert browser.cdp is not None
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if browser.cdp.eval(
+                        "!!document.getElementById('wsBadge')"
+                        " && document.getElementById('wsBadge').classList.contains('ok')"):
+                    break
+                time.sleep(0.1)
+            time.sleep(1.2)          # 攒够 2 s 窗口里的发送/触摸样本
+            meta = browser.cdp.eval("""(() => {
+              const pad = document.getElementById('pad');
+              const knob = document.getElementById('knob');
+              const de = document.documentElement;
+              const d = window.__carwebDiag ? window.__carwebDiag() : null;
+              return {
+                padTouch: getComputedStyle(pad).touchAction,
+                knobTouch: getComputedStyle(knob).touchAction,
+                overHtml: getComputedStyle(de).overscrollBehaviorY
+                  || getComputedStyle(de).overscrollBehavior,
+                overBody: getComputedStyle(document.body).overscrollBehaviorY
+                  || getComputedStyle(document.body).overscrollBehavior,
+                line: (document.getElementById('jitterLine') || {}).textContent || '',
+                backend: (document.getElementById('jitterBackend') || {}).textContent || '',
+                diag: d,
+                overflow: de.scrollWidth - de.clientWidth,
+              };
+            })()""")
+            dg = (meta or {}).get("diag") or {}
+            checker.check(
+                51, "390px 移动端：computed touch-action=none / overscroll=none、"
+                    "诊断行有指令+触摸、rAF 心跳在发",
+                meta
+                and meta["padTouch"] == "none" and meta["knobTouch"] == "none"
+                and "none" in str(meta["overHtml"]) and "none" in str(meta["overBody"])
+                and "指令" in meta["line"] and "触摸" in meta["line"]
+                and "ms" in meta["line"]
+                and "超时清零" in meta["backend"] and "次" in meta["backend"]
+                and dg.get("raf") is True
+                and (dg.get("send") or {}).get("n", 0) >= 3
+                and meta["overflow"] <= 1,
+                "meta=%s diag.send=%s" % (
+                    {k: meta[k] for k in
+                     ("padTouch", "knobTouch", "overHtml", "overBody", "line",
+                      "backend", "overflow")} if meta else None,
+                    (dg.get("send") if dg else None)))
+
+            # 52：pointerdown → 3 次 pointermove 立即更新目标；pointercancel 归零并计数
+            browser.cdp.eval("""(() => {
+              const pad = document.getElementById('pad');
+              const r = pad.getBoundingClientRect();
+              const fire = (type, x, y) => pad.dispatchEvent(new PointerEvent(type, {
+                pointerId: 21, pointerType: 'touch', isPrimary: true,
+                button: 0, buttons: 1, bubbles: true, cancelable: true,
+                clientX: x, clientY: y
+              }));
+              fire('pointerdown', r.left + r.width * 0.90, r.top + r.height * 0.50);
+              for (let i = 1; i <= 3; i++) {
+                fire('pointermove', r.left + r.width * (0.90 + i * 0.01),
+                     r.top + r.height * (0.50 - i * 0.02));
+              }
+              return true;
+            })()""")
+            time.sleep(0.20)
+            st_hold = get_json(base, "/api/state")
+            dg_hold = browser.cdp.eval("window.__carwebDiag()")
+            browser.cdp.eval("""(() => {
+              const pad = document.getElementById('pad');
+              const r = pad.getBoundingClientRect();
+              pad.dispatchEvent(new PointerEvent('pointercancel', {
+                pointerId: 21, pointerType: 'touch', isPrimary: true,
+                button: 0, bubbles: true, cancelable: true,
+                clientX: r.left + r.width * 0.93, clientY: r.top + r.height * 0.44
+              }));
+              return true;
+            })()""")
+            time.sleep(0.20)
+            st_rel = get_json(base, "/api/state")
+            dg_rel = browser.cdp.eval("window.__carwebDiag()")
+            checker.check(
+                52, "pointermove 期间目标随触摸更新（wz<0、vx>0）；pointercancel 立即归零并计数",
+                st_hold["cmd"]["wz"] < 0 and st_hold["cmd"]["vx"] > 0
+                and (dg_hold.get("touch") or {}).get("n", 0) >= 3
+                and (dg_hold.get("send") or {}).get("n", 0) >= 3
+                and abs(st_rel["cmd"]["vx"]) < 1e-9
+                and abs(st_rel["cmd"]["wz"]) < 1e-9
+                and st_rel["cmd"]["reason"] == "web"
+                and (dg_rel.get("cancels") or {}).get("pointercancel", 0) >= 1,
+                "hold=%s touch=%s release=%s cancels=%s" % (
+                    st_hold["cmd"], dg_hold.get("touch"),
+                    st_rel["cmd"], dg_rel.get("cancels")))
+        finally:
+            browser.close()
+            time.sleep(0.3)
+
+
+def staleness_scale_ok(cmd: dict) -> bool:
+    """49 的辅助断言：stale 状态下 scale 必须是 0.30/0.50/0.70 之一。"""
+    return cmd.get("reason") == "stale" \
+        and cmd.get("degraded") is True \
+        and cmd.get("degrade_scale") in (0.3, 0.5, 0.7)
 
 
 def main() -> int:

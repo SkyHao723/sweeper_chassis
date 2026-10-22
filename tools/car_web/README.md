@@ -5,7 +5,7 @@
 
 ```
 浏览器（手机/电脑）
-   │  WebSocket：20 Hz 指令 + 20 Hz 状态
+   │  WebSocket：30 Hz 指令（rAF + 触摸事件驱动）+ 20 Hz 状态
    ▼
 car_web.py（本进程，唯一碰串口的一线程）
    │  115200 8N1：11 字节命令帧 / 收 24+44 字节帧
@@ -29,8 +29,8 @@ Web 端只用标准库 `http.server` + 自己实现的极简 WebSocket，**不�
 | `car_web.py` | 后端：串口收发（单线程）、帧同步/BCC 校验、解码、WebSocket 广播、HTTP API、安全状态机、`--sim` 仿真 |
 | `static/index.html` | 页面结构（驾驶区、电机详情、flags、IMU/姿态、里程、链路诊断） |
 | `static/style.css` | 深色卡片样式，无外网依赖，移动端适配 |
-| `static/app.js` | 摇杆/键盘输入、20 Hz 指令发送、状态渲染、IMU 波形、急停与页面生命周期 |
-| `selftest.py` | `--sim` 离线自测：45 项断言（含方向、加减速、停车分类、6 档、新增信息显示、390px 移动端） |
+| `static/app.js` | 摇杆/键盘输入、30 Hz 指令发送（rAF + 事件驱动）、状态渲染、链路抖动诊断、IMU 波形、急停与页面生命周期 |
+| `selftest.py` | `--sim` 离线自测：52 项断言（含方向、加减速、停车分类、6 档、信息显示、390px 移动端、手机顿挫诊断） |
 | `README.md` | 本文（启动、协议、安全、上车核对） |
 
 `--sim` 模式**不打开任何串口**，不需要 pyserial；真机模式才 `import serial`。
@@ -92,7 +92,10 @@ WantedBy=multi-user.target
 ## 3. 界面怎么用
 
 - **摇杆**：圆形区域，上下 = `vx`（前/后），左右 = `wz`（右推右转）。
-  鼠标按住拖动、触摸拖动都行（Pointer Events）。中心有 10% 死区防手抖。
+  鼠标按住拖动、触摸拖动都行（Pointer Events + `setPointerCapture`）。
+  摇杆区 `touch-action:none`，触摸不会触发页面滚动/下拉刷新；
+  中心死区**双阈值滞回**：居中时推过 10% 才起步，已在控制时降到 6% 才回中
+  （单阈值会被手指微抖反复跨过，车就会一顿一顿）。
 - **档位**：驾驶卡里的 6 档（低速/中速/高速/快速/极速/超快），同时限制
   `vx` 和 `wz`（见下表），当前上限显示在驾驶卡的胶囊里；键盘 `1~6` 也能切。
   **默认低速 0.15 m/s**。手机上档位按钮自动排成 3×2，不会挤成一条。
@@ -127,6 +130,10 @@ WantedBy=multi-user.target
 - **链路诊断**：串口、遥测/状态帧年龄、发送/帧计数、坏帧/重同步、
   底盘回读指令、**启动阶段**（中文，`[41]`）、IMU 诊断、**CAN 失败 / 反馈帧总数**
   （`[28][29]`）、左右**反馈年龄**摘要。异常项按绿/橙/红分级。
+- **链路抖动诊断**（驾驶卡状态行下方，1.4.0 新增）：最近 2 s 的
+  `指令 min/avg/max 抖X`、`触摸 min/avg/max 抖X`、`帧 min/avg/max`，
+  以及后端的 `超时清零 N 次 · 原因 web/stale/timeout/hard · 后端到达 xx ms`、
+  前端 `触摸取消 N · 硬停 N(blur N)`。手机顿挫时先看这一行，判断方法见 §4.4。
 
 > **关于“电流”**：达妙 DM-H65 反馈帧里的 T 是 **12 bit 扭矩**（`TMAX=40 Nm`），
 > 不是相电流 A。本固件只写控制模式，**没有读 KT 寄存器（0x01 `KT_Value`）**，
@@ -187,12 +194,13 @@ v_right = vx + wz * TRACK/2
 |---|---|---|
 | 浏览器 | 松手 / 摇杆回中 / 键盘松开 / 点“回中 / 停止” | 发普通 `vx=0,wz=0`（**后端软停**） |
 | 浏览器 | 切后台（visibilitychange）/ 窗口失焦 / 页面关闭（pagehide） | 发 `vx=0,wz=0,hard=true`（**后端立即停**），关页时再关 WebSocket |
-| 服务端 | 500 ms 没收到网页指令（WebSocket 断开也会立刻清） | 立即发 0；`cmd.reason = timeout` |
+| 服务端 | 300 / 380 / 460 ms 没收到网页指令 | 目标先乘 `70% / 50% / 30%` **分级衰减**（不是一步到 0） |
+| 服务端 | 500 ms 没收到网页指令（WebSocket 断开也会立刻清） | **立即发 0**；`cmd.reason = timeout`，`timeout_zero_count +1` |
 | 服务端 | 急停 | 锁存，立即只发 0，直到 `/api/estop/reset` |
 | 服务端 | 任何指令 | 先按档位、再按 ±2.0 / ±1.5 硬夹；NaN/Infinity 直接归零 |
 | 服务端 | 缓启缓停开启时的**正常行驶**指令 | 按加速斜率 `vx 1.0 m/s²` / `wz 4.0 rad/s²` 逼近目标（默认开） |
 | 服务端 | 缓启缓停开启时的**主动停车** | 按减速斜率 `vx 0.40 m/s²` / `wz 1.50 rad/s²` **软停**（默认开） |
-| 服务端 | 缓启缓停开启时的**安全停车** | 急停 / 超时 / 断连 / `hard:true` **下一拍直接归零**，不受斜坡影响 |
+| 服务端 | 缓启缓停开启时的**安全停车** | 急停 / 500 ms 超时 / 断连 / `hard:true` **下一拍直接归零**，不受斜坡影响 |
 | STM32 | 800 ms 没收到合法命令帧（固件） | 目标清零（不使能、不失能，保持零速） |
 
 其他实现细节：
@@ -205,8 +213,10 @@ v_right = vx + wz * TRACK/2
   开第二个标签页只看状态，不会把正在开的车弄停。
 - **急停锁存期间收到的指令只计数、不生效**（目标保持 0、时间戳清零），
   复位后不会把锁存期间最后一帧指令“放出来”，必须重新推摇杆。
-- 浏览器 20 Hz 持续发（包括 0），既是控制也是心跳；后台标签页被浏览器节流后
-  自然超过 500 ms，服务端会归零 —— 这是期望行为。
+- 浏览器 30 Hz 持续发（包括 0），既是控制也是心跳；驱动方式是
+  `requestAnimationFrame` + `pointermove` 事件驱动（不再用 `setInterval`，
+  手机在触摸/省电模式下会把定时器拉长到 100 ms~1 s）。
+  后台标签页 rAF 暂停后自然超过 500 ms，服务端会归零 —— 这是期望行为。
 
 ### 4.1 缓启缓停为什么放在后端
 
@@ -214,7 +224,7 @@ v_right = vx + wz * TRACK/2
 调用它；`snapshot()` / HTTP 线程只读，不积分。这样做的好处：
 
 1. 前端断网/卡顿/标签页被节流时，后端仍按自己的节拍平滑过渡，不会因为
-   网页 20 Hz 抖动而一冲一冲；
+   网页 30 Hz 抖动而一冲一冲；
 2. 与 500 ms 心跳、800 ms 固件看门狗在同一层，不会出现“网页还在斜坡、
    服务端已经超时归零”的互相打架；
 3. 前端只负责开关状态，控制律只有一份。
@@ -228,13 +238,14 @@ v_right = vx + wz * TRACK/2
 | 场景 | 触发路径 | 行为 | 原因 |
 |---|---|---|---|
 | 松手 | 摇杆 `pointerup/pointercancel/lostpointercapture` | **软停** DEC | 用户还在看着车 |
-| 摇杆回中 | 摇杆进入中心 10% 死区 | **软停** DEC | 同上 |
+| 摇杆回中 | 摇杆低于 6% 退出死区（双阈值） | **软停** DEC | 同上 |
 | 键盘松开 | `keyup`（WASD/方向键） | **软停** DEC | 同上 |
 | 空格 / “回中 / 停止”按钮 | 前端发普通 0 | **软停** DEC | 主动正常停车 |
 | `POST /api/stop`（不带 hard） | 脚本/HTTP 客户端 | **软停** DEC | 主动正常停车 |
 | 切后台 / 页面隐藏 | `visibilitychange` + `hard:true` | **立即 0** | 用户可能已经看不到车 |
 | 窗口失焦 | `blur` + `hard:true` | **立即 0** | 同上 |
 | 页面关闭 | `pagehide` + `hard:true` + 关 WS | **立即 0** | 同上 |
+| 心跳抖动 | 300~460 ms 没收到网页指令 | **分级衰减** 70%→50%→30% | 手机 WiFi 短暂抖动，先柔和降速 |
 | 心跳超时 | 500 ms 没收到任何网页指令 | **立即 0** | 网页可能卡死/断网，没人看着车 |
 | 前端断连 | WebSocket close（`drop_owner`） | **立即 0** | 同上 |
 | 急停 | 网页急停 / `POST /api/estop` | **立即 0 并锁存** | 安全底线，绝不变慢 |
@@ -270,13 +281,31 @@ v_right = vx + wz * TRACK/2
 > 所以拆成 `ACC=1.0`（跟手）+ `DEC=0.40`（软停）。真正危险时用急停/超时，
 > 那两条路径永远立即归零，不会等这 0.75~4 s。
 
-**软停期间必须继续有网页心跳。** 真实页面在松手后仍按 20 Hz 发 0，所以能走完
+**软停期间必须继续有网页心跳。** 真实页面在松手后仍按 30 Hz 发 0，所以能走完
 整个减速过程；脚本单次 `POST /api/stop` 只会软停 0.5 s，之后 500 ms 心跳超时
 按安全层立即归零（这是预期行为，不是 bug）。需要脚本完整软停时，请在减速期间
 持续 POST `/api/stop`（自测里的 `hold_stop()` 就是这么做的）。
 
 斜坡关闭时（`/api/ramp {"on":false}`）：加速和停车都恢复旧行为 —— 下一拍直接
 阶跃到目标（目标 0 就是立即停），不保留任何减速过程。
+
+### 4.4 手机端顿挫怎么定位（1.4.0）
+
+页面驾驶卡下方的抖动诊断行就是为此加的，**不要靠猜**：
+
+| 现象 | 结论 | 下一步 |
+|---|---|---|
+| `超时清零` 次数在涨、`原因 timeout` 帧多 | **网络/心跳断流**（手机 WiFi 抖动、2.4G 干扰、省电） | 换 5G 频段/靠近 AP；看 `后端到达` 的 max 是否 >300 ms |
+| `超时清零` 不涨，但 `触摸取消` 在涨 | **浏览器抢手势**（滚动/缩放打断 pointermove） | 确认摇杆区 `touch-action:none` 生效；别在摇杆上做长按/双指 |
+| `触摸` 间隔尖峰大、`指令` 间隔同时尖峰、`帧` 也大 | **主线程卡顿**（手机 CPU 忙/渲染重） | 关掉其它标签页；看是否只在状态刷新时卡 |
+| `硬停 blur` 在涨 | 手机浏览器地址栏/通知栏/输入法抢焦点触发 `window.blur` | 用无痕模式/全屏 PWA 复测；这是安全停车，不会自动恢复 |
+| `指令` 尖峰但 `触摸`/`帧` 正常 | 前端心跳被节流（旧版 `setInterval`） | 1.4.0 已改 rAF；确认 `app.js?v=1.4.0` 没被缓存 |
+
+后端 500 ms 仍是硬上限：分级衰减只发生在 300~500 ms，**绝不把归零时间延长**；
+固件 800 ms 看门狗再兜一层。`/status` 里同样能 `curl` 到这三行。
+
+> 没连接或没在控制时，`原因 timeout` 帧会一直很多（服务端本来就在发 0），
+> 这是正常的；只看**推着摇杆的那几秒**数据。
 
 > 没有登录/鉴权。**只放在可信局域网**，不要把端口映射到公网。
 
@@ -400,7 +429,7 @@ flags 位：
 | GET | `/` `/static/*` | 页面（UTF-8，无外网依赖） |
 | GET | `/api/state` | 完整状态 JSON（~2.7 KB） |
 | GET | `/status` | 纯文本，`curl` 直接看，不需要 jq |
-| POST | `/api/cmd` | `{"vx":0.1,"wz":0.2}`，m/s、rad/s；可带 `"hard":true` 表示安全停车；也接受 `/api/stop` |
+| POST | `/api/cmd` | `{"vx":0.1,"wz":0.2}`，m/s、rad/s；可带 `"hard":true` 表示安全停车；可选 `"seq"/"session"/"ts"` 做旧包诊断 |
 | GET | `/api/ramp` | 查询缓启缓停：`{"ok":true,"ramp":{...}}` |
 | POST | `/api/ramp` | `{"on":true}` 开、`{"on":false}` 关；也接受 `enabled` / `1` / `0` / `"on"` / `"off"` |
 | POST | `/api/stop` | 主动停车（**软停**）；`{"hard":true}` 为安全停车（立即归零） |
@@ -413,7 +442,7 @@ flags 位：
 WebSocket 客户端消息：
 
 ```json
-{"t":"cmd","vx":0.1,"wz":0.2}
+{"t":"cmd","vx":0.1,"wz":0.2,"seq":123,"session":"s1a2b3c4","ts":4567}
 {"t":"cmd","vx":0,"wz":0,"hard":true}
 {"t":"gear","gear":"mid"}
 {"t":"ramp","on":true}
@@ -423,6 +452,11 @@ WebSocket 客户端消息：
 {"t":"ping"}
 ```
 
+> `seq` / `session` / `ts` 都是可选的（HTTP 脚本不传也能用）：
+> `session` 每次页面加载随机生成，同 session 内 `seq` 单调递增；后端丢弃
+> `seq <= 上次` 的旧包，只累加 `jitter.stale_packets`，不会让它覆盖新目标。
+> `ts` 是页面的 `performance.now()`，只用于诊断展示。
+
 > `hard:true` 只对“目标为 0”的安全停车有效（页面隐藏/失焦/关页），
 > 后端会跳过减速斜坡立即归零。普通松手/回中不要带 hard，否则就没有软停了。
 
@@ -430,7 +464,8 @@ WebSocket 客户端消息：
 > 脚本直接调 API 时也要注意符号，不要和“驾驶意图（右为正）”混用。
 
 服务端 20 Hz 推送 `{"t":"state", ...}`，字段与 `/api/state` 相同。
-指令按 20 Hz 发即可；HTTP 客户端也能控制（`owner=0`），方便脚本自测。
+指令按 30 Hz 发即可（页面就是 rAF + 事件驱动）；HTTP 客户端也能控制
+（`owner=0`），方便脚本自测。
 
 `/api/state` 主要字段：
 
@@ -438,7 +473,14 @@ WebSocket 客户端消息：
 version, sim
 link{open,port,baud,error,tx_hz,tx_count,telemetry_count,status_count,
      bad_frames,resync_bytes,rx_age_ms,status_age_ms}
-cmd{vx,wz,tx_vx,tx_wz,target_vx,target_wz,reason,clamped,age_ms,has_client}
+cmd{vx,wz,tx_vx,tx_wz,target_vx,target_wz,reason,clamped,age_ms,has_client,
+    seq,session,client_ts,degraded,degrade_scale,stale_packets,seq_gaps,
+    session_resets}
+jitter{arrival{n,window_ms,min_ms,avg_ms,max_ms,jitter_ms},
+       reason{web,stale,timeout,hard,estop,frames,window_ms},
+       window_ms,timeout_zero_count,timeout_zero_last_s,stale_frames_total,
+       reason_total{...},stale_packets,seq_gaps,session_resets,
+       degrade_steps[{after_ms,scale}],hard_timeout_ms}
 ramp{on,default_on,vx_acc,vx_dec,wz_acc,wz_dec,out_vx,out_wz,target_vx,target_wz,
      active,mode,stopping,hard_stop,steps}
 safety{estop,timeout_ms,vx_limit,wz_limit,firmware_vx_max}
@@ -470,9 +512,16 @@ events[{t,msg}]
 | `left/right.age_level` | 反馈年龄 | `>200 ms`→warn，`>500 ms`/0xFFFF→bad |
 | `status.boot_level` | `[41]` | 1→ok，2/3→warn，4→bad |
 | `status.can_fail` / `fb_count` | `[28]` / `[29]` | 链路质量（8 位饱和计数） |
+| `jitter.arrival` | `/cmd` 或 WS cmd 的到达时刻 | 最近 2 s 的 min/avg/max/抖动（ms） |
+| `jitter.reason` | `step_output` 每拍分类 | 最近 2 s 的 web/stale/timeout/hard/estop 帧数 |
+| `jitter.timeout_zero_count` | 超时边沿 | **因心跳超时被清零的次数**（不是帧数） |
+| `cmd.seq/session` | 前端 cmd | 当前接受的序号与页面会话 id |
+| `cmd.degraded/degrade_scale` | 300~500 ms 心跳年龄 | `true` 时目标已按 0.7/0.5/0.3 衰减 |
 
 其中 `cmd.tx_vx/tx_wz` 与 `ramp.out_vx/out_wz` 是**斜坡后真正写串口**的值，
-`cmd.target_vx/target_wz` 是夹取后的目标值。
+`cmd.target_vx/target_wz` 是夹取**并经过心跳衰减后**的目标值。
+`cmd.reason` 取值：`web`（正常）、`stale`（300~500 ms，分级衰减中）、
+`timeout`（≥500 ms，已归零）、`estop`（急停锁存）。
 
 - `ramp.active=true`：正在斜坡中（加速或减速）。
 - `ramp.mode`：`accel`（加速）、`decel`（**缓停中**）、`hard`（立即停）、
@@ -493,7 +542,7 @@ cd tools\car_web
 python selftest.py                 # 需要 Edge/Chrome；没有就加 --no-browser
 ```
 
-`selftest.py` 共 **45 项断言**，全部通过时退出码 0：
+`selftest.py` 共 **52 项断言**，全部通过时退出码 0：
 
 - 原有 22 项：页面/CSS/JS 均 200；24/44 字节帧解析、BCC、`az≈9.8`；
   低档夹取 0.5→0.15、1.0→0.50；轮速跟随目标；里程增长；
@@ -516,14 +565,27 @@ python selftest.py                 # 需要 Edge/Chrome；没有就加 --no-brow
   - **最高档 vx**：ultra 目标/实发 1.60 m/s，且 `1.6 ≤ 硬夹 2.0 ≤ 固件 2.565`；
   - **最高档 wz**：ultra 实发 1.50 rad/s，轮速需求 4.00 rad/s < 固件 30 rad/s。
 - 新增信息显示（40~45）：
-  - **版本 1.3.0**；IMU `|a|≈9.81`（由 24B 帧 ax/ay/az 计算）；
+  - **版本 1.4.0**；IMU `|a|≈9.81`（由 24B 帧 ax/ay/az 计算）；
   - 44B **新字段**齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段；
   - **ERR 中文映射**完整（0/1 正常，5~E 按达妙错误码翻译）；
   - **分级阈值**：温度 `>70` 橙 / `>85` 红；反馈年龄 `>200` 橙 / `>500` 红；
   - **390px 移动端**无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在；
-  - 页面新增值确实渲染（年龄 ms、温度、ERR 使能、`|a|≈9.81`、版本 1.3.0）。
+  - 页面新增值确实渲染（年龄 ms、温度、ERR 使能、`|a|≈9.81`、版本 1.4.0）。
+- 手机顿挫 / 链路抖动诊断（46~52）：
+  - 摇杆 `pad/knob/pad-wrap` 的 CSS 都有 `touch-action:none`，页面
+    `overscroll-behavior:none`，摇杆 `touch*` 监听是 `passive:false`；
+  - 发送环是 `requestAnimationFrame` + `pointermove` 事件驱动，没有裸
+    `setInterval(sendCmd)`，每条 cmd 带 `seq/session`；
+  - `/api/state` 有 `jitter`（到达间隔、reason 分布、超时清零次数），
+    `/status` 输出对应中文诊断行；
+  - 心跳 300~500 ms 时目标按 70%/50%/30% 分级衰减，500 ms 归零，
+    `timeout_zero_count` 递增；
+  - 旧 `seq` 被丢弃、换 `session` 后序号基线重置；
+  - 390px 移动端 computed `touch-action=none` / `overscroll=none`、
+    诊断行有数值、rAF 心跳在发；
+  - 合成 pointer 事件：`pointermove` 立即改目标、`pointercancel` 立即归零并计数。
 
-> 软停用例会持续 POST `/api/stop` 维持 500 ms 心跳（真实网页松手后就是 20 Hz 发 0）；
+> 软停用例会持续 POST `/api/stop` 维持 500 ms 心跳（真实网页松手后就是 30 Hz 发 0）；
 > 单次 `curl /api/stop` 只软停 0.5 s，随后被心跳超时立即归零，这是 §4.3 说明的安全行为。
 
 手动体验（自测之外的 UI 操作）：

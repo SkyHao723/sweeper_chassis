@@ -3,8 +3,15 @@
  * 三个不变量（改代码时别破坏）：
  *   1. 只有"摇杆被按住 / 键盘按住"时目标才非 0；松手/回中发 0（后端软停），
  *      页面隐藏/失焦/关闭发 0 + hard:true（后端立即停），断连一律停发。
- *   2. 指令按 20 Hz 持续发，服务端据此判活；停发 = 500 ms 后服务端自己归零。
+ *   2. 指令按 30 Hz 持续发（requestAnimationFrame 兜底 + pointermove 事件驱动），
+ *      服务端据此判活；停发 = 500 ms 后服务端开始分级衰减并归零。
  *   3. 急停是锁存的：本地立刻归零 + 通知服务端锁存，必须点"复位"才恢复。
+ *
+ * 为什么不用 setInterval 发指令（1.4.0 改）：
+ *   手机浏览器在触摸滚动/省电/省流模式下会把 setInterval 拉长到 100 ms~1 s，
+ *   20 Hz 心跳一旦被拉长到 >500 ms，后端就判超时 → 车"加速-停-加速"。
+ *   rAF 跟着屏幕刷新，触摸时不会被节流；再叠加 pointermove 里立即发一次，
+ *   即使 rAF 被系统暂停，事件流也能把最新目标送出去。
  */
 (() => {
   "use strict";
@@ -40,8 +47,13 @@
   // 0~5 rad/s；按 30 画条子几乎看不出变化，所以显示用 ±6，超出贴边。
   const W_OMEGA_MAX = 6.0;
   const TQ_MAX = 10.0;        // 扭矩条形图满量程（±10 Nm，再大就贴边）
-  const CMD_HZ = 20;          // 网页指令频率
-  const WAVE_N = 150;         // 波形保留点数（20 Hz × 7.5 s）
+  const CMD_HZ = 30;          // 网页指令心跳频率（rAF 驱动）
+  const CMD_GAP_MS = 1000 / CMD_HZ;       // rAF 心跳最小间隔（33 ms）
+  const CMD_EVENT_GAP_MS = 20;            // 触摸/键盘事件里最多 50 Hz，避免刷爆 WS
+  const DIAG_WINDOW_MS = 2000;            // 链路抖动诊断窗口（和 /status 一致）
+  const DEADZONE_ENTER = 0.10;            // 居中 → 开始控制：需要推过 10%
+  const DEADZONE_EXIT = 0.06;             // 控制中 → 回中：低于 6% 才归零（防抖）
+  const WAVE_N = 150;         // 波形保留点数（20 Hz 状态推送 × 7.5 s）
 
   const $ = (id) => document.getElementById(id);
   const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
@@ -63,16 +75,85 @@
     rampPendingAt: 0,
     target: { vx: 0, wz: 0 },
     dragId: null,
+    deadzoneActive: false,      // 双阈值滞回，避免手指在死区边缘来回抖
     keys: new Set(),
     last: null,
     lastCmdSent: 0,
     reconnectDelay: 500,
     lastEventsJson: "",
+    flagSig: "",
+    flagEls: Object.create(null),
     wave: { gz: [], ax: [] },
     canvasW: 0,
     canvasH: 0,
+    canvasDirty: true,
+    canvasObs: null,
+    padGeom: null,              // 拖动期间缓存摇杆几何，避免每帧 getBoundingClientRect
+
+    // ---- 指令会话/序号：后端据此识别"旧包/乱序/页面重载" ----
+    seq: 0,
+    // 每一次页面加载一个会话 id：换页/刷新后 seq 从 0 重新开始，
+    // 后端看到 session 变了就重置基线，不会把新页面的指令当成旧包丢掉。
+    session: "s" + Math.random().toString(36).slice(2, 10),
+
+    // ---- 链路抖动诊断（最近 2 s 滚动窗口）----
+    sendTimes: [],              // 真正发出 cmd 的时刻
+    touchTimes: [],             // 摇杆 pointermove 到达前台的时刻
+    frameTimes: [],             // rAF 时刻：用来看主线程有没有卡顿
+    lastDiagRender: 0,
+    rafId: 0,
+    watchdogId: 0,
+    hardStops: { blur: 0, hidden: 0, pagehide: 0 },
+    cancels: { pointercancel: 0, lostcapture: 0, pointerup: 0 },
+    lastPointerType: "-",
   };
   if (!GEARS[S.gear]) S.gear = "low";
+
+  // 2 秒滑动窗口：只保留窗口内的样本（数组很小，最多 100 个）。
+  function pruneSamples(arr, now) {
+    while (arr.length && now - arr[0] > DIAG_WINDOW_MS) arr.shift();
+  }
+  function pushSample(arr, t) {
+    arr.push(t);
+    pruneSamples(arr, t);
+  }
+
+  // 间隔统计：min/avg/max + 最大抖动（每个间隔与平均值之差的最大绝对值）。
+  function intervalStats(arr) {
+    const n = arr.length;
+    if (n < 2) return { n: n, min: null, avg: null, max: null, jitter: null };
+    let min = Infinity, max = 0, sum = 0;
+    for (let i = 1; i < n; i++) {
+      const d = arr[i] - arr[i - 1];
+      if (d < min) min = d;
+      if (d > max) max = d;
+      sum += d;
+    }
+    const avg = sum / (n - 1);
+    let jitter = 0;
+    for (let i = 1; i < n; i++) {
+      const dev = Math.abs((arr[i] - arr[i - 1]) - avg);
+      if (dev > jitter) jitter = dev;
+    }
+    return {
+      n: n,
+      min: Math.round(min * 10) / 10,
+      avg: Math.round(avg * 10) / 10,
+      max: Math.round(max * 10) / 10,
+      jitter: Math.round(jitter * 10) / 10,
+    };
+  }
+
+  function msText(v) {
+    if (v === null || v === undefined) return "—";
+    return v < 10 ? v.toFixed(1) : String(Math.round(v));
+  }
+
+  function statsText(label, s) {
+    if (!s || s.n < 2) return `${label} —`;
+    return `${label} ${msText(s.min)}/${msText(s.avg)}/${msText(s.max)}ms 抖${msText(s.jitter)}`;
+  }
+
 
   // ---------------------------------------------------------------------
   // 连接
@@ -147,37 +228,81 @@
     const g = limits();
     S.target.vx = clamp(vx, -g.vx, g.vx);
     S.target.wz = clamp(wz, -g.wz, g.wz);
-    $("cmdVx").textContent = fmt(S.target.vx, 3);
-    $("cmdWz").textContent = fmt(S.target.wz, 3);
+    text("cmdVx", fmt(S.target.vx, 3));
+    text("cmdWz", fmt(S.target.wz, 3));
     renderSpeedClass(S.target.vx);
     const now = performance.now();
-    // 指针移动事件可能到 60~120 Hz，限到 30 Hz 再发；20 Hz 的定时器兜底。
-    if (force || now - S.lastCmdSent >= 33) sendCmd();
+    // 事件驱动：触摸/键盘一改目标就立刻发（最多 50 Hz），不等下一帧 rAF。
+    // rAF 那条路只负责"没事件时的心跳"（30 Hz）。
+    if (force || now - S.lastCmdSent >= CMD_EVENT_GAP_MS) sendCmd();
   }
 
-  function sendCmd() {
-    if (!S.connected) return;
-    if (send({ t: "cmd", vx: S.target.vx, wz: S.target.wz })) {
-      S.lastCmdSent = performance.now();
-    }
+  function sendCmd(hard) {
+    if (!S.connected) return false;
+    S.seq += 1;
+    const msg = {
+      t: "cmd",
+      vx: S.target.vx,
+      wz: S.target.wz,
+      seq: S.seq,
+      session: S.session,
+      ts: Math.round(performance.now()),
+    };
+    if (hard) msg.hard = true;
+    if (!send(msg)) return false;
+    S.lastCmdSent = performance.now();
+    pushSample(S.sendTimes, S.lastCmdSent);
+    return true;
   }
 
-  let cmdTimer = null;
+  let cmdLoopOn = false;
   function startCmdLoop() {
     stopCmdLoop();
-    // 持续发（包括 0）：既是控制，也是"网页还活着"的心跳。
-    cmdTimer = setInterval(sendCmd, 1000 / CMD_HZ);
+    cmdLoopOn = true;
+    S.lastCmdSent = 0;
+    // 主循环：requestAnimationFrame。屏幕刷新（60/90/120 Hz）驱动，
+    // 触摸时不会被浏览器当作后台定时器节流；按 CMD_GAP_MS 限到 30 Hz。
+    const tick = (ts) => {
+      if (!cmdLoopOn) return;
+      S.rafId = requestAnimationFrame(tick);
+      pushSample(S.frameTimes, ts);
+      // ★ 这里必须用 performance.now() 做间隔判断，不能混用 rAF 的 ts：
+      // ts 是"这一帧的开始时刻"，比回调里真正执行的时刻早，拿它减
+      // lastCmdSent（performance.now）会偶尔差 1~2 ms 从而多跳一帧，
+      // 实际心跳会从 33 ms 变成 50 ms（22 Hz）。阈值留 4 ms 余量，
+      // 保证 60 Hz 下稳定"每 2 帧发一次"=30 Hz。
+      const now = performance.now();
+      if (!document.hidden && now - S.lastCmdSent >= CMD_GAP_MS - 4) sendCmd();
+      if (now - S.lastDiagRender >= 200) {
+        S.lastDiagRender = now;
+        renderDiagLine();
+      }
+    };
+    S.rafId = requestAnimationFrame(tick);
+    // 兜底：某些 WebView 在屏幕常亮/不合成时会暂停 rAF，但 setTimeout 还在。
+    // 只在"页面可见且超过 150 ms 没发"时补一帧，保证 500 ms 心跳不断。
+    const watchdog = () => {
+      if (!cmdLoopOn) return;
+      const now = performance.now();
+      if (!document.hidden && now - S.lastCmdSent >= 150) sendCmd();
+      S.watchdogId = setTimeout(watchdog, 100);
+    };
+    S.watchdogId = setTimeout(watchdog, 100);
   }
   function stopCmdLoop() {
-    if (cmdTimer) { clearInterval(cmdTimer); cmdTimer = null; }
+    cmdLoopOn = false;
+    if (S.rafId) { cancelAnimationFrame(S.rafId); S.rafId = 0; }
+    if (S.watchdogId) { clearTimeout(S.watchdogId); S.watchdogId = 0; }
+    S.sendTimes.length = 0;
+    S.frameTimes.length = 0;
   }
 
   // 普通停车（松手/回中/主动停止）：目标发 0，后端按减速斜率软停。
   function zeroTarget() {
     S.target.vx = 0;
     S.target.wz = 0;
-    $("cmdVx").textContent = fmt(0, 3);
-    $("cmdWz").textContent = fmt(0, 3);
+    text("cmdVx", fmt(0, 3));
+    text("cmdWz", fmt(0, 3));
     renderSpeedClass(0);
     sendCmd();
   }
@@ -187,10 +312,10 @@
   function hardStop() {
     S.target.vx = 0;
     S.target.wz = 0;
-    $("cmdVx").textContent = fmt(0, 3);
-    $("cmdWz").textContent = fmt(0, 3);
+    text("cmdVx", fmt(0, 3));
+    text("cmdWz", fmt(0, 3));
     renderSpeedClass(0);
-    send({ t: "cmd", vx: 0, wz: 0, hard: true });
+    sendCmd(true);
   }
 
   // ---------------------------------------------------------------------
@@ -200,9 +325,19 @@
   const knob = $("knob");
 
   function knobGeometry() {
+    // 拖动期间几何不变：缓存起来，避免每个 pointermove 都做一次
+    // getBoundingClientRect（会强制同步布局，手机上是实打实的卡顿源）。
+    if (S.padGeom) return S.padGeom;
     const r = pad.getBoundingClientRect();
-    return { cx: r.left + r.width / 2, cy: r.top + r.height / 2, max: Math.max(20, r.width / 2 - 38) };
+    S.padGeom = {
+      cx: r.left + r.width / 2,
+      cy: r.top + r.height / 2,
+      max: Math.max(20, r.width / 2 - 38),
+    };
+    return S.padGeom;
   }
+
+  function invalidatePadGeom() { S.padGeom = null; }
 
   function moveKnob(dx, dy) {
     const g = knobGeometry();
@@ -217,7 +352,7 @@
     knob.style.transform = "translate(0px, 0px)";
   }
 
-  function updateFromPointer(ev) {
+  function updateFromPointer(ev, force) {
     const g = knobGeometry();
     let dx = ev.clientX - g.cx;
     let dy = ev.clientY - g.cy;
@@ -228,14 +363,21 @@
     const nx = dx / g.max;
     const ny = dy / g.max;
     const mag = Math.hypot(nx, ny);
-    if (mag < 0.10) {                     // 中心死区，避免手抖让车蠕动
-      applyTarget(0, 0);
+    // 双阈值滞回：居中时 10% 才起步，已经在控制时降到 6% 才回中。
+    // 单阈值在手机上会被手指微抖反复跨过 → 目标 0/有 之间跳 → 车一顿一顿。
+    const inDeadzone = S.deadzoneActive
+      ? mag < DEADZONE_EXIT
+      : mag < DEADZONE_ENTER;
+    if (inDeadzone) {
+      S.deadzoneActive = true;
+      applyTarget(0, 0, force);
       return;
     }
+    S.deadzoneActive = false;
     const lim = limits();
     // 屏幕坐标：上 = 前进(+vx)，右 = 右转。右转对应协议 wz<0，
     // 由 steerWz() 里的 WZ_CMD_SIGN 统一取反，这里不要写裸负号。
-    applyTarget(-ny * lim.vx, steerWz(nx, lim.wz));
+    applyTarget(-ny * lim.vx, steerWz(nx, lim.wz), force);
   }
 
   pad.addEventListener("pointerdown", (ev) => {
@@ -243,29 +385,60 @@
     if (S.estop) return;
     ev.preventDefault();
     S.dragId = ev.pointerId;
+    S.lastPointerType = ev.pointerType || "?";
+    S.deadzoneActive = false;             // 每次新触摸都从"居中"状态开始
+    invalidatePadGeom();                  // 按下时量一次，整个拖动复用
     pad.classList.add("active");
+    // 捕获指针：手指滑出圆形区域后仍能收到 pointermove，不会"拖到一半断掉"。
     try { pad.setPointerCapture(ev.pointerId); } catch (err) {}
-    updateFromPointer(ev);
+    updateFromPointer(ev, true);          // 按下立即发一帧，不等 rAF
   });
 
   pad.addEventListener("pointermove", (ev) => {
     if (S.dragId !== ev.pointerId) return;
     ev.preventDefault();
-    updateFromPointer(ev);
+    // 触摸事件间隔诊断：这里记"前台真正处理到"的时刻，能看出主线程卡顿。
+    pushSample(S.touchTimes, performance.now());
+    updateFromPointer(ev, false);
   });
 
-  function endDrag(ev) {
-    if (S.dragId !== ev.pointerId) return;
+  function endDrag(ev, how) {
+    if (S.dragId === null || S.dragId !== ev.pointerId) return;
     S.dragId = null;
+    S.deadzoneActive = false;
     pad.classList.remove("active");
     resetKnob();
-    applyTarget(0, 0, true);              // 松手立刻发 0，不等定时器
+    applyTarget(0, 0, true);              // 松手立刻发 0，不等 rAF
+    if (how && S.cancels[how] !== undefined) S.cancels[how] += 1;
   }
-  pad.addEventListener("pointerup", endDrag);
-  pad.addEventListener("pointercancel", endDrag);
-  pad.addEventListener("lostpointercapture", endDrag);
+
+  // lostpointercapture 的 target 必须是 pad 本身才算"松手"：
+  // 触摸指针默认隐式捕获在子元素上，setPointerCapture(pad) 转移捕获时
+  // 会从子元素冒泡一个 lostpointercapture 上来 —— 那不代表用户松手，
+  // 按旧写法会把刚按下的拖动立刻清零（手机上手感=按下去不动/一顿）。
+  pad.addEventListener("lostpointercapture", (ev) => {
+    if (ev.target === pad) endDrag(ev, "lostcapture");
+  });
+  pad.addEventListener("pointerup", (ev) => endDrag(ev, "pointerup"));
+  pad.addEventListener("pointercancel", (ev) => endDrag(ev, "pointercancel"));
+  // 兜底：捕获意外丢失/事件在 pad 外抬起时，window 上也能收到。
+  window.addEventListener("pointerup", (ev) => endDrag(ev, "pointerup"));
+  window.addEventListener("pointercancel", (ev) => endDrag(ev, "pointercancel"));
   pad.addEventListener("contextmenu", (ev) => ev.preventDefault());
   pad.addEventListener("dragstart", (ev) => ev.preventDefault());
+  pad.addEventListener("dblclick", (ev) => ev.preventDefault());
+
+  // 老 WebView / 部分 Android 浏览器对 touch-action 支持不完整：
+  // 摇杆上的 touchmove 仍可能触发页面滚动/下拉刷新，浏览器会发 pointercancel
+  // 把拖动打断。这里只在摇杆上非被动（passive:false）地 preventDefault，
+  // 不动页面其它区域，也不参与控制逻辑（控制仍走 Pointer Events）。
+  const blockGesture = (ev) => { if (ev.cancelable) ev.preventDefault(); };
+  pad.addEventListener("touchstart", blockGesture, { passive: false });
+  pad.addEventListener("touchmove", blockGesture, { passive: false });
+  // iOS Safari 的双指缩放/长按呼出也不该在摇杆上触发。
+  document.addEventListener("gesturestart", (ev) => {
+    if (ev.target === pad || (ev.target && pad.contains(ev.target))) ev.preventDefault();
+  });
 
   // ---------------------------------------------------------------------
   // 键盘（桌面/无触摸屏时方便，也是在 Windows 上自测的主要手段）
@@ -458,7 +631,14 @@
       txt.textContent = "急停锁存中：只发 0，点“复位”才能恢复";
     } else if (reason === "timeout") {
       dot.classList.add("warn");
-      txt.textContent = "服务端 500 ms 未收到指令，已自动归零";
+      const j = m.jitter || {};
+      const n = j.timeout_zero_count || 0;
+      txt.textContent = `服务端 500 ms 未收到指令，已归零（累计超时清零 ${n} 次）`;
+    } else if (reason === "stale") {
+      // 300~500 ms 没新指令：后端按 70%→50%→30% 分级衰减，不再一步归零。
+      const pct = Math.round((m.cmd.degrade_scale || 0) * 100);
+      dot.classList.add("warn");
+      txt.textContent = `链路抖动：${m.cmd.age_ms} ms 没收到新指令，目标暂降到 ${pct}%`;
     } else {
       dot.classList.add("ok");
       txt.textContent = `正在发送 · ${CMD_HZ} Hz · 实发 vx ${fmt(m.cmd.tx_vx, 3)} / wz ${fmt(m.cmd.tx_wz, 3)}`;
@@ -467,6 +647,12 @@
 
   function setBar(id, value, max) {
     const el = $(id);
+    if (!el) return;
+    // 值没变就别写 style：20 Hz × 4 个条，手机上这些写操作会带来
+    // 不必要的样式重算/重绘（和 canvas 的布局读取叠加成卡顿）。
+    const key = value + "|" + max;
+    if (el.__barKey === key) return;
+    el.__barKey = key;
     const pct = clamp(value / max, -1, 1) * 50;
     if (pct >= 0) {
       el.style.left = "50%";
@@ -479,7 +665,12 @@
   }
 
   function setMark(id, value, max) {
-    $(id).style.left = (50 + clamp(value / max, -1, 1) * 50) + "%";
+    const el = $(id);
+    if (!el) return;
+    const key = value + "|" + max;
+    if (el.__markKey === key) return;
+    el.__markKey = key;
+    el.style.left = (50 + clamp(value / max, -1, 1) * 50) + "%";
   }
 
   // 后端已经把分级算好（temp_level / age_level / boot_level），前端只套 CSS。
@@ -556,7 +747,11 @@
   function renderFlags(m) {
     const box = $("flags");
     const flags = m.flags || [];
-    if (box.children.length !== flags.length) {
+    const sig = flags.map((f) => f.key).join(",");
+    if (sig !== S.flagSig) {
+      // 重建一次并缓存元素：不要每帧对 8 个 flag 做 querySelector。
+      S.flagSig = sig;
+      S.flagEls = Object.create(null);
       box.textContent = "";
       flags.forEach((f) => {
         const span = document.createElement("span");
@@ -567,10 +762,11 @@
         span.appendChild(dot);
         span.appendChild(document.createTextNode(f.label));
         box.appendChild(span);
+        S.flagEls[f.key] = span;
       });
     }
     flags.forEach((f) => {
-      const el = box.querySelector(`[data-key="${f.key}"]`);
+      const el = S.flagEls[f.key] || box.querySelector(`[data-key="${f.key}"]`);
       if (el) el.className = "flag " + (f.good ? "ok" : "bad");
     });
     text("flagsRaw", m.status ? `flags 0x${m.status.flags_raw.toString(16).padStart(2, "0").toUpperCase()}` : "flags —");
@@ -718,10 +914,103 @@
     }
   }
 
+  // ---------------------------------------------------------------------
+  // 链路抖动诊断（每 200 ms 刷新一行，数据是最近 2 s 的滚动窗口）
+  //
+  // 怎么看：
+  //   * "指令"：前端真正发出 cmd 的间隔。正常 30~50 Hz → 20~35 ms；
+  //     出现 100~500 ms 的尖峰 = 主线程被卡（渲染/GC）或定时器被节流。
+  //   * "触摸"：pointermove 到达前台的间隔。手指一直动时正常 8~20 ms；
+  //     出现 >80 ms 的尖峰 = 主线程卡顿，不是网络问题。
+  //   * "帧"：rAF 间隔。和触摸同时尖峰 → 页面渲染太重/手机 CPU 忙。
+  //   * "触摸取消"：浏览器把触摸抢去滚动/缩放（pointercancel）的次数。
+  //     涨 = 手势没被 touch-action:none 完全拦住。
+  //   * "硬停"：blur/切后台/pagehide 触发的立即归零次数。blur 在手机上
+  //     可能是浏览器地址栏/通知栏抢焦点，涨且车顿 → 是这个原因。
+  //   * "超时清零/原因"：后端 step_output 的统计。超时清零涨 = 真·网络/心跳
+  //     断流；不涨而车仍顿 → 看触摸/帧，是前端输入或主线程问题。
+  // ---------------------------------------------------------------------
+  function renderDiagLine(m) {
+    m = m || S.last;
+    const now = performance.now();
+    // 读的时候也裁剪：手指/心跳停下来后，旧样本不能一直显示成"最近 2 s"。
+    pruneSamples(S.sendTimes, now);
+    pruneSamples(S.touchTimes, now);
+    pruneSamples(S.frameTimes, now);
+    const sendS = intervalStats(S.sendTimes);
+    const touchS = intervalStats(S.touchTimes);
+    const frameS = intervalStats(S.frameTimes);
+    const lineEl = $("jitterLine");
+    if (lineEl) {
+      lineEl.textContent = [
+        statsText("指令", sendS),
+        statsText("触摸", touchS),
+        statsText("帧", frameS),
+      ].join(" | ");
+    }
+
+    const j = (m && m.jitter) || null;
+    const reason = (j && j.reason) || null;
+    const arr = (j && j.arrival) || null;
+    const cancels = S.cancels.pointercancel + S.cancels.lostcapture;
+    const hardStops = S.hardStops.blur + S.hardStops.hidden + S.hardStops.pagehide;
+    const backendEl = $("jitterBackend");
+    if (backendEl) {
+      if (!j) {
+        backendEl.textContent = "超时清零 — · 原因 — · 服务端诊断等待中";
+      } else {
+        backendEl.textContent =
+          `超时清零 ${j.timeout_zero_count} 次 · ` +
+          `原因 web ${reason ? reason.web : 0}/stale ${reason ? reason.stale : 0}` +
+          `/timeout ${reason ? reason.timeout : 0}/hard ${reason ? reason.hard : 0} · ` +
+          `后端到达 ${arr && arr.n >= 2 ? msText(arr.avg) : "—"}ms · ` +
+          `触摸取消 ${cancels} · 硬停 ${hardStops}(blur ${S.hardStops.blur})`;
+      }
+    }
+
+    // 链路诊断卡片里的三行（和上面同一份数据，方便截图/README 对照）
+    text("dJitter", statsText("指令", sendS) + " · " + statsText("触摸", touchS));
+    const tz = $("dTimeoutZero");
+    if (tz && j) {
+      tz.textContent = `超时清零 ${j.timeout_zero_count} 次 · 近2s timeout ${reason ? reason.timeout : 0} 帧`;
+      // 只在最近 10 s 内真的清零过才标黄，否则累计值会让这一行一直黄着。
+      const last = j.timeout_zero_last_s;
+      const recent = last !== null && last !== undefined && m && m.ts !== undefined
+        && (m.ts - last) < 10;
+      tz.className = "lvl " + (recent ? "warn" : "ok");
+    } else if (tz) {
+      tz.textContent = "—";
+    }
+    text("dArrival", arr && arr.n >= 2
+      ? `${msText(arr.min)}/${msText(arr.avg)}/${msText(arr.max)}ms 抖${msText(arr.jitter)} · ${arr.n} 帧/2s`
+      : "—");
+  }
+
+  // 给 selftest / 现场控制台看的只读诊断快照（不参与控制）。
+  window.__carwebDiag = () => ({
+    connected: S.connected,
+    raf: !!S.rafId,
+    session: S.session,
+    seq: S.seq,
+    lastCmdSentAgo: Math.round(performance.now() - S.lastCmdSent),
+    send: intervalStats(S.sendTimes),
+    touch: intervalStats(S.touchTimes),
+    frame: intervalStats(S.frameTimes),
+    hardStops: { ...S.hardStops },
+    cancels: { ...S.cancels },
+    pointerType: S.lastPointerType,
+    deadzoneActive: S.deadzoneActive,
+    dragId: S.dragId,
+    backend: (S.last && S.last.jitter) || null,
+    reason: (S.last && S.last.cmd && S.last.cmd.reason) || null,
+    degradeScale: (S.last && S.last.cmd && S.last.cmd.degrade_scale) || 1,
+    timeoutZeroCount: (S.last && S.last.jitter && S.last.jitter.timeout_zero_count) || 0,
+  });
+
   function renderVersion(m) {
     const el = $("footerVer");
     if (!el) return;
-    const v = (m && m.version) || "1.3.0";
+    const v = (m && m.version) || "1.4.0";
     text("footerVer", `car_web ${v}`);
   }
 
@@ -821,6 +1110,7 @@
     renderImu(tel, st, m.imu);
     renderOdom(m);
     renderDiag(m);
+    renderDiagLine(m);
     renderEvents(m);
     renderBanner(m);
     renderSendState(m);
@@ -833,11 +1123,16 @@
   // ---------------------------------------------------------------------
   // 波形（canvas，无第三方库）
   // ---------------------------------------------------------------------
-  function sizeCanvas() {
+  function sizeCanvas(force) {
     const c = $("wave");
+    if (!c) return;
+    // ★ 只在尺寸变化时读 clientWidth/clientHeight。每帧读一次布局会
+    // 强制同步重排（前面刚写过一堆 style），手机上这就是掉帧的常见原因。
+    if (!force && !S.canvasDirty) return;
     const dpr = window.devicePixelRatio || 1;
     const w = Math.max(10, c.clientWidth);
     const h = Math.max(10, c.clientHeight);
+    S.canvasDirty = false;
     if (S.canvasW === w && S.canvasH === h) return;
     S.canvasW = w;
     S.canvasH = h;
@@ -845,6 +1140,14 @@
     c.height = Math.round(h * dpr);
     const ctx = c.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function watchCanvasSize() {
+    const c = $("wave");
+    if (!c || S.canvasObs || typeof ResizeObserver !== "function") return;
+    // 容器尺寸变化（旋转屏幕、侧栏折行）时标脏，下一帧重新量。
+    S.canvasObs = new ResizeObserver(() => { S.canvasDirty = true; });
+    S.canvasObs.observe(c);
   }
 
   function pushWave(tel) {
@@ -891,7 +1194,14 @@
     drawTrace(S.wave.gz, 2.0, "rgba(34,211,238,.95)", 1.8);
   }
 
-  window.addEventListener("resize", () => { S.canvasW = S.canvasH = 0; drawWave(); });
+  window.addEventListener("resize", () => {
+    S.canvasW = S.canvasH = 0;
+    S.canvasDirty = true;
+    invalidatePadGeom();
+    drawWave();
+  });
+  // 页面滚动/地址栏伸缩后摇杆的视口坐标会变，缓存必须失效。
+  window.addEventListener("scroll", invalidatePadGeom, { passive: true });
 
   // ---------------------------------------------------------------------
   // 页面生命周期：切后台/失焦/关闭 = **立即停**（安全停车，不软停）
@@ -903,6 +1213,7 @@
   // ---------------------------------------------------------------------
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
+      S.hardStops.hidden += 1;
       S.keys.clear();
       S.dragId = null;
       pad.classList.remove("active");
@@ -912,12 +1223,14 @@
   });
 
   window.addEventListener("blur", () => {
+    S.hardStops.blur += 1;
     S.keys.clear();
     if (S.dragId === null) resetKnob();
     hardStop();
   });
 
   window.addEventListener("pagehide", () => {
+    S.hardStops.pagehide += 1;
     hardStop();
     if (S.ws) { try { S.ws.close(); } catch (err) {} }
   });
@@ -930,7 +1243,9 @@
   updateEstopUI();
   updateBadges(null);
   renderSendState(null);
+  renderDiagLine(null);
   sizeCanvas();
+  watchCanvasSize();
   drawWave();
   connect();
 })();

@@ -21,9 +21,12 @@
 安全层次（三层，任何一层失效都还能停住）
     1. 前端：松手/回中 → 发 0（后端软停）；切后台/失焦/关页 → 发 0 + hard:true
        （后端立即归零）；WebSocket 断了就不再发。
-    2. 本程序：500 ms 没收到网页指令 → 立即发 0；急停锁存后只发 0；
-               |vx|<=2.0 m/s、|wz|<=1.5 rad/s 硬夹 + 档位夹（固件上限 2.565 m/s）。
+    2. 本程序：500 ms 没收到网页指令 → 分级衰减（300 ms 70%、380 ms 50%、
+       460 ms 30%）并在 500 ms 归零；急停锁存后只发 0；
+       |vx|<=2.0 m/s、|wz|<=1.5 rad/s 硬夹 + 档位夹（固件上限 2.565 m/s）。
     3. STM32：800 ms 收不到合法命令帧 → 目标清零（固件里已实现）。
+    ★ 分级衰减只让"网络抖动"的顿挫变柔和，绝不延长归零时间：
+      硬上限仍是 500 ms 开始/完成归零，比固件 800 ms 看门狗更早。
 
 缓启缓停（默认开，加减速分开）
     正常行驶指令在 step_output() 里按 vx 加速 1.0 / 减速 0.40 m/s²、
@@ -40,7 +43,7 @@
 
 自测
     python3 car_web.py --sim            # 不开串口，内部仿真产生 24/44 字节帧
-    python3 selftest.py                 # 45 项断言（需要浏览器；否则 --no-browser）
+    python3 selftest.py                 # 52 项断言（需要浏览器；否则 --no-browser）
     python3 car_web.py                  # 真机：/dev/wheeltec_controller @115200
 """
 
@@ -70,7 +73,7 @@ from urllib.parse import unquote, urlparse
 
 # 页面/接口版本：改前端静态资源时一定要一起改，index.html 的 ?v= 会跟着变，
 # 否则浏览器会拿缓存的旧 app.js 跑新 HTML（现场排查过好几次）。
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
@@ -120,6 +123,19 @@ HARD_VX_LIMIT = 2.00
 HARD_WZ_LIMIT = 1.50
 FIRMWARE_VX_MAX = WHEEL_OMEGA_MAX * WHEEL_R_M   # 2.565 m/s，只用于注释/自测对照
 CMD_TIMEOUT_MS = 500     # 网页心跳超时（< 固件的 800 ms，保证先由我们清零）
+
+# ---- 心跳分级衰减（1.4.0）-----------------------------------------------
+# 只用来说明"500 ms 之前"的阶段：手机 WiFi 抖动时，指令可能 300~500 ms 才到。
+# 旧行为是"到 500 ms 一步从全速跳到 0"，车会明显"冲一下-停-再冲"。
+# 现在按 (年龄阈值, 目标缩放) 分 3 档衰减，让减速更柔和；但 500 ms 仍然
+# 强制归零（不延长），固件 800 ms 看门狗仍在更外层兜底。
+#
+# ★ 安全边界（改之前先读）：
+#   * 最晚 300 ms 就开始降速，500 ms 必须到 0 —— 比原来的 500 ms 更早减速；
+#   * 衰减只乘"目标"，实际的下降仍由 RAMP_VX_DEC / RAMP_WZ_DEC 限制；
+#   * 急停 / hard:true / 断连永远不会走这条路径，仍是立即归零。
+CMD_DEGRADE_STEPS = ((300.0, 0.70), (380.0, 0.50), (460.0, 0.30))
+CMD_DIAG_WINDOW_MS = 2000  # 诊断滚动窗口，和前端 app.js 的 DIAG_WINDOW_MS 一致
 
 # ---- 缓启缓停（指令斜坡）------------------------------------------------
 # 只作用于"正常行驶指令"：目标 vx/wz 变化时按下面的斜率逐步逼近，
@@ -233,6 +249,13 @@ def xor_bcc(data: bytes) -> int:
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
+
+
+def _ms(v: Optional[float]) -> str:
+    """/status 用：None → "—"，数值 → 一位小数或不带小数。"""
+    if v is None:
+        return "—"
+    return ("%.1f" % v) if v < 10 else ("%.0f" % v)
 
 
 def slew(cur: float, target: float, max_step: float) -> float:
@@ -495,13 +518,39 @@ class CarHub:
         self.cmd_time = 0.0          # 最近一次网页指令的 monotonic 时间（0=从没收到）
         self.cmd_recv_count = 0
 
+        # ---- 指令序号 / 诊断（1.4.0）----
+        # 前端每条 cmd 带 session + seq + ts：
+        #   session 每次页面加载随机生成，刷新后 seq 从 0 重来；
+        #   后端只在该 session 内比较 seq，丢弃"旧序号"（乱序/重发）的包，
+        #   避免晚到的旧目标把新目标覆盖回去。
+        self.cmd_session: Optional[str] = None
+        self.cmd_seq: Optional[int] = None
+        self.cmd_last_client_ts: Optional[int] = None
+        self.cmd_stale_packets = 0   # 被丢弃的旧序号/重复包
+        self.cmd_seq_gaps = 0        # 序号跳号总数（丢包迹象）
+        self.cmd_session_resets = 0  # 页面重载/换标签页次数
+
+        # 最近 2 s 的指令到达时刻（含被丢弃的旧包：它们也真的到过）。
+        # maxlen 取 1024：即使 120 Hz 发也能覆盖完整 2 s 窗口。
+        self.cmd_arrivals: deque[float] = deque(maxlen=1024)
+        # 每一拍 step_output 的分类，用于 /status 的 reason 分布。
+        self.reason_frames: deque[tuple[float, str]] = deque(maxlen=512)
+        self.reason_total = {"web": 0, "stale": 0, "timeout": 0,
+                             "hard": 0, "estop": 0}
+        self._prev_reason: Optional[str] = None
+        # ★ 最关键诊断：因心跳超时而被清零的"次数"（不是帧数）。
+        # 只在前一帧还是 web/stale 且当前输出确实非 0 时 +1，
+        # 这样手机操作时这个数在涨 → 就是网络/心跳断流。
+        self.timeout_zero_count = 0
+        self.last_timeout_s: Optional[float] = None
+
         # ---- 安全 ----
         self.estop = False
         self.estop_time = 0.0
         self.gear = "low"            # 默认最慢档：第一次打开页面不会蹿出去
         # hard_stop=True 表示"这次目标是安全停车，必须立即归零"：
         # 页面隐藏 / 窗口失焦 / pagehide 会带 hard:true 发 0；锁存到下一次
-        # 非零行驶指令为止。这样随后的 20 Hz 0 心跳不会把硬停又变回软停。
+        # 非零行驶指令为止。这样随后的 30 Hz 0 心跳不会把硬停又变回软停。
         self.hard_stop = False
 
         # ---- 缓启缓停（斜坡）----
@@ -564,7 +613,9 @@ class CarHub:
 
     # -- 指令 ---------------------------------------------------------------
     def set_cmd(self, vx: float, wz: float, owner: int,
-                hard: bool = False) -> None:
+                hard: bool = False, seq: Optional[int] = None,
+                session: Optional[str] = None,
+                ts: Optional[int] = None) -> None:
         """记录网页目标值。
 
         hard=True 只对"目标为 0"的指令有意义：页面隐藏 / 窗口失焦 /
@@ -575,6 +626,13 @@ class CarHub:
         **急停锁存期间不接受新目标**：否则复位后会把锁存期间收到的
         最后一帧指令放出来（"复位后必须重新推摇杆"的承诺就破了）。
         急停时只保留 owner/count 用于诊断，目标与时间戳都保持 0。
+
+        1.4.0 新增 seq / session / ts：
+          * session 每次页面加载随机生成；换页面后 seq 从 0 重来，
+            后端据此重置基线，不会把新页面的指令当"旧包"丢掉。
+          * 同一 session 内 seq 单调递增；`seq <= 上次` 视为乱序/重发的旧包，
+            直接丢弃（不计入心跳、不覆盖目标），只累加诊断计数。
+            TCP/WS 本身有序，这条主要防 HTTP 多连接和浏览器重发。
         """
         vx = float(vx)
         wz = float(wz)
@@ -583,9 +641,42 @@ class CarHub:
         if not (math.isfinite(vx) and math.isfinite(wz)):
             vx = 0.0
             wz = 0.0
+        now = time.monotonic()
         with self.lock:
             self.cmd_owner = owner
             self.cmd_recv_count += 1
+            # 到达时刻先记：即使是被丢弃的旧包，它也确实占用了网络链路，
+            # 到达间隔统计应该包含它。
+            self.cmd_arrivals.append(now)
+
+            if session is not None:
+                session = str(session)
+                if self.cmd_session is not None and session != self.cmd_session:
+                    self.cmd_session_resets += 1
+                    self.cmd_seq = None
+                self.cmd_session = session
+
+            seq_i: Optional[int] = None
+            if seq is not None:
+                try:
+                    seq_i = int(seq)
+                except (TypeError, ValueError, OverflowError):
+                    seq_i = None
+            if seq_i is not None:
+                if self.cmd_seq is not None:
+                    if seq_i <= self.cmd_seq:
+                        self.cmd_stale_packets += 1
+                        return
+                    if seq_i > self.cmd_seq + 1:
+                        self.cmd_seq_gaps += seq_i - self.cmd_seq - 1
+                self.cmd_seq = seq_i
+
+            if ts is not None:
+                try:
+                    self.cmd_last_client_ts = int(ts)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+
             if self.estop:
                 self.cmd_vx = 0.0
                 self.cmd_wz = 0.0
@@ -593,7 +684,7 @@ class CarHub:
                 return
             self.cmd_vx = vx
             self.cmd_wz = wz
-            self.cmd_time = time.monotonic()
+            self.cmd_time = now
             if vx != 0.0 or wz != 0.0:
                 # 只要重新开始行驶，就清掉硬停锁存（下一次停车按新指令分类）。
                 self.hard_stop = False
@@ -677,23 +768,44 @@ class CarHub:
             self.note("里程清零")
 
     # -- 安全核心 -----------------------------------------------------------
+    def _degrade_scale_locked(self, age_ms: float) -> tuple[float, bool]:
+        """心跳年龄 → 目标缩放。返回 (scale, 是否处于分级衰减)。
+
+        300 ms 起 0.70 → 0.50 → 0.30，500 ms 由 _target_locked 直接归零。
+        只用于"链路抖动"的柔性降速，不改变任何立即停的路径。
+        """
+        for threshold, scale in reversed(CMD_DEGRADE_STEPS):
+            if age_ms >= threshold:
+                return scale, True
+        return 1.0, False
+
     def _target_locked(self, now: float) -> tuple[float, float, str, bool]:
-        """算目标值（已过安全状态机 + 档位/硬上限夹取），不推进斜坡。
+        """算目标值（已过安全状态机 + 档位/硬上限夹取 + 心跳分级衰减），不推进斜坡。
 
         返回 (vx, wz, 原因, 是否被夹取)。原因用于界面显示"为什么车不动"。
         调用者必须已持有 self.lock（RLock 重入也行）。
         """
         if self.estop:
             return 0.0, 0.0, "estop", False
-        if self.cmd_time <= 0.0 or (now - self.cmd_time) * 1000.0 > CMD_TIMEOUT_MS:
+        if self.cmd_time <= 0.0:
             return 0.0, 0.0, "timeout", False
+        age_ms = (now - self.cmd_time) * 1000.0
+        if age_ms > CMD_TIMEOUT_MS:
+            # 硬上限：500 ms 到 0，绝不因为"分级衰减"延长到固件 800 ms 附近。
+            return 0.0, 0.0, "timeout", False
+        scale, degraded = self._degrade_scale_locked(age_ms)
         g = GEARS[self.gear]
         vx_max = min(g["vx"], HARD_VX_LIMIT)
         wz_max = min(g["wz"], HARD_WZ_LIMIT)
+        # 先按档位/硬上限夹"网页原始目标"，再乘衰减系数：
+        # clamped 只表示"被夹取"，不能把 70% 衰减也算成夹取。
         vx = clamp(self.cmd_vx, -vx_max, vx_max)
         wz = clamp(self.cmd_wz, -wz_max, wz_max)
         clamped = (abs(vx - self.cmd_vx) > 1e-9) or (abs(wz - self.cmd_wz) > 1e-9)
-        return vx, wz, "web", clamped
+        if degraded:
+            vx *= scale
+            wz *= scale
+        return vx, wz, ("stale" if degraded else "web"), clamped
 
     def effective(self, now: float) -> tuple[float, float, str, bool]:
         """目标值（不含斜坡）。保留这个名字给状态/诊断用；**不要**在这里积分。
@@ -723,11 +835,13 @@ class CarHub:
            都只是把目标置 0，没有 hard 标记；开了斜坡就按 RAMP_*_DEC
            逐拍减速到 0。斜坡关闭时仍保持旧行为：下一拍直接置 0。
 
-        注意：软停期间必须继续有网页心跳（页面在后台仍按 20 Hz 发 0，
-        或脚本持续 POST /api/stop）；一旦心跳断了，500 ms 后按 A.2 立即归零。
+        注意：软停期间必须继续有网页心跳（页面在后台仍按 30 Hz 发 0，
+        或脚本持续 POST /api/stop）；一旦心跳断了，先按 CMD_DEGRADE_STEPS
+        柔性降速，500 ms 后按 A.2 立即归零。
         """
         with self.lock:
             tvx, twz, reason, clamped = self._target_locked(now)
+            was_moving = abs(self.out_vx) > 1e-6 or abs(self.out_wz) > 1e-6
 
             if self._ramp_t <= 0.0:
                 dt = 0.0
@@ -750,6 +864,27 @@ class CarHub:
                                         RAMP_VX_ACC, RAMP_VX_DEC)
                 self.out_wz = slew_axis(self.out_wz, twz, dt,
                                         RAMP_WZ_ACC, RAMP_WZ_DEC)
+
+            # ---- 诊断（1.4.0）：每拍归一个原因，供 /status 看分布 ----
+            # 注意分类顺序：estop > timeout > hard（前端 hard:true）> stale > web。
+            if reason == "estop":
+                cat = "estop"
+            elif reason == "timeout":
+                cat = "timeout"
+            elif self.hard_stop:
+                cat = "hard"
+            elif reason == "stale":
+                cat = "stale"
+            else:
+                cat = "web"
+            self.reason_frames.append((now, cat))
+            self.reason_total[cat] = self.reason_total.get(cat, 0) + 1
+            # ★ 超时清零"次数"：只在刚跨进 timeout 且此前输出确实非 0 时 +1。
+            # 这样停在原地时不会一直涨；手机操作时它涨 = 心跳真的断了。
+            if cat == "timeout" and self._prev_reason != "timeout" and was_moving:
+                self.timeout_zero_count += 1
+                self.last_timeout_s = round(now - self.started, 1)
+            self._prev_reason = cat
 
             self.ramp_step_count += 1
             return self.out_vx, self.out_wz, reason, clamped
@@ -818,6 +953,44 @@ class CarHub:
                     self._prev_fault = fault
 
     # -- 状态快照 -----------------------------------------------------------
+    def _arrival_stats_locked(self, now: float) -> dict[str, Any]:
+        """最近 2 s 内 /cmd（HTTP 或 WS）的到达间隔统计。
+
+        手机 WiFi 抖动最直接的证据：间隔 min/avg/max 和最大抖动。
+        只统计"到达"，不区分是否为旧序号包 —— 旧包也的确到了。
+        """
+        horizon = now - CMD_DIAG_WINDOW_MS / 1000.0
+        while self.cmd_arrivals and self.cmd_arrivals[0] < horizon:
+            self.cmd_arrivals.popleft()
+        arr = list(self.cmd_arrivals)
+        out: dict[str, Any] = {
+            "n": len(arr), "window_ms": CMD_DIAG_WINDOW_MS,
+            "min_ms": None, "avg_ms": None, "max_ms": None, "jitter_ms": None,
+        }
+        if len(arr) >= 2:
+            gaps = [(arr[i] - arr[i - 1]) * 1000.0 for i in range(1, len(arr))]
+            avg = sum(gaps) / len(gaps)
+            out.update({
+                "min_ms": round(min(gaps), 1),
+                "avg_ms": round(avg, 1),
+                "max_ms": round(max(gaps), 1),
+                "jitter_ms": round(max(abs(g - avg) for g in gaps), 1),
+            })
+        return out
+
+    def _reason_stats_locked(self, now: float) -> dict[str, Any]:
+        """最近 2 s 内 step_output 每一拍的原因分布（web/stale/timeout/hard/estop）。"""
+        horizon = now - CMD_DIAG_WINDOW_MS / 1000.0
+        while self.reason_frames and self.reason_frames[0][0] < horizon:
+            self.reason_frames.popleft()
+        counts = {"web": 0, "stale": 0, "timeout": 0, "hard": 0, "estop": 0}
+        for _t, cat in self.reason_frames:
+            if cat in counts:
+                counts[cat] += 1
+        counts["frames"] = len(self.reason_frames)
+        counts["window_ms"] = CMD_DIAG_WINDOW_MS
+        return counts
+
     def _cmd_age_ms(self, now: float) -> Optional[float]:
         if self.cmd_time <= 0.0:
             return None
@@ -828,6 +1001,12 @@ class CarHub:
         with self.lock:
             g = GEARS[self.gear]
             target_vx, target_wz, reason, clamped = self._target_locked(now)
+            age_ms = self._cmd_age_ms(now)
+            degrade_scale = 1.0
+            if reason == "timeout":
+                degrade_scale = 0.0        # 已归零：显示 0%，不是 100%
+            elif reason == "stale" and age_ms is not None:
+                degrade_scale, _ = self._degrade_scale_locked(age_ms)
             # 立即停的语义在显示上也立即生效（即使 LinkWorker 这一拍还没跑到），
             # 但不能把"软停中"也显示成 0，否则界面看不出缓停。只有
             # estop / timeout / hard_stop 这三类才强制显示 0。
@@ -927,10 +1106,39 @@ class CarHub:
                     "target_wz": round(target_wz, 3),
                     "reason": reason,
                     "clamped": clamped,
-                    "age_ms": round(self._cmd_age_ms(now) or 0.0, 0),
-                    "has_client": self._cmd_age_ms(now) is not None
-                                  and (now - self.cmd_time) * 1000.0 <= CMD_TIMEOUT_MS,
+                    "age_ms": round(age_ms or 0.0, 0),
+                    "has_client": age_ms is not None and age_ms <= CMD_TIMEOUT_MS,
                     "recv_count": self.cmd_recv_count,
+                    # ---- 1.4.0 指令链路诊断 ----
+                    "seq": self.cmd_seq,
+                    "session": self.cmd_session,
+                    "client_ts": self.cmd_last_client_ts,
+                    # degraded=true 时 target_* 已经是衰减后的值，scale 是系数
+                    "degraded": reason == "stale",
+                    "degrade_scale": round(degrade_scale, 2),
+                    "stale_packets": self.cmd_stale_packets,
+                    "seq_gaps": self.cmd_seq_gaps,
+                    "session_resets": self.cmd_session_resets,
+                },
+                "jitter": {
+                    # 最近 2 s 的到达间隔（前端指令 → 本进程）
+                    "arrival": self._arrival_stats_locked(now),
+                    # 最近 2 s 每一拍输出按原因分类（30 Hz × 2 s ≈ 60 帧）
+                    "reason": self._reason_stats_locked(now),
+                    "window_ms": CMD_DIAG_WINDOW_MS,
+                    # ★ 因心跳超时被清零的次数：手机操作时它涨 = 网络/心跳问题
+                    "timeout_zero_count": self.timeout_zero_count,
+                    "timeout_zero_last_s": self.last_timeout_s,
+                    "stale_frames_total": self.reason_total.get("stale", 0),
+                    "reason_total": dict(self.reason_total),
+                    "stale_packets": self.cmd_stale_packets,
+                    "seq_gaps": self.cmd_seq_gaps,
+                    "session_resets": self.cmd_session_resets,
+                    "degrade_steps": [
+                        {"after_ms": int(ms), "scale": scale}
+                        for ms, scale in CMD_DEGRADE_STEPS
+                    ],
+                    "hard_timeout_ms": CMD_TIMEOUT_MS,
                 },
                 "ramp": {
                     "on": self.ramp_on,
@@ -1544,7 +1752,11 @@ class Handler(BaseHTTPRequestHandler):
             # hard=true 表示安全停车（页面隐藏/失焦/关页），立即归零；
             # 不打 hard 的 0 是松手/回中/主动停止，走缓停斜坡。
             hard = parse_onoff(body.get("hard")) is True
-            self.hub.set_cmd(vx, wz, owner=0, hard=hard)   # owner=0 表示 HTTP 客户端
+            # 1.4.0：可选的 seq/session/ts 用于乱序/旧包诊断；不带也能工作
+            # （HTTP 脚本客户端向后兼容）。
+            self.hub.set_cmd(vx, wz, owner=0, hard=hard,
+                             seq=body.get("seq"), session=body.get("session"),
+                             ts=body.get("ts"))   # owner=0 表示 HTTP 客户端
             self._json({"ok": True, "cmd": self.hub.snapshot()["cmd"]})
             return
         if path == "/api/ramp":
@@ -1623,9 +1835,31 @@ class Handler(BaseHTTPRequestHandler):
                 {"decel": "缓停中", "accel": "斜坡中",
                  "hard": "立即停", "off": "斜坡关闭", "idle": "—"}[
                      s["ramp"]["mode"]]),
-            "指令: 网页=(%.3f, %.3f)  实发=(%.3f, %.3f)  原因=%s  夹取=%s  年龄=%sms" % (
+            "指令: 网页=(%.3f, %.3f)  实发=(%.3f, %.3f)  原因=%s  夹取=%s  年龄=%sms"
+            "  衰减=%d%%  seq=%s" % (
                 cmd["vx"], cmd["wz"], cmd["tx_vx"], cmd["tx_wz"],
-                cmd["reason"], "是" if cmd["clamped"] else "否", cmd["age_ms"]),
+                cmd["reason"], "是" if cmd["clamped"] else "否", cmd["age_ms"],
+                round(cmd["degrade_scale"] * 100), cmd["seq"]),
+            # ---- 1.4.0 链路抖动诊断：手机顿挫先看这三行 ----
+            "抖动: 指令到达 %s  min/avg/max=%s/%s/%sms  抖动=%sms（窗口 %dms）" % (
+                "%d 帧" % s["jitter"]["arrival"]["n"],
+                _ms(s["jitter"]["arrival"]["min_ms"]),
+                _ms(s["jitter"]["arrival"]["avg_ms"]),
+                _ms(s["jitter"]["arrival"]["max_ms"]),
+                _ms(s["jitter"]["arrival"]["jitter_ms"]),
+                s["jitter"]["window_ms"]),
+            "原因: web=%d stale=%d timeout=%d hard=%d estop=%d（近2s共 %d 帧）" % (
+                s["jitter"]["reason"]["web"], s["jitter"]["reason"]["stale"],
+                s["jitter"]["reason"]["timeout"], s["jitter"]["reason"]["hard"],
+                s["jitter"]["reason"]["estop"], s["jitter"]["reason"]["frames"]),
+            "超时清零: %d 次%s  分级衰减帧=%d{300ms:70%%,380ms:50%%,460ms:30%%}→0"
+            "  旧包丢弃=%d 缺号=%d 会话重置=%d" % (
+                s["jitter"]["timeout_zero_count"],
+                "" if s["jitter"]["timeout_zero_last_s"] is None
+                else "（最近 %.1fs）" % s["jitter"]["timeout_zero_last_s"],
+                s["jitter"]["stale_frames_total"],
+                s["jitter"]["stale_packets"], s["jitter"]["seq_gaps"],
+                s["jitter"]["session_resets"]),
         ]
         if tel:
             imu = s["imu"] or {}
@@ -1760,7 +1994,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             # hard=true：页面隐藏/失焦/关页的安全停车，后端立即归零。
             hard = parse_onoff(msg.get("hard")) is True
-            self.hub.set_cmd(vx, wz, owner=cid, hard=hard)
+            self.hub.set_cmd(vx, wz, owner=cid, hard=hard,
+                             seq=msg.get("seq"), session=msg.get("session"),
+                             ts=msg.get("ts"))
         elif t == "gear":
             self.hub.set_gear(str(msg.get("gear", "")))
         elif t == "ramp":

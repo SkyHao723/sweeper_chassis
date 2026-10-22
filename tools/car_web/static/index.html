@@ -6,7 +6,7 @@
   <meta name="theme-color" content="#0d1117" />
   <title>小车遥控器</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2322d3ee'/%3E%3Ctext x='16' y='23' font-size='15' font-family='monospace' font-weight='bold' text-anchor='middle' fill='%23051016'%3ERC%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/static/style.css?v=1.3.0" />
+  <link rel="stylesheet" href="/static/style.css?v=1.4.0" />
 </head>
 <body>
   <header class="topbar">
@@ -86,6 +86,16 @@
       <div class="send-state" id="sendState">
         <span class="send-dot" id="sendDot"></span>
         <span id="sendText">等待连接…</span>
+      </div>
+
+      <!-- 1.4.0 链路抖动诊断：一行看清顿挫是网络、触摸还是主线程 -->
+      <div class="jitter-panel" id="jitterPanel">
+        <div class="jitter-line" id="jitterLine">指令 — | 触摸 — | 帧 —</div>
+        <div class="jitter-line sub" id="jitterBackend">超时清零 — · 原因 — · 服务端诊断等待中</div>
+        <div class="jitter-hint">
+          指令/触摸/帧均为最近 2 s 的 min/avg/max；<b>超时清零涨</b>=网络心跳断流；
+          <b>触摸取消涨</b>=浏览器抢手势；<b>指令尖峰 + 触摸尖峰</b>=手机主线程卡顿。
+        </div>
       </div>
 
       <div class="ramp-row on" id="rampRow">
@@ -288,6 +298,9 @@
           <div><dt>协议版本</dt><dd id="dProto">—</dd></div>
           <div><dt>反馈年龄 左 / 右</dt><dd id="dFbAge">—</dd></div>
           <div><dt>CAN 失败 / 反馈帧</dt><dd class="lvl" id="dCan">—</dd></div>
+          <div><dt>指令 / 触摸抖动</dt><dd id="dJitter">—</dd></div>
+          <div><dt>超时清零 / 原因</dt><dd class="lvl" id="dTimeoutZero">—</dd></div>
+          <div><dt>后端到达间隔</dt><dd id="dArrival">—</dd></div>
         </dl>
         <div class="events">
           <div class="events-head">最近事件</div>
@@ -296,12 +309,12 @@
       </section>
 
       <footer class="footer">
-        <span>RK3576 串口 → STM32 → 达妙 DM-H65 · 本页 20 Hz 推状态、20 Hz 发指令</span>
-        <span id="footerVer">car_web 1.3.0</span>
+        <span>RK3576 串口 → STM32 → 达妙 DM-H65 · 本页 20 Hz 推状态、30 Hz 发指令（rAF + 触摸事件驱动）</span>
+        <span id="footerVer">car_web 1.4.0</span>
       </footer>
     </div>
   </main>
 
-  <script src="/static/app.js?v=1.3.0"></script>
+  <script src="/static/app.js?v=1.4.0"></script>
 </body>
 </html>
