@@ -55,9 +55,38 @@
 #define MOTOR2_MST_ID       0x11        /* 右轮反馈帧 ID */
 
 #define WHEEL_R_M           0.0855f     /* 轮半径 m (171 mm 轮径 / 2) */
-/* ★ 电机方向系数。2026-10-21 实测: 发 vx=+0.1 时两个轮子都**倒着转**,
-   所以整体取反。改回 +1.0f 即恢复原方向; 左右若不一致, 再加两个独立宏。 */
-#define DM_DIR_SIGN         (-1.0f)
+/*====================== 电机安装方向 (左右独立, 按车型分) =================
+ * 轮毂电机装在车的左侧和右侧是**镜像安装**的: 同一个"电机反馈为正", 在左轮上
+ * 对应车前进, 在右轮上就对应车后退。所以方向系数必须**每个轮子一个**。
+ *
+ * 旧固件只有一个全局 DM_DIR_SIGN, 那是洗地车两台电机恰好同向安装的巧合。
+ * 换车/重新装配后就会出现整机动作错位, 典型症状:
+ *     按"前进" → 原地打转;   按"左转" → 车往前走
+ * 根因是某一侧方向系数反了, **不是混控公式错** —— 别去改逆解。
+ *
+ * 语义:  target_omega = DM_DIR_x * (v_x / WHEEL_R_M)
+ *        +1.0f = 该轮"发正转速 → 车前进"
+ *        -1.0f = 该轮取反
+ *        命令侧和反馈侧必须乘**同一个**宏, 否则"命令往前、上报往后"。
+ *
+ * ★ 现场判定 (车轮必须架空):
+ *     1. 发纯前进 vx=+0.10, wz=0;
+ *     2. 两个轮子应当**同向朝前**;
+ *     3. 若两轮对转 → 某一侧反了, **朝后转的那个轮子**就是要取反的那个。
+ *   判定完只改对应车型的那一行, 重新编译。
+ *
+ * 为什么按车型分而不是写死一份: 方向属性和轮距一样, 是**车身装配**属性,
+ * 洗地车两台电机同向装、扫地车左轮镜像装 —— 两个 target 必须各带各的。
+ *=======================================================================*/
+#if (VEHICLE_SEL == 1)                  /* 扫地车 (716 轮距) */
+#define DM_DIR_LEFT         (+1.0f)     /* 左轮镜像安装: 正转速 = 车前进 */
+#define DM_DIR_RIGHT        (-1.0f)     /* 右轮: 负转速 = 车前进 */
+#elif (VEHICLE_SEL == 2)                /* 洗地车 (456 轮距) */
+#define DM_DIR_LEFT         (-1.0f)     /* 两轮同向安装: 负转速 = 车前进 */
+#define DM_DIR_RIGHT        (-1.0f)
+#else
+#error "VEHICLE_SEL 未定义或非法: 必须是 1(扫地车) 或 2(洗地车), 在 Keil target Define 里指定"
+#endif
 /*----------------------------- 车型参数 ---------------------------------
  * 轮距由 **Keil target 的编译宏**传进来, 不再写死在代码里:
  *      -D TRACK_WIDTH_MM=716   → sweeper  (新扫地车, 171 轮 / 716 轮距)
@@ -1072,10 +1101,10 @@ static void Send_MainTelemetry(void)
     right_fresh = (uint8_t)(g_fb_seen[1] &&
                             ((g_tick_ms - g_last_fb_ms[1]) <= WHEEL_STALE_MS));
 
-    /* ★ 上报的 vx/wz 由**实际反馈**反解, 所以反馈也要乘 DM_DIR_SIGN ——
-       否则命令往前走、上报却说在往后。 */
-    v_left = left_fresh ? (DM_DIR_SIGN * g_motor[0].vel_rad_s * WHEEL_R_M) : 0.0f;
-    v_right = right_fresh ? (DM_DIR_SIGN * g_motor[1].vel_rad_s * WHEEL_R_M) : 0.0f;
+    /* ★ 上报的 vx/wz 由**实际反馈**反解, 所以反馈也要乘同一组方向系数 ——
+       否则命令往前走、上报却说在往后。左右各乘各的, 镜像安装才不会算错。 */
+    v_left = left_fresh ? (DM_DIR_LEFT * g_motor[0].vel_rad_s * WHEEL_R_M) : 0.0f;
+    v_right = right_fresh ? (DM_DIR_RIGHT * g_motor[1].vel_rad_s * WHEEL_R_M) : 0.0f;
 
     vx_mm = ClampToI16((v_left + v_right) * 0.5f * 1000.0f);
     wz_mrad = ClampToI16((v_right - v_left) / TRACK_WIDTH_M * 1000.0f);
@@ -1169,9 +1198,9 @@ static void Control_Tick(void)
     v_left = vx - wz * (TRACK_WIDTH_M * 0.5f);
     v_right = vx + wz * (TRACK_WIDTH_M * 0.5f);
 
-    g_target_omega[0] = DM_DIR_SIGN * ClampF(v_left / WHEEL_R_M,
+    g_target_omega[0] = DM_DIR_LEFT * ClampF(v_left / WHEEL_R_M,
                                -MAX_OMEGA_RAD_S, MAX_OMEGA_RAD_S);
-    g_target_omega[1] = DM_DIR_SIGN * ClampF(v_right / WHEEL_R_M,
+    g_target_omega[1] = DM_DIR_RIGHT * ClampF(v_right / WHEEL_R_M,
                                -MAX_OMEGA_RAD_S, MAX_OMEGA_RAD_S);
 
     /* 反馈超时的轮子目标清零: 驱动器可能已经掉线, 继续发旧目标没有意义,

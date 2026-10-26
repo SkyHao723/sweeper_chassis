@@ -1258,7 +1258,8 @@ class SimChassis:
         self.cmd_buf = bytearray()
         self.cmd_bad = 0
 
-        # 轮子状态（电机原始 ω，注意固件 DM_DIR_SIGN=-1：车前进时 ω 为负）
+        # 轮子状态（电机原始 ω，方向系数按车型分：DM_DIR_LEFT / DM_DIR_RIGHT，
+        # 扫地车左轮 +1、右轮 -1，洗地车两个都 -1；见 docs/vehicle-params.md §4.1）
         self.omega = [0.0, 0.0]
         self.pos = [0.0, 0.0]
         self.torque = [0.0, 0.0]
@@ -1333,7 +1334,8 @@ class SimChassis:
             self._eff_vx = self.cmd_vx
             self._eff_wz = self.cmd_wz
 
-        # 逆解 → 电机目标（固件 DM_DIR_SIGN = -1）
+        # 逆解 → 电机目标（仅 --sim 用；方向系数沿洗地车 DM_DIR_LEFT=DM_DIR_RIGHT=-1，
+        # 只是让仿真里的 ω 符号看起来一致，真机由 STM32 按车型乘，见 vehicle-params.md §4.1）
         v_left = self._eff_vx - self._eff_wz * TRACK_WIDTH_M / 2.0
         v_right = self._eff_vx + self._eff_wz * TRACK_WIDTH_M / 2.0
         target = [-v_left / WHEEL_R_M, -v_right / WHEEL_R_M]

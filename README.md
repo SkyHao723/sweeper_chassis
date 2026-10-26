@@ -52,7 +52,7 @@ STM32F103 两驱差速底盘控制器。分支 **`damiao-bridge`**。
 | `WHEEL_R_M` | `0.0855f` | 轮半径，171 mm 轮径的一半（两车相同） |
 | `TRACK_WIDTH_M` | `TRACK_WIDTH_MM/1000.0f` | **由 target 传入**，无默认值 |
 | `MAX_OMEGA_RAD_S` | `30.0f` | 单轮角速度上限 ≈ 2.565 m/s |
-| `DM_DIR_SIGN` | `-1.0f` | 电机方向；**命令侧和反馈侧都乘** |
+| `DM_DIR_LEFT` / `DM_DIR_RIGHT` | 按车型 | 左右轮方向系数，**按 `VEHICLE_SEL` 分车型**；命令侧和反馈侧都乘 |
 | `CTRL_PERIOD_MS` | `20` | 控制/下发周期 50 Hz |
 | `STATUS_PERIOD_MS` | `50` | 状态上报 20 Hz |
 | `CMD_TIMEOUT_MS` | `800` | 上位机命令超时 → **只清零，不失能** |
@@ -62,6 +62,11 @@ STM32F103 两驱差速底盘控制器。分支 **`damiao-bridge`**。
 
 **为什么不失能而是清零**：达妙驱动器**失能后不制动**（转子 3.15 kg 会自由滑行）。
 要停车必须主动发 `v_des = 0`，让驱动器自己去减速。`CMD_TIMEOUT` 只把目标清零。
+
+> ⚠️ **左右轮方向系数是分开的**（轮毂电机左右镜像安装）。扫地车
+> `DM_DIR_LEFT=+1 / DM_DIR_RIGHT=-1`，洗地车两个都 `-1`，由 `VEHICLE_SEL` 选择。
+> 典型症状：**按左转→车往前走、按前进→原地打转** = 某一侧系数反了，
+> 不是混控公式错。判定方法见 `docs/vehicle-params.md` §4.1。
 
 ---
 
