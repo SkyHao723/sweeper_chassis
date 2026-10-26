@@ -338,7 +338,7 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls></MiscControls>
-              <Define>USE_STDPERIPH_DRIVER,VEHICLE_SEL=1</Define>
+              <Define>USE_STDPERIPH_DRIVER,VEHICLE_SEL=1,TRACK_WIDTH_MM=716</Define>
               <Undefine></Undefine>
               <IncludePath>.\start;.\lib;.\user;.\sys;.\hardware</IncludePath>
             </VariousControls>
@@ -1050,7 +1050,7 @@
             <v6Rtti>0</v6Rtti>
             <VariousControls>
               <MiscControls></MiscControls>
-              <Define>USE_STDPERIPH_DRIVER,VEHICLE_SEL=2</Define>
+              <Define>USE_STDPERIPH_DRIVER,VEHICLE_SEL=2,TRACK_WIDTH_MM=456</Define>
               <Undefine></Undefine>
               <IncludePath>.\start;.\lib;.\user;.\sys;.\hardware</IncludePath>
             </VariousControls>

@@ -58,7 +58,27 @@
 /* ★ 电机方向系数。2026-10-21 实测: 发 vx=+0.1 时两个轮子都**倒着转**,
    所以整体取反。改回 +1.0f 即恢复原方向; 左右若不一致, 再加两个独立宏。 */
 #define DM_DIR_SIGN         (-1.0f)
-#define TRACK_WIDTH_M       0.456f      /* 轮距 m ★ 2026-10-21 按新底盘实测 456mm 更新(原 425) */
+/*----------------------------- 车型参数 ---------------------------------
+ * 轮距由 **Keil target 的编译宏**传进来, 不再写死在代码里:
+ *      -D TRACK_WIDTH_MM=716   → sweeper  (新扫地车, 171 轮 / 716 轮距)
+ *      -D TRACK_WIDTH_MM=456   → scrubber (洗地车,   171 轮 / 456 轮距)
+ *
+ * 为什么必须由 target 传、且没传就 #error:
+ *   轮距错是**安全级**错误 —— 差速逆解 v_left/v_right = vx ∓ wz*TRACK/2,
+ *   轮距写错等于转向增益写错, 车会转过头或转不够, 而上报的 wz 却是按错的
+ *   轮距反算的(自洽), 看数据根本发现不了, 只有车跑起来才知道。
+ *   所以宁可**编不过**, 也不要静默用错车型的参数。
+ *
+ * 加新车型: 在 Keil 里复制一个 target, 改 OutputDirectory/OutputName 和
+ *   这一个 -D 数字即可, **不需要改本文件**。
+ *-----------------------------------------------------------------------*/
+#ifndef TRACK_WIDTH_MM
+#error "未指定车型轮距: 请在 Keil target 的 C/C++ Define 里加 TRACK_WIDTH_MM (sweeper=716, scrubber=456)"
+#endif
+#if (TRACK_WIDTH_MM < 200) || (TRACK_WIDTH_MM > 2000)
+#error "TRACK_WIDTH_MM 超出合理范围 (200~2000 mm), 检查是否写错单位(要毫米, 不是米)"
+#endif
+#define TRACK_WIDTH_M       ((float)TRACK_WIDTH_MM / 1000.0f)
 #define MAX_OMEGA_RAD_S     30.0f       /* 单轮角速度上限 rad/s (~2.57 m/s) */
 
 /*----------------------------- 时间参数 ---------------------------------
