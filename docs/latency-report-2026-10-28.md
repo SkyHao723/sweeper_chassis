@@ -97,3 +97,64 @@
 # 本机：上传 + 自检 + 正式测量 + 拉回 + 分析，见 tools/latency/README.md
 python tools/latency/selftest_analyze.py          # 先确认分析脚本可信（PASSED）
 ```
+
+---
+
+# 附：换一种测法 —— 键盘 teleop 全链路（RK3588 / 192.168.5.7）
+
+- 日期：**2026-10-28 12:0x**（主机时间），主机 **RK3588 / 192.168.5.7**（`smart`），`ROS_DOMAIN_ID=15`
+- 与上一台的区别：**同款轮子/同款固件，但换了一台主机**；并且链路多了一段
+  ——这次不是直接发 `/cmd_vel`，而是真的**按键**，走
+  `teleop_twist_keyboard` → `/cmd_vel` → `wheeltec_robot_node` → 串口 → STM32 → CAN → 达妙。
+- 起法（用户要求的两条命令）：
+  ```bash
+  ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py   # 底盘+EKF+URDF，只是底盘
+  ros2 run teleop_twist_keyboard teleop_twist_keyboard
+  ```
+  实测这台机器上的 `teleop_twist_keyboard`（humble 原版，`/opt/ros/humble/lib/python3.10/site-packages/`）
+  **每按一次键只发一条 `Twist`**（没有 10 Hz 重复发布），且必须给 stdin 一个 **pty**
+  （`getKey()` 里 `tty.setraw(sys.stdin.fileno())` + `termios.tcgetattr`，管道会直接抛异常）。
+  所以探针用 `pty.openpty()` 起子进程、把按键写到 master，写之前记 `time.time()` 作为"按下"时刻。
+- 工具：`tools/latency/teleop_key_probe.py`（pty 驱动 + `/cmd_vel`/`/odom` 采集）、
+  `tools/latency/analyze_teleop.py`（四段分割）、钩子仍是 `tools/latency/writets.c`
+  （这次把 `LD_PRELOAD` 加在 `ros2 launch` 上，节点继承它）。
+- 条件：**车落地**、方向自检 `forward`（`.7` 这台的方向也是对的）、`speed=0.20 m/s`、20 个 trial、
+  方向交替 `i` / `,`、每 trial 先按 `k` 停稳 1.5 s 再按运动键 1.0 s。
+- 原始数据：`tools/latency/results/key_probe_20261028_7.json`、`writets_key_20261028_7.log`、
+  分析输出 `teleop_analyze_20261028_7.txt`。
+
+## A1. 一句话结论
+
+**按键 → 轮子开始转 ≈ 49 ms（保守 28~74 ms），和上一台直接发 `/cmd_vel` 的 47 ms 基本一样。**
+也就是说 **键盘 teleop 这一段几乎不花钱（0.6 ms）**，全链路仍然是
+"厂商节点 20 Hz 大循环（≈26 ms） + 固件控制周期/驱动/机械（≈20 ms）"两笔。
+
+## A2. 四段拆分
+
+| 段 | 含义 | 结果 |
+|---|---|---|
+| **T0** | 按键 → `/cmd_vel` 到达订阅者 | **中位 0.6 ms**（0.4~1.2 ms）（teleop 进程 + DDS，可忽略） |
+| **T1** | `/cmd_vel` 到达 → 节点把 11 B 帧写出串口 | **中位 25.8 ms**（0~49.3 ms，均值 24.2 ms） |
+| **T2** | 串口写出 → 轮子开始转 | **区间 1.9 ~ 47.8 ms**（50 ms 网格，只能给区间） |
+| **T_total** | 按键 → 轮子开始转 | **约 49 ms**（28~74 ms） |
+
+- `/odom` 观测网格：**49.9 ms（20.03 Hz）**，到达-时间戳 **中位 0.6 ms**（p95 1.5 ms）→ 观测链路可忽略。
+- T1 的 5 ms 直方图 `5 0 1 1 3 2 2 2 1 3 0 0 0`（0~60 ms），覆盖整个 0~50 ms → 与上一台同样被
+  20 Hz 大循环**量化**。
+- T1 逐 trial 呈锯齿（`4.6 → 2.0 → 0.6 → 0.5 → 46.9 → 50.4 → 0.5 → 46.1 → 38.6 → … → 18.0`），
+  因为 trial 周期 2.5 s ≈ 50.1 个 49.9 ms 网格 → 每 trial 相位漂 ~0.1 格。
+- 从"按下"到 `/odom` **第一次报告在动**：中位 **75 ms**（上界，含平均 ~25 ms 的采样相位）。
+
+## A3. 两个次要点
+
+1. 20 个 trial 里有 1 个（方向反转那次）在写串口时车还没停稳 → 那段 T2 被拉长到 92 ms，
+   已在分析里剔除（表里标 `*`）。
+2. `/odom` 的 `header.stamp` 是**节点发布时刻**，不是电机转速的真实时刻，所以 T2 这个区间同时
+   包含"车真的动了"和"遥测帧把它报出来"两件事——想把它拆开，只能提高 24 B 帧的上报率（见 §4.2）。
+
+## A4. 对"按键遥控"的实用含义
+
+- 人按键到车动 **≈ 50 ms**，这个延迟在遥控场景基本感知不到；但**松手/按 `k` 之后还有 ~190 ms
+  的减速斜坡**（上一台实测），这才是"操作手感"里最容易感觉到的部分。
+- 遥控要更"跟手"，优先的不是延迟而是**减速斜坡**与**速度环过冲**（+26 %）这两项。
+

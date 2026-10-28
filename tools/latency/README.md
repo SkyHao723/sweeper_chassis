@@ -30,7 +30,32 @@ probe_latency.py ──/cmd_vel──> wheeltec_robot_node ──串口 11 B 帧
 | `analyze_latency.py` | **本机跑**：配对发布↔串口写，出 T1 直方图 / T2 区间 / 逐 trial 表 |
 | `analyze_profile.py` | **本机跑**：合并重建响应曲线 v(τ)，出 T2 区间、过冲、减速曲线 |
 | `selftest_analyze.py` | 用**已知真值**的假数据 + 假 LED 帧验证分析脚本（`PASSED` 才可信） |
+| `teleop_key_probe.py` | **主机上跑**：pty 里起 `teleop_twist_keyboard`，脚本"按键"并记录按键时刻 + `/cmd_vel`/`/odom` → `/tmp/key_probe.json` |
+| `analyze_teleop.py` | **本机跑**：把键盘全链路切成 T0(按键→cmd_vel)/T1(cmd_vel→串口写)/T2(写→动)/T_total |
+| `check_topics.py` | **主机上跑**：快速体检 `/odom`、`/cmd_vel` 帧率与 `header.stamp` 偏差 |
 | `results/` | 每次实测的原始数据与分析输出（保留，便于复查） |
+
+### 键盘 teleop 全链路（换一种测法）
+
+不直接发 `/cmd_vel`，而是真的按键：`teleop_twist_keyboard` → `/cmd_vel` → 厂商节点 → 串口。
+两点前提：humble 版 teleop **每按一次键只发一条 Twist**；`getKey()` 用
+`tty.setraw()`+`termios.tcgetattr()`，**stdin 必须是 pty**（管道会抛异常），所以探针用 `pty.openpty()`。
+
+```bash
+# 主机上：先把底盘 launch 起来（钩子挂在 launch 上，节点会继承 LD_PRELOAD）
+export LD_PRELOAD=/tmp/writets.so WRITETS_LOG=/tmp/writets_key.log
+ros2 launch turn_on_wheeltec_robot turn_on_wheeltec_robot.launch.py
+# 主机上：跑探针（它会自己起 teleop，不用手敲）
+export ROS_DOMAIN_ID=15
+python3 /tmp/teleop_key_probe.py --trials 20 --speed 0.20 --out /tmp/key_probe.json
+# 本机：拉回 + 分析
+python tools/rsh.py 192.168.5.7 12345678 --get /tmp/key_probe.json    tools/latency/results/key_probe.json
+python tools/rsh.py 192.168.5.7 12345678 --get /tmp/writets_key.log   tools/latency/results/writets_key.log
+python tools/latency/analyze_teleop.py --json tools/latency/results/key_probe.json --hook tools/latency/results/writets_key.log
+```
+
+注意 `--speed` 是传给 teleop 的参数（`-p speed:=`），`i`/`,` 是前进/后退键。
+「写串口时车还没停稳」的 trial 会被剔除（逐 trial 表里标 `*`）。
 
 ## 怎么跑
 
