@@ -29,8 +29,8 @@
   {"config":..., "published":[{t,vx,tag}], "samples":[{t,st,vx,wz}], "check":{...}}
 
 配套:
-  run_latency.sh   —— 停 car_web、起节点（带 strace 抓串口 write 时刻）、跑本脚本
-  analyze_latency.py —— 把 /tmp/latency.json + /tmp/strace_node.log 一起分析出分段延迟
+  run_latency.sh   —— 停 car_web、起节点（带 LD_PRELOAD 钩子抓串口 write 时刻）、跑本脚本
+  analyze_latency.py —— 把 /tmp/latency.json + /tmp/writets.log 一起分析出分段延迟
 """
 
 import argparse
@@ -143,25 +143,30 @@ def main():
     p.spin_for(0.5)
     p.send(0.0, tag="check_stop")
     p.spin_for(0.8)
-    seg = [s for s in p.samples if s["t"] >= t_chk + 0.15]
+    # 只看"已经升上去之后的平台段": 跳过前 0.20 s 的上升沿, 到 0.48 s 截至
+    # (之前的 bug: 用 t >= t_chk+0.15 一路统计到停车之后的 0.8 s, 把一堆 0 平均进去)
+    seg = [s for s in p.samples if t_chk + 0.20 <= s["t"] <= t_chk + 0.48]
     vx = statistics.fmean([s["vx"] for s in seg]) if seg else 0.0
     wz = statistics.fmean([s["wz"] for s in seg]) if seg else 0.0
-    print("[probe] 自检结果: /odom vx 平均 %+.3f m/s, wz 平均 %+.3f rad/s"
-          % (vx, wz), flush=True)
+    vx_peak = max([abs(s["vx"]) for s in seg]) if seg else 0.0
+    print("[probe] 自检结果(平台段 %d 样本): /odom vx 平均 %+.3f m/s, 峰值 %.3f, wz 平均 %+.3f rad/s"
+          % (len(seg), vx, vx_peak, wz), flush=True)
     verdict = "unknown"
-    if vx > 0.06:
-        verdict = "forward"          # 命令正 vx → odom 正 vx
-    elif abs(wz) > 0.15:
+    if abs(wz) > 0.15:
         verdict = "spin"             # 原地打转 = 左右方向系数错
-    elif vx < -0.06:
+    elif vx > 0.03:
+        verdict = "forward"          # 命令正 vx → odom 正 vx
+    elif vx < -0.03:
         verdict = "backward"
+    elif vx_peak > 0.03:
+        verdict = "forward"          # 平台段抖动大, 用峰值兜底
     print("[probe] 自检判读: %s" % verdict, flush=True)
     print("[probe] (forward=方向正常; spin=左右方向系数反了; backward=整体反了)", flush=True)
 
     if args.check_only:
         data = {"config": vars(args), "published": p.published, "samples": p.samples,
-                "check": {"vx": vx, "wz": wz, "verdict": verdict,
-                          "noise_max": noise_max}}
+                "check": {"vx": vx, "wz": wz, "vx_peak": vx_peak,
+                          "verdict": verdict, "noise_max": noise_max}}
         with open(args.out, "w") as f:
             json.dump(data, f)
         print("[probe] 已写 %s" % args.out, flush=True)
@@ -192,7 +197,7 @@ def main():
         "track": TRACK,
         "published": p.published,
         "samples": p.samples,
-        "check": {"vx": vx, "wz": wz, "verdict": verdict, "noise_max": noise_max},
+        "check": {"vx": vx, "wz": wz, "vx_peak": vx_peak, "verdict": verdict, "noise_max": noise_max},
     }
     with open(args.out, "w") as f:
         json.dump(data, f)

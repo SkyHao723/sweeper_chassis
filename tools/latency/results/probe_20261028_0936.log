@@ -1,0 +1,28 @@
+[probe] 等待 /odom ...
+[probe] 静止 1 s: 样本 20 个, vwheel 最大 0.0011 m/s, 中位 0.0011
+[probe] --- 方向自检: 发 vx=+0.10 保持 0.5 s ---
+[probe] 自检结果(平台段 5 样本): /odom vx 平均 +0.111 m/s, 峰值 0.121, wz 平均 +0.016 rad/s
+[probe] 自检判读: forward
+[probe] (forward=方向正常; spin=左右方向系数反了; backward=整体反了)
+[probe] --- 正式测量: 20 个 trial, 目标 ±0.20 m/s ---
+[probe] trial  1/20  +0.20 m/s  t=1793151367.0470
+[probe] trial  2/20  -0.20 m/s  t=1793151368.8515
+[probe] trial  3/20  +0.20 m/s  t=1793151370.6563
+[probe] trial  4/20  -0.20 m/s  t=1793151372.4617
+[probe] trial  5/20  +0.20 m/s  t=1793151374.2669
+[probe] trial  6/20  -0.20 m/s  t=1793151376.0739
+[probe] trial  7/20  +0.20 m/s  t=1793151377.8811
+[probe] trial  8/20  -0.20 m/s  t=1793151379.6864
+[probe] trial  9/20  +0.20 m/s  t=1793151381.4914
+[probe] trial 10/20  -0.20 m/s  t=1793151383.2976
+[probe] trial 11/20  +0.20 m/s  t=1793151385.1054
+[probe] trial 12/20  -0.20 m/s  t=1793151386.9117
+[probe] trial 13/20  +0.20 m/s  t=1793151388.7193
+[probe] trial 14/20  -0.20 m/s  t=1793151390.5260
+[probe] trial 15/20  +0.20 m/s  t=1793151392.3332
+[probe] trial 16/20  -0.20 m/s  t=1793151394.1396
+[probe] trial 17/20  +0.20 m/s  t=1793151395.9461
+[probe] trial 18/20  -0.20 m/s  t=1793151397.7511
+[probe] trial 19/20  +0.20 m/s  t=1793151399.5574
+[probe] trial 20/20  -0.20 m/s  t=1793151401.3612
+[probe] 完成: 64 个发布, 797 个 /odom 样本 -> /tmp/latency.json
