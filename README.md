@@ -174,6 +174,8 @@ TB01-CAN-USART/
 ├── README.md                        本文件
 ├── docs/
 │   ├── ★ vehicle-params.md          **车型几何 / target 选择 / 车型验证**（现役）
+│   ├── ★ cmdvel-to-wheel-speed.md   **/cmd_vel 业务语义 + 差速轮运动学数学 + 固件实现对照**（现役）
+│   ├── ★ latency-report-2026-10-28.md  **cmd_vel→轮子转动 链路延迟实测**（现役）
 │   ├── ★ rk3576-chassis-inventory-2026-10-22.md  上位机侧现状盘点（现役）
 │   ├── chassis-serial-protocol.md   串口协议（**帧格式有效**，FOC 相关段落已过时）
 │   ├── wiring.md                    接线总表（引脚有效，继电器章节已废弃）
