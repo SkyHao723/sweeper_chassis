@@ -146,7 +146,7 @@
 #define RAMP_ON_TIMEOUT     0
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      2           /* 状态帧 [30] 版本号: v2 = 支持主机功能帧(电机重新使能) */
+#define STATUS_VERSION      3           /* 状态帧 [30] 版本号: v2 = 功能帧(重新使能), v3 = 心跳帧(链路看门狗) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -739,12 +739,53 @@ static uint8_t g_cmd_len;
 static uint8_t  g_reinit_ok;               /* 成功执行次数 (饱和) */
 static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) */
 
+/*==================== 心跳帧 + 看门狗语义切换 (v3 新增) =================
+ * 为什么要有心跳帧:
+ *   原来的看门狗看的是"最近一条速度命令"。上位机只要没有新的速度要发
+ *   (比如手柄松手、Nav2 这一拍没出 cmd_vel), 就等同于"链路掉了" —— 车
+ *   必须停。但这两件事其实不是一回事:
+ *       A. 上位机还活着, 只是没有新命令  -> 应该保持上一条命令
+ *       B. 上位机真的没了                 -> 必须停
+ *   心跳帧就是把 A 和 B 分开:
+ *       f[1] = 0x08: FUNC_HEARTBEAT —— 只"续命", 不改任何目标
+ *
+ * 语义(向后兼容, 关键):
+ *   - 任何一条合法帧(速度帧或心跳帧)都同时刷新"链路存活"计时,
+ *     所以老上位机(只发速度帧)一条心跳都不发也照常工作;
+ *   - **收到过至少一条心跳帧之后**, 固件才进入"心跳模式":
+ *         看门狗计时 = HB_TIMEOUT_MS (默认 300 ms, 比 800 更快抓到真掉线)
+ *         速度目标     = 锁存最后一条命令, 不再因为"没发新命令"而过期
+ *   - 没收到过心跳 = 保持老行为 (CMD_TIMEOUT_MS = 800 ms 命令看门狗)。
+ *
+ * ★ 安全含义要说清楚: 心跳模式下车会**一直执行最后一条命令**, 直到
+ *   ①上位机发新命令(含 0) ②心跳断掉。所以发心跳的一方必须保证:
+ *   "自己还在跑"和"还想让车按这条命令跑"是同一件事。car_web 这类
+ *   单进程独占串口的工具适合; 中间隔了一层 broker 的场景要小心。
+ *=====================================================================*/
+#define FUNC_HEARTBEAT             0x08
+#define HB_TIMEOUT_MS              300     /* 心跳模式下的链路看门狗 */
+#define HB_ENABLE                  1       /* 0 = 完全退回老的 800 ms 命令看门狗 */
+static uint32_t g_hb_last_ms;              /* 最近一次收到任何合法帧的时刻 */
+static uint8_t  g_hb_mode;                 /* 1 = 已进入心跳模式 */
+
 static void Motors_Startup(void);          /* 定义在文件后半, 这里先声明 */
 
 static void Cmd_Apply(const uint8_t *f)
 {
-    /* 能进到这里说明帧头、帧尾、BCC 全对, 足以证明上位机活着。 */
+    /* 能进到这里说明帧头、帧尾、BCC 全对, 足以证明上位机活着。
+       两条计时都刷新: g_last_cmd_ms 给"老命令看门狗"用,
+       g_hb_last_ms 给"心跳模式链路看门狗"用(速度帧也算心跳)。 */
     g_last_cmd_ms = g_tick_ms;
+    g_hb_last_ms = g_tick_ms;
+
+    /* ---- 心跳帧: 只续命, 不改目标, 也绝不触碰速度指令 ---- */
+#if HB_ENABLE
+    if (f[1] == FUNC_HEARTBEAT)
+    {
+        g_hb_mode = 1;
+        return;
+    }
+#endif
 
     /* ---- 主机功能帧: f[1]=FUNC_MOTOR_REINIT, 重新写模式 + 使能 ---- */
     if (f[1] == FUNC_MOTOR_REINIT)
@@ -1220,7 +1261,20 @@ static void Send_MainTelemetry(void)
  *=====================================================================*/
 static void Bridge_Update(uint32_t now)
 {
+#if HB_ENABLE
+    /* 心跳模式: 只看"链路还活着吗", 不看"有没有新命令"。
+       速度目标锁存最后一条命令, 直到上位机发新命令或心跳断掉。 */
+    if (g_hb_mode)
+    {
+        g_cmd_timeout = ((now - g_hb_last_ms) > HB_TIMEOUT_MS) ? 1 : 0;
+    }
+    else
+    {
+        g_cmd_timeout = ((now - g_last_cmd_ms) > CMD_TIMEOUT_MS) ? 1 : 0;
+    }
+#else
     g_cmd_timeout = ((now - g_last_cmd_ms) > CMD_TIMEOUT_MS) ? 1 : 0;
+#endif
 
     if (g_cmd_timeout)
     {
@@ -1338,10 +1392,12 @@ static void Control_Tick(void)
  *   [39] IMU 体检标志: bit0 版本 bit1 陀螺 bit2 磁力
  *        bit7 = imu_gyro_ok (这次上电读到过非零角速度; 读失败会清)
  *   [40] IMU 版本号主字节
- *   [41] 启动阶段/错误码 (以前恒 0):
+ *   [41] 低 3 位 = 启动阶段/错误码 (以前恒 0):
  *        0=启动中(串口上不会出现, 帧都在主循环里发) 1=正常
  *        2=CAN 初始化失败已降级  3=IMU 从没读到已跳过  4=两者都失败
- *        ★ 这一字节只做诊断, 不改任何已有字段的含义。
+ *        **bit7 = 已进入心跳模式**(= 收到过 f[1]=0x08 心跳帧):
+ *        此时链路看门狗是 300 ms 且速度目标锁存; 清 0 = 老的 800 ms 命令看门狗。
+ *        老上位机只读低 3 位, 不受影响。
  *   [42] BCC = XOR(f[0..41])         [43] 0x7D
  *
  * 为什么把"目标"也报上去: 上位机只有同时看到"目标"和"实际", 才能区分
@@ -1454,7 +1510,10 @@ static void Status_Send(uint32_t now)
     f[38] = imu_found_addr;
     f[39] = (uint8_t)(imu_probe_flags | (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));
     f[40] = imu_ver_major;
-    f[41] = BootStage();            /* 启动阶段/错误码, 见帧格式说明 */
+    f[41] = (uint8_t)(BootStage() | (uint8_t)(g_hb_mode ? 0x80 : 0x00));
+    /* [41] 高 bit7 置 1 = 已进入**心跳模式**(链路看门狗 300 ms, 目标锁存);
+       bit0..2 = 启动阶段/错误码 (0~4)。加之前该字节恒 0~4, 老上位机读
+       bit0..2 不受影响。 */
 
     for (i = 0; i < STATUS_FRAME_SIZE - 2; i++)
     {

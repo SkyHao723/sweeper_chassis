@@ -1010,7 +1010,7 @@
   function renderVersion(m) {
     const el = $("footerVer");
     if (!el) return;
-    const v = (m && m.version) || "1.4.0";
+    const v = (m && m.version) || "1.5.0";
     text("footerVer", `car_web ${v}`);
   }
 
