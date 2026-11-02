@@ -258,10 +258,17 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | 收帧/校验 | `Cmd_FeedByte()` / `Cmd_Verify()` | 帧头 `0x7B`、帧尾 `0x7D`、BCC 全对才接受；**非法帧丢弃且不刷新看门狗** |
 | 解析 | `Cmd_Apply()`（`g_cmd_vx_mm = f[3]<<8\|f[4]`） | `vx` mm/s、`wz` mrad/s，大端 int16 |
 | 有效期 | `Bridge_Update()`（`CMD_TIMEOUT_MS = 800`） | 过期 → `g_eff_* = 0`（**只清零，不失能**：失能=输出关断=不制动会溜车） |
+| **缓起缓停** | `Control_Tick()`：`Ramp_Step(g_ramp_vx, vx, RAMP_VX_ACC·dt, RAMP_VX_DEC·dt)` | **逆解之前**先对 `vx`/`wz` 做斜坡，保证起步/停车时两轮比例始终正确 |
 | 逆解 | `Control_Tick()`：`v_left = vx − wz·TRACK/2`、`v_right = vx + wz·TRACK/2` | 2.3 节公式 |
 | 换算+夹取 | `g_target_omega[i] = DM_DIR_x * ClampF(v/R, ±MAX_OMEGA_RAD_S)` | `MAX_OMEGA_RAD_S = 30` |
 | 下发 | `DM_SendSpeed()` → 标准帧 `0x200+CAN_ID` | float32 小端 rad/s |
 | 反解上报 | `Send_MainTelemetry()`：`v_left = DM_DIR_LEFT·ω_fb·R` … `vx=(v_L+v_R)/2`、`wz=(v_R−v_L)/L` | **用实测反馈，不是目标值** |
+
+> 斜坡是 20 ms 一拍的**线性**逼近（`Ramp_Step`），加减速分别用不同斜率：
+> 0→0.20 m/s 用 `RAMP_VX_ACC=1.0` 需 **200 ms**；0.20→0 用 `RAMP_VX_DEC=1.5` 需 **140 ms**；
+> `+0.20→−0.20` 反向时一律用减速斜率穿过零点，需 340 ms。
+> 诊断帧 `[10..13]` 的目标 ω 报的是**斜坡之后**的值，可以直接看出斜坡是否生效。
+
 
 ### 3.2 关键宏
 
@@ -272,6 +279,9 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | `MAX_OMEGA_RAD_S` | `30.0f`（≈2.565 m/s） | 同上 |
 | `DM_DIR_LEFT` / `DM_DIR_RIGHT` | sweeper `+1/−1`；scrubber `−1/−1` | 按 `VEHICLE_SEL` 分支定义 |
 | `CMD_TIMEOUT_MS` | `800` | 命令看门狗 |
+| `RAMP_VX_ACC` / `RAMP_VX_DEC` | `1.0f` / `1.5f` m/s² | 缓起缓停（线速度） |
+| `RAMP_WZ_ACC` / `RAMP_WZ_DEC` | `2.0f` / `3.0f` rad/s² | 缓起缓停（角速度） |
+| `RAMP_ON_TIMEOUT` | `0` | 0 = 超时立即归零；1 = 超时也走斜坡 |
 | `FB_TIMEOUT_MS` | `2000` | 反馈超时 → 该轮目标强制 0 + offline |
 | `CTRL_PERIOD_MS` / `STATUS_PERIOD_MS` | `20` / `50` | 控制 50 Hz / 上报 20 Hz |
 
@@ -300,5 +310,5 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | "`wz>0` 是右转" | ROS 约定 **正 = 逆时针 = 左转** |
 | "轮速就是 RPM 直接发" | 发的是 **rad/s**，且要先做差速逆解 + 乘安装方向系数 |
 | "轮距填错只影响转弯" | 影响转向增益 **和** `/odom` 上报的 wz，且两者反向抵消（最危险） |
-| "固件有加减速限制" | 没有；斜坡在驱动器内部（`ACC/DEC`，未配置） |
+| "固件有加减速限制" | **有**了：`Ramp_Step` 按 `RAMP_VX_*`/`RAMP_WZ_*` 对 `vx`/`wz` 做线性斜坡（2026-11 起）；驱动器 `ACC/DEC` 仍可叠加当兜底 |
 | "限幅是整体按比例缩小" | 是按轮各夹各的，会造成速度+转向同时偏移 |

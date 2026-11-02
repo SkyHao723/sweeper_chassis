@@ -121,6 +121,30 @@
 #define CTRL_PERIOD_MS      20          /* 控制/下发周期 */
 #define STATUS_PERIOD_MS    50          /* 状态上报周期 */
 
+/*------------------------- 缓起缓停 (速度斜坡) -------------------------
+ * 为什么放在固件里做:
+ *   1) 现场反馈"发指令瞬间启动、发 0 瞬间停住", 肉眼看不出加减速;
+ *   2) 驱动器自带 ACC(0x04)/DEC(0x05) 限幅, 但出厂默认值未知、我们也从未
+ *      写过, 而且它只有一组斜率、改一次要动寄存器, 现场不方便调;
+ *   3) 放固件里对所有上层(ROS / 网页 / 手动 CAN / 未来 ESP32 直连)一律
+ *      生效, 而且随时能改宏、能回退、能测量验证。
+ *
+ * 单位: 线速度 m/s^2, 角速度 rad/s^2。20 ms 一拍, 1.0 m/s^2 = 每拍 0.02 m/s
+ * (mm/s 精度 1, 所以斜坡台阶是连续可见的, 不会出现"卡在 0 附近不动")。
+ *
+ * 取值原则: 加速 < 减速 —— 起步宁可慢, 停下来要快一点(安全);
+ *           wz 比 vx 敏感, 斜率给得更大, 否则转向会明显拖拍。
+ * 换算参考: 0.20 m/s 从 0 到额定时 RAMP_VX_ACC=1.0 需 200 ms(每拍 +0.02)。
+ *-----------------------------------------------------------------------*/
+#define RAMP_VX_ACC         1.0f        /* 线速度加速 m/s^2 */
+#define RAMP_VX_DEC         1.5f        /* 线速度减速 m/s^2 */
+#define RAMP_WZ_ACC         2.0f        /* 角速度加速 rad/s^2 */
+#define RAMP_WZ_DEC         3.0f        /* 角速度减速 rad/s^2 */
+
+/* 命令超时/丢帧时: 0 = 立即归零(安全优先, 保持原行为);
+ *                   1 = 也走斜坡(更柔, 但停车距离变长, 不建议)。 */
+#define RAMP_ON_TIMEOUT     0
+
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
 #define STATUS_VERSION      2           /* 状态帧 [30] 版本号: v2 = 支持主机功能帧(电机重新使能) */
 #define STATUS_FRAME_SIZE   44
@@ -235,6 +259,8 @@ static uint32_t g_last_cmd_ms;          /* 最近一次合法速度帧的时刻 
 static uint32_t g_boot_reinit_ms;       /* 上电后补使能的节流时刻 (见主循环) */
 static uint8_t  g_cmd_timeout;          /* 1 = 超过 800 ms 没收到命令 */
 static float    g_target_omega[2];      /* 下发给电机的目标 rad/s */
+static float    g_ramp_vx;              /* 斜坡后的线速度指令 m/s (缓起缓停状态) */
+static float    g_ramp_wz;              /* 斜坡后的角速度指令 rad/s (缓起缓停状态) */
 static uint8_t  g_can_tx_fail;          /* CAN 发送失败计数, 饱和 8 位 */
 
 /*------------------------------ IMU -----------------------------------*/
@@ -881,6 +907,43 @@ static float ClampF(float v, float lo, float hi)
     return v;
 }
 
+/* 一阶线性斜坡: 把 cur 朝 tgt 推进最多 step。
+ *
+ * 加速/减速分开处理:
+ *   - 目标幅值变大、且与当前同号  -> 用 acc_step  (起步)
+ *   - 目标幅值变小 / 目标为零      -> 用 dec_step  (收油 / 停车)
+ *   - 目标反号(例如 +0.2 -> -0.2)  -> 一律用 dec_step 慢慢穿过零点,
+ *     避免"一下子从正转跳到反转"把轮子和车体都踹一下
+ *
+ * 注意: 比较用">="而不是">", 保证"目标=当前"时走 acc 分支也不会抖动
+ * (步进会被下面两行 if 截断成 0)。取绝对值手写, 不引 math.h。 */
+static float Ramp_Step(float cur, float tgt, float acc_step, float dec_step)
+{
+    float d = tgt - cur;
+    float step;
+    float tgt_abs = (tgt >= 0.0f) ? tgt : -tgt;
+    float cur_abs = (cur >= 0.0f) ? cur : -cur;
+
+    if ((tgt_abs >= cur_abs) && ((tgt >= 0.0f) == (cur >= 0.0f)))
+    {
+        step = acc_step;                        /* 同向加大 = 加速 */
+    }
+    else
+    {
+        step = dec_step;                        /* 减小 / 反向 / 归零 = 减速 */
+    }
+
+    if (d > step)
+    {
+        d = step;
+    }
+    if (d < -step)
+    {
+        d = -step;
+    }
+    return cur + d;
+}
+
 /* 浮点 -> int16, 带饱和。状态帧所有物理量都是 x100 定点的:
    omega x100 rad/s, torque x100 Nm, pos x100 rad。
    显式饱和是为了防止异常反馈 (比如温度/参数被改) 溢出后回绕成
@@ -1176,7 +1239,7 @@ static void Bridge_Update(uint32_t now)
                              ((now - g_last_fb_ms[1]) <= FB_TIMEOUT_MS)) ? 1 : 0);
 }
 
-/* 20 ms 一拍: 差速逆解 + 限幅 + 下发。
+/* 20 ms 一拍: 缓起缓停斜坡 + 差速逆解 + 限幅 + 下发。
  *
  *   v_left  = vx - wz * track / 2
  *   v_right = vx + wz * track / 2
@@ -1184,9 +1247,14 @@ static void Bridge_Update(uint32_t now)
  *
  * 只限幅 omega, 不再对 vx/wz 另设软限幅 —— 单轮 30 rad/s 已经等价于
  * 2.57 m/s, 上层给再大的 vx 也会在这里被轮速上限吃掉。
+ *
+ * ★ 斜坡放在逆解之前: 先让 vx/wz 平滑, 再算左右轮, 这样"直行/转向同时
+ *   起步"时两轮的相对关系始终正确(如果先逆解再各自斜坡, 会把转向比例
+ *   在过渡期掰弯, 表现为"刚起步时车先直走再拐")。
  *=====================================================================*/
 static void Control_Tick(void)
 {
+    float dt = (float)CTRL_PERIOD_MS / 1000.0f;    /* 0.020 s */
     float vx;
     float wz;
     float v_left;
@@ -1195,6 +1263,28 @@ static void Control_Tick(void)
     vx = (float)g_eff_vx_mm / 1000.0f;      /* mm/s -> m/s */
     wz = (float)g_eff_wz_mrad / 1000.0f;    /* mrad/s -> rad/s */
 
+    /* ---- 缓起缓停 ----
+     * 命令超时: 默认(RAMP_ON_TIMEOUT=0)立即把斜坡状态清零, 保证"丢帧就停"
+     * 的安全语义不变; 只有正常的速度变化(含上位机主动发 0)才平滑过渡。
+     * 任一电机掉线: 同样清零斜坡, 避免它重新上线时从一个很高的斜坡值
+     * 瞬间跳到目标(那时车已经在动, 会明显踹一下)。 */
+    if (((RAMP_ON_TIMEOUT == 0) && g_cmd_timeout) ||
+        (!g_online[0]) || (!g_online[1]))
+    {
+        g_ramp_vx = 0.0f;
+        g_ramp_wz = 0.0f;
+    }
+    else
+    {
+        g_ramp_vx = Ramp_Step(g_ramp_vx, vx,
+                              RAMP_VX_ACC * dt, RAMP_VX_DEC * dt);
+        g_ramp_wz = Ramp_Step(g_ramp_wz, wz,
+                              RAMP_WZ_ACC * dt, RAMP_WZ_DEC * dt);
+    }
+
+    vx = g_ramp_vx;
+    wz = g_ramp_wz;
+
     v_left = vx - wz * (TRACK_WIDTH_M * 0.5f);
     v_right = vx + wz * (TRACK_WIDTH_M * 0.5f);
 
@@ -1202,6 +1292,7 @@ static void Control_Tick(void)
                                -MAX_OMEGA_RAD_S, MAX_OMEGA_RAD_S);
     g_target_omega[1] = DM_DIR_RIGHT * ClampF(v_right / WHEEL_R_M,
                                -MAX_OMEGA_RAD_S, MAX_OMEGA_RAD_S);
+
 
     /* 反馈超时的轮子目标清零: 驱动器可能已经掉线, 继续发旧目标没有意义,
        而且一旦它重新上线, 会立刻执行一个过期目标, 很危险。 */
@@ -1430,6 +1521,11 @@ static void Motors_Startup(void)
             break;
         }
     }
+
+    /* 重新使能后从零斜坡开始: 否则复位/重新使能那一刻会直接把上一拍的
+       斜坡值当目标发出去, 等于又变回"瞬间启动"。 */
+    g_ramp_vx = 0.0f;
+    g_ramp_wz = 0.0f;
 
     IWDG_ReloadCounter();
 }
