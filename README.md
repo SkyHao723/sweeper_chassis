@@ -202,6 +202,7 @@ TB01-CAN-USART/
 │   ├── ★ vehicle-params.md          **车型几何 / target 选择 / 车型验证**（现役）
 │   ├── ★ cmdvel-to-wheel-speed.md   **/cmd_vel 业务语义 + 差速轮运动学数学 + 固件实现对照**（现役）
 │   ├── ★ latency-report-2026-10-28.md  **cmd_vel→轮子转动 链路延迟实测**（现役）
+│   ├── ★ ramp-measurement-2026-11-06.md  **缓起缓停实车实测 + 驱动器速度环抖动(4 Hz/超调37%)定位**（现役）
 │   ├── ★ rk3576-chassis-inventory-2026-10-22.md  上位机侧现状盘点（现役）
 │   ├── chassis-serial-protocol.md   串口协议（**帧格式有效**，FOC 相关段落已过时）
 │   ├── wiring.md                    接线总表（引脚有效，继电器章节已废弃）
@@ -214,6 +215,9 @@ TB01-CAN-USART/
 ├── tools/
 │   ├── car_web/                     网页遥控器（:8000，直连串口，供前期调试）
 │   ├── rsh.py                       远程执行主机命令（paramiko）
+│   ├── ramp_test.py                 直连串口做缓起缓停阶跃测试（发 11 B/收 44 B+24 B，存 JSON）
+│   ├── analyze_ramp.py              斜坡阶梯/到顶时间分析
+│   ├── imu_probe.py                 静态探测 IMU 状态位与六轴原始值（不动车）
 │   └── decode_diag.py               解码 44 B 诊断帧
 └── firmware/
     └── stm32-chassis/               Keil MDK 工程（唯一的固件）
