@@ -257,7 +257,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 |---|---|---|
 | 收帧/校验 | `Cmd_FeedByte()` / `Cmd_Verify()` | 帧头 `0x7B`、帧尾 `0x7D`、BCC 全对才接受；**非法帧丢弃且不刷新看门狗** |
 | 解析 | `Cmd_Apply()`（`g_cmd_vx_mm = f[3]<<8\|f[4]`） | `vx` mm/s、`wz` mrad/s，大端 int16 |
-| 有效期 | `Bridge_Update()`：`CMD_TIMEOUT_ENABLE = 0` → **不超时、目标锁存**（v4 起） | 收到 0 目标 → 按 `RAMP_VX_DEC = 0.40 m/s²` 软停（**只清零，不失能**：失能=输出关断=不制动会溜车）；改回 1 则 800 ms 超时软停（`RAMP_TIMEOUT_DEC 0.70`） |
+| 有效期 | `Bridge_Update()`：`CMD_TIMEOUT_ENABLE = 0` → **不超时、目标锁存**（v4 起） | 收到 0 目标 → 按 `RAMP_VX_DEC = 0.80 m/s²` 软停（**只清零，不失能**：失能=输出关断=不制动会溜车）；改回 1 则 800 ms 超时软停（`RAMP_TIMEOUT_DEC 0.70`） |
 | **缓起缓停** | `Control_Tick()`：`Ramp_Step(g_ramp_vx, vx, RAMP_VX_ACC·dt, RAMP_VX_DEC·dt)` | **逆解之前**先对 `vx`/`wz` 做斜坡，保证起步/停车时两轮比例始终正确 |
 | 逆解 | `Control_Tick()`：`v_left = vx − wz·TRACK/2`、`v_right = vx + wz·TRACK/2` | 2.3 节公式 |
 | 换算+夹取 | `g_target_omega[i] = DM_DIR_x * ClampF(v/R, ±MAX_OMEGA_RAD_S)` | `MAX_OMEGA_RAD_S = 30` |
@@ -265,7 +265,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | 反解上报 | `Send_MainTelemetry()`：`v_left = DM_DIR_LEFT·ω_fb·R` … `vx=(v_L+v_R)/2`、`wz=(v_R−v_L)/L` | **用实测反馈，不是目标值** |
 
 > 斜坡是 20 ms 一拍的**线性**逼近（`Ramp_Step`），加减速分别用不同斜率：
-> 0→0.20 m/s 用 `RAMP_VX_ACC=1.0` 需 **200 ms**；0.20→0 用 `RAMP_VX_DEC=1.5` 需 **140 ms**；
+> 0→0.20 m/s 用 `RAMP_VX_ACC=1.0` 需 **200 ms**；0.20→0 用 `RAMP_VX_DEC=0.80` 需 **250 ms**；
 > `+0.20→−0.20` 反向时一律用减速斜率穿过零点，需 340 ms。
 > 诊断帧 `[10..13]` 的目标 ω 报的是**斜坡之后**的值，可以直接看出斜坡是否生效。
 
@@ -280,7 +280,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | `DM_DIR_LEFT` / `DM_DIR_RIGHT` | sweeper `+1/−1`；scrubber `−1/−1` | 按 `VEHICLE_SEL` 分支定义 |
 | `CMD_TIMEOUT_ENABLE` | `0` | 命令看门狗开关（0=命令锁存，一直执行最后一条命令） |
 | `CMD_TIMEOUT_MS` | `800` | 命令看门狗阈值（仅 `CMD_TIMEOUT_ENABLE=1` 时生效） |
-| `RAMP_VX_ACC` / `RAMP_VX_DEC` | `1.0f` / `1.5f` m/s² | 缓起缓停（线速度） |
+| `RAMP_VX_ACC` / `RAMP_VX_DEC` | `1.0f` / `0.80f` m/s² | 缓起缓停（线速度；0.20 m/s 起步 200 ms / 停下 250 ms） |
 | `RAMP_WZ_ACC` / `RAMP_WZ_DEC` | `2.0f` / `3.0f` rad/s² | 缓起缓停（角速度） |
 | `RAMP_ON_TIMEOUT` | `0` | 0 = 超时立即归零；1 = 超时也走斜坡 |
 | `FB_TIMEOUT_MS` | `2000` | 反馈超时 → 该轮目标强制 0 + offline |

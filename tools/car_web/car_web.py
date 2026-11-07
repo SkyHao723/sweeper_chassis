@@ -166,7 +166,7 @@ CMD_DIAG_WINDOW_MS = 2000  # 诊断滚动窗口，和前端 app.js 的 DIAG_WIND
 #   软停（DEC）：松手、摇杆回中、键盘松开/空格、主动点停止、/api/stop。
 RAMP_DEFAULT_ON = True
 RAMP_VX_ACC = 1.0        # m/s²：从 0 到 0.30 约 0.30 s，跟手
-RAMP_VX_DEC = 0.40       # m/s²：从 0.30 停下 0.75 s，人能明显感到"软停"
+RAMP_VX_DEC = 0.80       # m/s²：从 0.30 停下 0.375 s（2026-11-07 与固件同步, 原 0.40）
 RAMP_WZ_ACC = 4.0        # rad/s²：0→1.0 约 0.25 s
 RAMP_WZ_DEC = 1.5        # rad/s²：1.0→0 约 0.67 s
 RAMP_MAX_DT = 0.2        # s；串口/线程卡顿后单拍最多积分这么多，防止一次跳变
