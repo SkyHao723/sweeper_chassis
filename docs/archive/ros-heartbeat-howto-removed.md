@@ -16,7 +16,8 @@
 > 本文档保留，只是为了让以后想再引入"链路存活"语义的人知道踩过什么坑
 > （尤其是 §7「七个坑」里的"锁存必须和'我还活着'绑定"那条）。
 > 补丁文件 `vendor-patches/vendor-node-heartbeat.patch` 已删除，需要时可从
-> git 历史 `ac2309c` 取回。
+> git 历史 `ac2309c` 取回；下文提到的 `tools/latch_test.py` 也已改名为
+> `tools/cmd_timeout_test.py`，判据从"锁存"反转为"800 ms 后自动软停"。
 
 ---
 
