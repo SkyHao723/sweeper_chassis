@@ -135,15 +135,39 @@
  * 取值原则: 加速 < 减速 —— 起步宁可慢, 停下来要快一点(安全);
  *           wz 比 vx 敏感, 斜率给得更大, 否则转向会明显拖拍。
  * 换算参考: 0.20 m/s 从 0 到额定时 RAMP_VX_ACC=1.0 需 200 ms(每拍 +0.02)。
+ *
+ * ★ 2026-11-06 起参数**照抄 car_web 的斜坡**(tools/car_web/car_web.py
+ *   `RAMP_VX_ACC=1.0 / RAMP_VX_DEC=0.40 / RAMP_WZ_ACC=4.0 / RAMP_WZ_DEC=1.5`):
+ *   现场反馈"旧固件(无斜坡) + web 缓启停"的手感最好, 而 web 的斜坡特点就是
+ *   **减速很慢(0.40 m/s²)**, 0.3 m/s 松手要 0.75 s 才停 —— 这就是"丝滑"的来源。
+ *   之前固件用的是 1.0/1.5, 减速比 web 快近 4 倍, 所以手感变硬。
+ *   现在把 web 那套参数原样搬进固件, 上层(ROS/web/手动 CAN)一律享受同样的斜坡。
+ *
+ *   RAMP_ENABLE = 0 可用于回退到"直通"(斜坡全交给上位机), 默认 1。
  *-----------------------------------------------------------------------*/
-#define RAMP_VX_ACC         1.0f        /* 线速度加速 m/s^2 */
-#define RAMP_VX_DEC         1.5f        /* 线速度减速 m/s^2 */
-#define RAMP_WZ_ACC         2.0f        /* 角速度加速 rad/s^2 */
-#define RAMP_WZ_DEC         3.0f        /* 角速度减速 rad/s^2 */
+#define RAMP_ENABLE         1           /* 1 = 固件内做缓起缓停; 0 = 直通(上位机做) */
 
-/* 命令超时/丢帧时: 0 = 立即归零(安全优先, 保持原行为);
- *                   1 = 也走斜坡(更柔, 但停车距离变长, 不建议)。 */
-#define RAMP_ON_TIMEOUT     0
+#define RAMP_VX_ACC         1.0f        /* 线速度加速 m/s^2 (同 web) */
+#define RAMP_VX_DEC         0.40f       /* 线速度减速 m/s^2 (同 web, 软停) */
+#define RAMP_WZ_ACC         4.0f        /* 角速度加速 rad/s^2 (同 web) */
+#define RAMP_WZ_DEC         1.5f        /* 角速度减速 rad/s^2 (同 web) */
+
+/* ★ 2026-11-06 定稿的停车语义 (只有两种情况会"急停", 其余一律软停):
+ *
+ *   1) **心跳模式下的链路超时** (HB_TIMEOUT_MS=300 ms): 立即急停 —— 斜坡
+ *      状态清零、目标直接给 0。这是整个底盘**唯一**的瞬停时机, 含义是
+ *      "上位机进程崩了 / 串口线掉了 / 主机死机了", 必须马上停。
+ *   2) 任一电机反馈掉线 (FB_TIMEOUT_MS): 同样立即急停(车可能正在动)。
+ *
+ *   其余全部软停, 用减速斜坡:
+ *      * 正常停车(收到 0 目标):         RAMP_VX_DEC  = 0.40 m/s^2 (丝滑)
+ *      * 非心跳模式下命令超时(800 ms):  RAMP_TIMEOUT_DEC = 0.70 m/s^2
+ *        (键盘 teleop 一次按键只发一帧, 每 800 ms 必然超时一次, 用瞬停的话
+ *         手感就是"松手立刻停住、看不到减速"; 但也不能太慢, 所以比正常
+ *         减速快一些)
+ */
+#define RAMP_TIMEOUT_DEC    0.70f       /* 非心跳模式命令超时: 线速度减速 m/s^2 */
+#define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 非心跳模式命令超时: 角速度减速 rad/s^2 */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
 #define STATUS_VERSION      3           /* 状态帧 [30] 版本号: v2 = 功能帧(重新使能), v3 = 心跳帧(链路看门狗) */
@@ -259,8 +283,10 @@ static uint32_t g_last_cmd_ms;          /* 最近一次合法速度帧的时刻 
 static uint32_t g_boot_reinit_ms;       /* 上电后补使能的节流时刻 (见主循环) */
 static uint8_t  g_cmd_timeout;          /* 1 = 超过 800 ms 没收到命令 */
 static float    g_target_omega[2];      /* 下发给电机的目标 rad/s */
+#if RAMP_ENABLE
 static float    g_ramp_vx;              /* 斜坡后的线速度指令 m/s (缓起缓停状态) */
 static float    g_ramp_wz;              /* 斜坡后的角速度指令 rad/s (缓起缓停状态) */
+#endif
 static uint8_t  g_can_tx_fail;          /* CAN 发送失败计数, 饱和 8 位 */
 
 /*------------------------------ IMU -----------------------------------*/
@@ -764,6 +790,7 @@ static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) 
  *=====================================================================*/
 #define FUNC_HEARTBEAT             0x08
 #define HB_TIMEOUT_MS              300     /* 心跳模式下的链路看门狗 */
+#define HB_STALE_MS                600     /* 心跳源消失判定: 超过这么久没收到心跳帧 -> 退出心跳模式 */
 #define HB_ENABLE                  1       /* 0 = 完全退回老的 800 ms 命令看门狗 */
 static uint32_t g_hb_last_ms;              /* 最近一次收到任何合法帧的时刻 */
 static uint8_t  g_hb_mode;                 /* 1 = 已进入心跳模式 */
@@ -948,6 +975,7 @@ static float ClampF(float v, float lo, float hi)
     return v;
 }
 
+#if RAMP_ENABLE
 /* 一阶线性斜坡: 把 cur 朝 tgt 推进最多 step。
  *
  * 加速/减速分开处理:
@@ -984,6 +1012,7 @@ static float Ramp_Step(float cur, float tgt, float acc_step, float dec_step)
     }
     return cur + d;
 }
+#endif /* RAMP_ENABLE */
 
 /* 浮点 -> int16, 带饱和。状态帧所有物理量都是 x100 定点的:
    omega x100 rad/s, torque x100 Nm, pos x100 rad。
@@ -1263,10 +1292,28 @@ static void Bridge_Update(uint32_t now)
 {
 #if HB_ENABLE
     /* 心跳模式: 只看"链路还活着吗", 不看"有没有新命令"。
-       速度目标锁存最后一条命令, 直到上位机发新命令或心跳断掉。 */
+       速度目标锁存最后一条命令, 直到上位机发新命令或心跳断掉。
+       ★ 但心跳模式**不能永久粘住**: 一旦心跳源(比如 car_web)退出, 后面来的
+       只有键盘/ROS 的一次性速度帧; 若还按 300 ms 心跳看门狗算, 每帧命令
+       只能管 300 ms, 松键就超时 —— 车"走一下突然停", 且目标永远在超时和
+       恢复之间抖。所以加"心跳源消失"判定: 超过 HB_STALE_MS 没收到心跳帧
+       就清掉 g_hb_mode, 回到老的 800 ms 命令看门狗(任何帧都续命)。 */
+    if (g_hb_mode && ((now - g_hb_last_ms) > HB_STALE_MS))
+    {
+        g_hb_mode = 0;
+    }
+
     if (g_hb_mode)
     {
         g_cmd_timeout = ((now - g_hb_last_ms) > HB_TIMEOUT_MS) ? 1 : 0;
+        if (g_cmd_timeout)
+        {
+            /* 心跳断了 = 上位机没了: 立即急停(Control_Tick 里会清斜坡),
+               同时**丢弃锁存的命令** —— 否则链路闪断一次恢复后, 车会自己
+               又按断线前那条命令冲出去。恢复后必须由上位机重新下发命令。 */
+            g_cmd_vx_mm   = 0;
+            g_cmd_wz_mrad = 0;
+        }
     }
     else
     {
@@ -1317,12 +1364,14 @@ static void Control_Tick(void)
     vx = (float)g_eff_vx_mm / 1000.0f;      /* mm/s -> m/s */
     wz = (float)g_eff_wz_mrad / 1000.0f;    /* mrad/s -> rad/s */
 
+#if RAMP_ENABLE
     /* ---- 缓起缓停 ----
-     * 命令超时: 默认(RAMP_ON_TIMEOUT=0)立即把斜坡状态清零, 保证"丢帧就停"
-     * 的安全语义不变; 只有正常的速度变化(含上位机主动发 0)才平滑过渡。
-     * 任一电机掉线: 同样清零斜坡, 避免它重新上线时从一个很高的斜坡值
-     * 瞬间跳到目标(那时车已经在动, 会明显踹一下)。 */
-    if (((RAMP_ON_TIMEOUT == 0) && g_cmd_timeout) ||
+     * 急停只有两个入口(见上面 RAMP_TIMEOUT_DEC 上的说明):
+     *   a) 心跳模式 + 链路超时(300 ms) —— 上位机进程/串口/主机没了;
+     *   b) 任一电机反馈掉线(FB_TIMEOUT_MS) —— 车可能正在动, 必须马上停。
+     * 其余情况一律走斜坡: 正常减速用 RAMP_VX_DEC(丝滑), 非心跳模式的
+     * 命令超时用 RAMP_TIMEOUT_DEC(比正常减速快, 但仍然看得见减速过程)。 */
+    if ((g_hb_mode && g_cmd_timeout) ||
         (!g_online[0]) || (!g_online[1]))
     {
         g_ramp_vx = 0.0f;
@@ -1330,14 +1379,24 @@ static void Control_Tick(void)
     }
     else
     {
-        g_ramp_vx = Ramp_Step(g_ramp_vx, vx,
-                              RAMP_VX_ACC * dt, RAMP_VX_DEC * dt);
-        g_ramp_wz = Ramp_Step(g_ramp_wz, wz,
-                              RAMP_WZ_ACC * dt, RAMP_WZ_DEC * dt);
+        float dec_vx = RAMP_VX_DEC;
+        float dec_wz = RAMP_WZ_DEC;
+        if (g_cmd_timeout)          /* 只可能是非心跳模式的命令超时 */
+        {
+            dec_vx = RAMP_TIMEOUT_DEC;
+            dec_wz = RAMP_TIMEOUT_WZ_DEC;
+        }
+        g_ramp_vx = Ramp_Step(g_ramp_vx, vx, RAMP_VX_ACC * dt, dec_vx * dt);
+        g_ramp_wz = Ramp_Step(g_ramp_wz, wz, RAMP_WZ_ACC * dt, dec_wz * dt);
     }
 
     vx = g_ramp_vx;
     wz = g_ramp_wz;
+#else
+    /* 直通: 斜坡交给上位机(car_web / ROS 节点)负责, 固件只忠实执行。
+       注意这里**不做任何平滑**, 上位机发 0 就是立刻 0, 发 0.2 就是立刻 0.2。 */
+    (void)dt;
+#endif
 
     v_left = vx - wz * (TRACK_WIDTH_M * 0.5f);
     v_right = vx + wz * (TRACK_WIDTH_M * 0.5f);
@@ -1583,8 +1642,10 @@ static void Motors_Startup(void)
 
     /* 重新使能后从零斜坡开始: 否则复位/重新使能那一刻会直接把上一拍的
        斜坡值当目标发出去, 等于又变回"瞬间启动"。 */
+#if RAMP_ENABLE
     g_ramp_vx = 0.0f;
     g_ramp_wz = 0.0f;
+#endif
 
     IWDG_ReloadCounter();
 }

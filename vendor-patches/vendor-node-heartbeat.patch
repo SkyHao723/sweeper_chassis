@@ -1,0 +1,70 @@
+--- a/src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp
++++ b/src/turn_on_wheeltec_robot/src/wheeltec_robot.cpp
+@@ -1,6 +1,7 @@
+ #include "turn_on_wheeltec_robot/wheeltec_robot.h"
+ #include "turn_on_wheeltec_robot/Quaternion_Solution.h"
+ #include "wheeltec_robot_msg/msg/data.hpp" 
++#include <chrono>   // 心跳帧限速用 (本工程扩展)
+ 
+ //sensor_msgs::msg::Imu Mpu6050;//Instantiate an IMU object //实例化IMU对象 
+ 
+@@ -971,6 +972,59 @@
+         distance_flag = false;
+     }
+ 
++    //=========================================================================
++    // 心跳帧 (本工程自定义扩展, 对应 STM32 的 FUNC_HEARTBEAT = f[1]=0x08)
++    //
++    // 为什么需要: STM32 有两种看门狗 ——
++    //   * 收到过心跳帧 -> "心跳模式": 只要心跳还在(<=300 ms), 速度目标**锁存**,
++    //     所以键盘按一次 i 松键后车会继续按原速走, 直到收到新命令(比如 k);
++    //     心跳一旦断掉(本节点崩溃/串口线掉了/主机死机) -> STM32 **立即急停**。
++    //     ★ 这是整个底盘**唯一**会瞬停的时机, 平时停车都是软停(减速斜坡)。
++    //   * 从没收到心跳 -> 老行为: 800 ms 没有新命令就软停。
++    // 所以本帧是"上位机还活着"的唯一凭据, 必须周期发。
++    //
++    // 帧格式: [0x7B][0x08][0..0][BCC][0x7D] —— 不带速度/使能任何信息,
++    // 只刷新 STM32 的链路计时, 不会改变车的运动状态。
++    //
++    // 注意限速: Control() 是"收到一个串口字节就转一圈"的循环(每秒上千圈),
++    // 不能每圈都发, 否则 115200 的串口会被心跳挤满 -> 所以这里用 steady_clock
++    // 限到 20 Hz。
++    //=========================================================================
++    {
++      static std::chrono::steady_clock::time_point _Last_Heartbeat =
++          std::chrono::steady_clock::now();
++      static bool _Heartbeat_Logged = false;
++      auto _now_hb = std::chrono::steady_clock::now();
++      if (std::chrono::duration_cast<std::chrono::milliseconds>(
++              _now_hb - _Last_Heartbeat).count() >= 50)   // 20 Hz
++      {
++        _Last_Heartbeat = _now_hb;
++        if (!_Heartbeat_Logged)
++        {
++          _Heartbeat_Logged = true;
++          RCLCPP_INFO(this->get_logger(),
++                      "heartbeat 开始发送: 20 Hz, f[1]=0x08 -> STM32 进入心跳模式"
++                      "(目标锁存 / 心跳断 300 ms 立即急停)");
++        }
++        Send_Data.tx[0] = FRAME_HEADER;   // 0x7B
++        Send_Data.tx[1] = 0x08;           // FUNC_HEARTBEAT
++        Send_Data.tx[2] = 0; Send_Data.tx[3] = 0;
++        Send_Data.tx[4] = 0; Send_Data.tx[5] = 0;
++        Send_Data.tx[6] = 0; Send_Data.tx[7] = 0;
++        Send_Data.tx[8] = 0;
++        Send_Data.tx[9] = Check_Sum(9, SEND_DATA_CHECK);   // BCC
++        Send_Data.tx[10] = FRAME_TAIL;    // 0x7D
++        try
++        {
++          Stm32_Serial.write(Send_Data.tx, sizeof(Send_Data.tx));
++        }
++        catch (serial::IOException& e)
++        {
++          RCLCPP_ERROR(this->get_logger(), "heartbeat send failed");
++        }
++      }
++    }
++
+     rclcpp::spin_some(this->get_node_base_interface());   //The loop waits for the callback function //循环等待回调函数
+     }
+     
