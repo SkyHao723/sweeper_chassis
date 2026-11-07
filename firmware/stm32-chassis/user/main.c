@@ -177,7 +177,7 @@
 #define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 (ENABLE=1 时才用) */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      6           /* 状态帧 [30] 版本号: v6 (辅助按钮默认时长 1000->200 ms) */
+#define STATUS_VERSION      7           /* 状态帧 [30] 版本号: v7 (辅助按钮改驱动低边 MOS 栅极, 极性修正) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -890,8 +890,8 @@ static void Port_ProcessCommands(void)
 #define LED_ON_LEVEL    1
 
 /* 旧板上的滚刷/水泵继电器引脚。继电器逻辑已删, 但这两个引脚现在被
-   **洗地车的辅助按钮**复用(PB0/PB1: 空闲上拉输入, 收到 FUNC_AUX_BTN 后
-   拉低 AUX_BTN_MS(默认 200 ms) 再回上拉, 见后面"辅助按钮输出"一节)。宏名保留: 旧接线图、
+   **洗地车的辅助按钮**复用(PB0/PB1: 空闲栅极拉低(MOS 关断), 收到 FUNC_AUX_BTN 后
+   把栅极拉高 AUX_BTN_MS(默认 200 ms) 再拉低, 见后面"辅助按钮输出"一节)。宏名保留: 旧接线图、
    旧工具和现场排线记录都按这两个名字引用。 */
 #define RELAY_BRUSH_PIN GPIO_Pin_0
 #define RELAY_PUMP_PIN  GPIO_Pin_1
@@ -950,19 +950,19 @@ static void LED_Tick(void)
 }
 
 /*======================= 辅助按钮输出 (仅洗地车) =======================
- * 硬件: 洗地车 PB0 / PB1 各接一个按钮(或按钮式执行器的输入端)。
- *   空闲: 引脚 = **输入 + 上拉** -> 对方读到高电平, 相当于"没按";
- *   动作: 上位机下令后, 把对应引脚切成**推挽输出低电平**, 相当于"按下",
- *         保持 AUX_BTN_MS = 200 ms(普通按键手感), 然后恢复成输入上拉("松开")。
+ * 硬件(按原理图): PB0 -> R7 220R -> Q1 栅极(AO3400A, 源极接地, 漏极->U8.1)
+ *                 PB1 -> R8 220R -> Q2 栅极(AO3400A, 源极接地, 漏极->U8.2)
+ *                 U8 = WAFER-PH2.0-2PLB, 3/4 脚接地, 1/2 脚就是"按钮线"
+ *   ⇒ 这两路本身已经是**低边开漏开关**, 固件只需要驱动栅极:
+ *       栅极高(3.3V) -> 管子导通 -> 把对方板子的按钮线拉到 GND  = "按下"
+ *       栅极低(0V)   -> 管子关断 -> 线路悬空, 对方上拉回 3.3V   = "松开"
+ *   ⇒ ★ 逻辑是**反的**: 输出高=按下, 输出低=松开。不要按"拉低=按下"想。
  *
- * 为什么"上拉输入 -> 输出低 -> 回上拉"而不是"输出高/低":
- *   对方那侧本来就是靠上拉判断开/合的干接点式输入, 我们只是把这条线
- *   拉低一下模拟按钮。空闲时必须真的**不驱动**(高阻 + 上拉), 否则两边
- *   都推挽输出会打架。
- *
- * ★ STM32F1 的坑: 输入模式下 ODR 决定上拉/下拉 (ODR=1 -> 上拉)。
- *   所以切回上拉输入之前**必须先 GPIO_SetBits**, 否则会变成下拉
- *   (引脚常低 = 按钮被一直按着)。
+ * ★ 空闲必须是**推挽输出低**(主动把栅极拉到 0), 绝不能配成上拉输入:
+ *   上拉输入会把栅极抬到 3.3V -> 管子常通 -> 对方那条线被永久按在 GND
+ *   (2026-11-07 实测就是这么翻车的: 一插线对方引脚就变 GND)。
+ *   上电/复位后引脚默认浮空, 栅极可能因为电荷保持在高位, 所以
+ *   AuxBtn_Init() 要在 main() 初始化序列里**尽早**调用(见 main)。
  *
  * 命令帧: f[1] = FUNC_AUX_BTN(0x09), f[2] = 按钮掩码
  *   f[2].bit0 -> PB0   f[2].bit1 -> PB1   (可以同时按)
@@ -970,7 +970,7 @@ static void LED_Tick(void)
  *          (上限 5000 ms, 下限 30 ms —— 太短了对方可能来不及消抖)
  *   这条帧**不改速度目标**, 车该怎么跑还怎么跑。
  *
- * 扫地车(sweeper)不接这两个按钮: 整个功能在 sweeper 里编成空操作,
+ * 扫地车(sweeper)没有这级硬件: 整个功能在 sweeper 里编成空操作,
  * 但仍然能安全收到该帧(不会被执行成速度命令)。
  *=====================================================================*/
 #define AUX_BTN_MS          200         /* 默认"按下"保持时间(普通按键手感) */
@@ -988,25 +988,25 @@ static uint32_t g_aux_start_ms;
 static uint32_t g_aux_hold_ms;
 static uint8_t  g_aux_count;            /* 执行次数(饱和), 现场判断命令有没有到 */
 
-static void AuxBtn_PinMode(uint16_t pin, uint8_t output_low)
+static void AuxBtn_PinMode(uint16_t pin, uint8_t pressed)
 {
     GPIO_InitTypeDef gpio;
 
-    if (output_low)
+    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+    gpio.GPIO_Speed = GPIO_Speed_2MHz;
+    gpio.GPIO_Pin = pin;
+
+    if (pressed)
     {
-        /* 先拉低再切输出, 避免切换瞬间冒一个高电平(等于"松手抖一下") */
-        GPIO_ResetBits(AUX_BTN_PORT, pin);
-        gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-        gpio.GPIO_Speed = GPIO_Speed_2MHz;
+        /* 栅极高 -> N-MOSFET 导通 -> 对方按钮线被拉到 GND = "按下" */
+        GPIO_SetBits(AUX_BTN_PORT, pin);
     }
     else
     {
-        /* ★ 先置 ODR=1, 再切输入上拉(F1 上 ODR 决定上下拉) */
-        GPIO_SetBits(AUX_BTN_PORT, pin);
-        gpio.GPIO_Mode = GPIO_Mode_IPU;
-        gpio.GPIO_Speed = GPIO_Speed_2MHz;
+        /* 栅极低 -> 管子关断 -> 线路悬空, 对方上拉回 3.3V = "松开"
+         * (这里必须是推挽输出低, 不是上拉输入! 见本节开头的坑) */
+        GPIO_ResetBits(AUX_BTN_PORT, pin);
     }
-    gpio.GPIO_Pin = pin;
     GPIO_Init(AUX_BTN_PORT, &gpio);
 }
 
@@ -1028,7 +1028,7 @@ static void AuxBtn_Init(void)
     g_aux_mask = 0;
     g_aux_last_mask = 0;
     g_aux_hold_ms = AUX_BTN_MS;
-    AuxBtn_PinMode(AUX_BTN_PIN0, 0);    /* 空闲 = 上拉输入 = 没按 */
+    AuxBtn_PinMode(AUX_BTN_PIN0, 0);    /* 空闲 = 栅极拉低 = 管子关断 = 没按 */
     AuxBtn_PinMode(AUX_BTN_PIN1, 0);
 }
 
@@ -1812,6 +1812,11 @@ int main(void)
     uint32_t last_ctrl_ms;
     uint32_t last_status_ms;
 
+    /* ★ 第一件事就是把洗地车 PB0/PB1 栅极拉到 0:
+       复位后引脚浮空, 栅极可能保持着高电平 -> 那两个低边管子常通 ->
+       对方板子的按钮线一上电就被按在 GND。这里先把它关掉再干别的。 */
+    AuxBtn_Init();          /* 洗地车 PB0/PB1: 栅极拉低 = 管子关断 = 没按 */
+
     Tick_Init();            /* 先有时基, 后面所有调度/超时都靠它 */
 
     /* CAN 初始化失败不拦启动: 标记 boot_stage=2, 帧照发, canFail 会反映。 */
@@ -1830,7 +1835,6 @@ int main(void)
 
     USART1_Init();          /* PA9/PA10, 115200, 中断收 */
     LED_Init();             /* PB9 心跳 */
-    AuxBtn_Init();          /* 洗地车 PB0/PB1: 空闲上拉输入(没按) */
     IWDG_Init();            /* 开狗; 后面初始化步骤都会喂 */
     IWDG_ReloadCounter();
 
@@ -1853,7 +1857,7 @@ int main(void)
         IWDG_ReloadCounter();       /* 主循环活着 = 喂狗 */
 
         LED_Tick();                 /* 灯停 = 主循环卡死, 现场第一判据 */
-        AuxBtn_Tick();              /* 到时把按钮引脚恢复成上拉输入(松开) */
+        AuxBtn_Tick();              /* 到时把栅极拉低(管子关断 = 松开) */
 
         Port_ProcessCommands();     /* 收命令 -> 组帧 -> 更新 g_cmd_* */
         CAN1_Poll();                /* 收反馈 -> 更新 g_motor[] */

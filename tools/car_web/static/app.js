@@ -591,7 +591,7 @@
 
   $("btnOdomReset").addEventListener("click", () => send({ t: "odom_reset" }));
 
-  // 洗地车辅助按钮：点一下让固件把 PB0/PB1 拉低（等于按下按钮）再回上拉输入。
+  // 洗地车辅助按钮：点一下让固件把 PB0/PB1 栅极拉高，低边 MOS 导通 -> 对方按钮线接地 = 按下。
   // 功能帧不改变速度指令，所以不需要停摇杆、也不影响当前运动。
   // 按下时长取 #auxHold 的选择（默认 200 ms，模拟一次普通按键）。
   function auxHoldMs() {
@@ -1077,7 +1077,7 @@
       const hold = Number(aux.last_hold_ms || aux.default_ms || 200);
       hint.textContent = "点一下让 PB0/PB1 拉低 "
         + (hold >= 1000 ? (hold / 1000).toFixed(1) + " s" : hold + " ms")
-        + " 再回上拉（等同于按一下按钮）；不改变速度指令";
+        + " 后自动松开（= 按一下按钮）；不改变速度指令";
     }
   }
 

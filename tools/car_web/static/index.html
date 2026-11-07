@@ -118,7 +118,7 @@
         <span class="hint">键盘 W A S D / 方向键，空格停</span>
       </div>
 
-      <!-- 洗地车辅助按钮（固件 v6，PB0/PB1）：点一下 = 拉低一会儿再回上拉 -->
+      <!-- 洗地车辅助按钮（固件 v7，PB0/PB1）：点一下 = 驱动低边 MOS 把对方按钮线拉到 GND 一会儿 -->
       <div class="aux-row" id="auxRow" hidden>
         <div class="aux-title">
           洗地车辅助按钮
@@ -138,7 +138,7 @@
           </label>
         </div>
         <div class="aux-hint" id="auxHint">
-          点一下让 PB0/PB1 从“上拉输入”拉低（等于按下按钮）再自动恢复；不改变速度指令
+          点一下让 PB0/PB1 驱动低边 MOS，把对方那条按钮线拉到 GND（等于按下）再放开；不改变速度指令
         </div>
       </div>
 
