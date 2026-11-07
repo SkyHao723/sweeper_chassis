@@ -177,7 +177,7 @@
 #define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 (ENABLE=1 时才用) */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      4           /* 状态帧 [30] 版本号: v4 (命令锁存, 无命令看门狗) */
+#define STATUS_VERSION      5           /* 状态帧 [30] 版本号: v5 (+洗地车辅助按钮, 帧格式不变) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -755,6 +755,7 @@ static uint8_t g_cmd_len;
  * 11 字节帧和速度帧同头同尾同校验, 靠 f[1] 区分:
  *   f[1] = 0x00/0x01: 普通速度帧 (0x01 是旧协议的"回充"标志, 本固件忽略)
  *   f[1] = 0x06:      FUNC_MOTOR_REINIT —— 主机要求重新"写速度模式 + 使能"
+ *   f[1] = 0x09:      FUNC_AUX_BTN —— 模拟按一下辅助按钮(仅洗地车, PB0/PB1)
  *
  * 为什么需要: DM 驱动器上电后默认失能, 只能由 STM32 发 FFx7+0xFC 使能。
  * 而 STM32 只在**自己启动时**发一次(3 次重试, 总预算 400 ms)。整车断电
@@ -768,6 +769,7 @@ static uint8_t g_cmd_len;
  *    主机的正确用法: 先发一帧全零速度帧, 再发这条功能帧。
  *=====================================================================*/
 #define FUNC_MOTOR_REINIT          0x06
+#define FUNC_AUX_BTN               0x09    /* 模拟按辅助按钮(仅洗地车), 详见"辅助按钮输出"一节 */
 #define REINIT_MAX_WHEEL_RAD_S     2.0f    /* 轮速超过这个值认为车在动, 拒绝 */
 static uint8_t  g_reinit_ok;               /* 成功执行次数 (饱和) */
 static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) */
@@ -785,6 +787,7 @@ static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) 
  *=====================================================================*/
 
 static void Motors_Startup(void);          /* 定义在文件后半, 这里先声明 */
+static void AuxBtn_Trigger(uint8_t mask, uint8_t hold_10ms);  /* 同上 */
 
 static void Cmd_Apply(const uint8_t *f)
 {
@@ -816,6 +819,13 @@ static void Cmd_Apply(const uint8_t *f)
             }
         }
         return;                     /* 功能帧不当速度帧用, 目标保持原值 */
+    }
+
+    /* ---- 主机功能帧: f[1]=FUNC_AUX_BTN, 模拟按一下辅助按钮(仅洗地车) ---- */
+    if (f[1] == FUNC_AUX_BTN)
+    {
+        AuxBtn_Trigger(f[2], f[3]);     /* f[2]=掩码(f[3] 单位 10 ms, 0=默认 1 s) */
+        return;                         /* 功能帧不当速度帧用, 目标保持原值 */
     }
 
     g_cmd_vx_mm = (int16_t)(((uint16_t)f[3] << 8) | f[4]);
@@ -879,9 +889,10 @@ static void Port_ProcessCommands(void)
 #define LED_PIN         GPIO_Pin_9
 #define LED_ON_LEVEL    1
 
-/* 旧板上的滚刷/水泵继电器引脚。新固件**不驱动**它们 (继电器逻辑已删),
-   但宏名保留: 旧接线图、旧工具和现场排线记录都按这两个名字引用, 删掉
-   会让"这块板到底哪根线是继电器"失去唯一的代码依据。 */
+/* 旧板上的滚刷/水泵继电器引脚。继电器逻辑已删, 但这两个引脚现在被
+   **洗地车的辅助按钮**复用(PB0/PB1: 空闲上拉输入, 收到 FUNC_AUX_BTN 后
+   拉低 1 s 再回上拉, 见后面"辅助按钮输出"一节)。宏名保留: 旧接线图、
+   旧工具和现场排线记录都按这两个名字引用。 */
 #define RELAY_BRUSH_PIN GPIO_Pin_0
 #define RELAY_PUMP_PIN  GPIO_Pin_1
 #define RELAY_PORT      GPIOB
@@ -937,6 +948,181 @@ static void LED_Tick(void)
         LED_Apply(g_led_on);
     }
 }
+
+/*======================= 辅助按钮输出 (仅洗地车) =======================
+ * 硬件: 洗地车 PB0 / PB1 各接一个按钮(或按钮式执行器的输入端)。
+ *   空闲: 引脚 = **输入 + 上拉** -> 对方读到高电平, 相当于"没按";
+ *   动作: 上位机下令后, 把对应引脚切成**推挽输出低电平**, 相当于"按下",
+ *         保持 AUX_BTN_MS = 1000 ms, 然后恢复成输入上拉("松开")。
+ *
+ * 为什么"上拉输入 -> 输出低 -> 回上拉"而不是"输出高/低":
+ *   对方那侧本来就是靠上拉判断开/合的干接点式输入, 我们只是把这条线
+ *   拉低一下模拟按钮。空闲时必须真的**不驱动**(高阻 + 上拉), 否则两边
+ *   都推挽输出会打架。
+ *
+ * ★ STM32F1 的坑: 输入模式下 ODR 决定上拉/下拉 (ODR=1 -> 上拉)。
+ *   所以切回上拉输入之前**必须先 GPIO_SetBits**, 否则会变成下拉
+ *   (引脚常低 = 按钮被一直按着)。
+ *
+ * 命令帧: f[1] = FUNC_AUX_BTN(0x09), f[2] = 按钮掩码
+ *   f[2].bit0 -> PB0   f[2].bit1 -> PB1   (可以同时按)
+ *   f[3] = 保持时间, 单位 10 ms; 0 = 用默认 1000 ms (上限 5000 ms)
+ *   这条帧**不改速度目标**, 车该怎么跑还怎么跑。
+ *
+ * 扫地车(sweeper)不接这两个按钮: 整个功能在 sweeper 里编成空操作,
+ * 但仍然能安全收到该帧(不会被执行成速度命令)。
+ *=====================================================================*/
+#define AUX_BTN_MS          1000        /* 默认"按下"保持时间 */
+#define AUX_BTN_MAX_MS      5000        /* 上位机自定义时长上限 */
+
+#if (VEHICLE_SEL == 2)                  /* 洗地车才有 */
+#define AUX_BTN_PORT        GPIOB
+#define AUX_BTN_PIN0        GPIO_Pin_0  /* 旧继电器宏 RELAY_BRUSH_PIN */
+#define AUX_BTN_PIN1        GPIO_Pin_1  /* 旧继电器宏 RELAY_PUMP_PIN  */
+
+static uint8_t  g_aux_mask;             /* 当前正在"按下"的按钮掩码 */
+static uint8_t  g_aux_last_mask;        /* 最近一次命令的掩码(给上位机回读) */
+static uint32_t g_aux_start_ms;
+static uint32_t g_aux_hold_ms;
+static uint8_t  g_aux_count;            /* 执行次数(饱和), 现场判断命令有没有到 */
+
+static void AuxBtn_PinMode(uint16_t pin, uint8_t output_low)
+{
+    GPIO_InitTypeDef gpio;
+
+    if (output_low)
+    {
+        /* 先拉低再切输出, 避免切换瞬间冒一个高电平(等于"松手抖一下") */
+        GPIO_ResetBits(AUX_BTN_PORT, pin);
+        gpio.GPIO_Mode = GPIO_Mode_Out_PP;
+        gpio.GPIO_Speed = GPIO_Speed_2MHz;
+    }
+    else
+    {
+        /* ★ 先置 ODR=1, 再切输入上拉(F1 上 ODR 决定上下拉) */
+        GPIO_SetBits(AUX_BTN_PORT, pin);
+        gpio.GPIO_Mode = GPIO_Mode_IPU;
+        gpio.GPIO_Speed = GPIO_Speed_2MHz;
+    }
+    gpio.GPIO_Pin = pin;
+    GPIO_Init(AUX_BTN_PORT, &gpio);
+}
+
+static void AuxBtn_Release(uint8_t mask)
+{
+    if (mask & 0x01)
+    {
+        AuxBtn_PinMode(AUX_BTN_PIN0, 0);
+    }
+    if (mask & 0x02)
+    {
+        AuxBtn_PinMode(AUX_BTN_PIN1, 0);
+    }
+}
+
+static void AuxBtn_Init(void)
+{
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOB, ENABLE);
+    g_aux_mask = 0;
+    g_aux_last_mask = 0;
+    g_aux_hold_ms = AUX_BTN_MS;
+    AuxBtn_PinMode(AUX_BTN_PIN0, 0);    /* 空闲 = 上拉输入 = 没按 */
+    AuxBtn_PinMode(AUX_BTN_PIN1, 0);
+}
+
+static void AuxBtn_Trigger(uint8_t mask, uint8_t hold_10ms)
+{
+    uint32_t hold;
+
+    mask &= 0x03;
+    if (mask == 0)
+    {
+        return;                         /* 空掩码: 不动任何引脚 */
+    }
+
+    hold = (uint32_t)hold_10ms * 10u;
+    if (hold == 0)
+    {
+        hold = AUX_BTN_MS;
+    }
+    if (hold > AUX_BTN_MAX_MS)
+    {
+        hold = AUX_BTN_MAX_MS;
+    }
+
+    /* 已经在按的: 保持时间从这次重新算(相当于再按一次) */
+    g_aux_mask = (uint8_t)(g_aux_mask | mask);
+    g_aux_last_mask = mask;
+    g_aux_hold_ms = hold;
+    g_aux_start_ms = g_tick_ms;
+
+    if (mask & 0x01)
+    {
+        AuxBtn_PinMode(AUX_BTN_PIN0, 1);
+    }
+    if (mask & 0x02)
+    {
+        AuxBtn_PinMode(AUX_BTN_PIN1, 1);
+    }
+
+    if (g_aux_count != 0xFF)
+    {
+        g_aux_count++;
+    }
+}
+
+static void AuxBtn_Tick(void)
+{
+    if (g_aux_mask == 0)
+    {
+        return;
+    }
+    if ((g_tick_ms - g_aux_start_ms) >= g_aux_hold_ms)
+    {
+        AuxBtn_Release(g_aux_mask);
+        g_aux_mask = 0;
+    }
+}
+
+/* 给诊断帧 [39] 的高位用: bit3 = 正在按, bit4 = 最近按过 PB0, bit5 = 最近按过 PB1 */
+static uint8_t AuxBtn_StatusBits(void)
+{
+    uint8_t bits = 0;
+
+    if (g_aux_mask != 0)
+    {
+        bits |= 0x08;
+    }
+    if (g_aux_last_mask & 0x01)
+    {
+        bits |= 0x10;
+    }
+    if (g_aux_last_mask & 0x02)
+    {
+        bits |= 0x20;
+    }
+    return bits;
+}
+#else                                   /* 扫地车: 空操作, 但帧要安全吃掉 */
+static void AuxBtn_Init(void)
+{
+}
+
+static void AuxBtn_Tick(void)
+{
+}
+
+static void AuxBtn_Trigger(uint8_t mask, uint8_t hold_10ms)
+{
+    (void)mask;
+    (void)hold_10ms;
+}
+
+static uint8_t AuxBtn_StatusBits(void)
+{
+    return 0;
+}
+#endif
 
 /*=========================== 控制/状态更新 ============================*/
 static float ClampF(float v, float lo, float hi)
@@ -1514,7 +1700,8 @@ static void Status_Send(uint32_t now)
     PutU16(&f[34], FbAge(1, now));
     PutU16(&f[36], (uint16_t)g_tick_ms);
     f[38] = imu_found_addr;
-    f[39] = (uint8_t)(imu_probe_flags | (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));
+    f[39] = (uint8_t)(imu_probe_flags | AuxBtn_StatusBits() |
+                    (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));   /* bit3/4/5 = 辅助按钮状态 */
     f[40] = imu_ver_major;
     /* bit0..2 = 启动阶段/错误码 (0~4); bit6 = 命令锁存(无命令看门狗);
        bit7 保留恒 0。 */
@@ -1637,6 +1824,7 @@ int main(void)
 
     USART1_Init();          /* PA9/PA10, 115200, 中断收 */
     LED_Init();             /* PB9 心跳 */
+    AuxBtn_Init();          /* 洗地车 PB0/PB1: 空闲上拉输入(没按) */
     IWDG_Init();            /* 开狗; 后面初始化步骤都会喂 */
     IWDG_ReloadCounter();
 
@@ -1659,6 +1847,7 @@ int main(void)
         IWDG_ReloadCounter();       /* 主循环活着 = 喂狗 */
 
         LED_Tick();                 /* 灯停 = 主循环卡死, 现场第一判据 */
+        AuxBtn_Tick();              /* 到时把按钮引脚恢复成上拉输入(松开) */
 
         Port_ProcessCommands();     /* 收命令 -> 组帧 -> 更新 g_cmd_* */
         CAN1_Poll();                /* 收反馈 -> 更新 g_motor[] */

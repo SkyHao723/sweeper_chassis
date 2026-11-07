@@ -75,11 +75,17 @@ from urllib.parse import unquote, urlparse
 
 # 页面/接口版本：改前端静态资源时一定要一起改，index.html 的 ?v= 会跟着变，
 # 否则浏览器会拿缓存的旧 app.js 跑新 HTML（现场排查过好几次）。
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
 CMD_SIZE = 11
+
+# 主机功能帧（f[1]）。速度帧是 0x00/0x01，功能帧不会改变速度目标。
+FUNC_AUX_BTN = 0x09      # 模拟按一下洗地车辅助按钮（PB0/PB1），固件 v5+
+AUX_BTN_NAMES = {0x01: "PB0", 0x02: "PB1", 0x03: "PB0+PB1"}
+AUX_BTN_DEFAULT_MS = 1000    # 与固件 AUX_BTN_MS 一致
+AUX_BTN_MAX_MS = 5000        # 与固件 AUX_BTN_MAX_MS 一致
 
 TEL_HEAD = 0x7B          # 24 字节主遥测帧（含 IMU 六轴）
 TEL_TAIL = 0x7D
@@ -345,6 +351,36 @@ def build_cmd_frame(vx_m_s: float, wz_rad_s: float) -> bytes:
     return bytes(f)
 
 
+def build_aux_btn_frame(mask: int, hold_ms: int = 0) -> bytes:
+    """组 11 字节"辅助按钮"功能帧（固件 v5，仅洗地车有实际动作）。
+
+    f[1] = 0x09 让固件走功能帧分支，**不改变速度目标**：
+      固件侧把 PB0/PB1 从"上拉输入"切成"推挽输出低"（等于按下按钮），
+      保持 hold_ms（0=默认 1000 ms，上限 5000 ms）后自动恢复上拉输入。
+    f[2] = 掩码：bit0 -> PB0，bit1 -> PB1（可同时按）
+    f[3] = 保持时间，单位 10 ms（0 = 用固件默认值）
+    """
+    mask = int(mask) & 0x03
+    if mask == 0:
+        raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
+    hold_10ms = int(round(clamp(float(hold_ms), 0.0, AUX_BTN_MAX_MS) / 10.0))
+    hold_10ms = int(clamp(hold_10ms, 0, 255))
+
+    f = bytearray(CMD_SIZE)
+    f[0] = CMD_HEAD
+    f[1] = FUNC_AUX_BTN
+    f[2] = mask
+    f[3] = hold_10ms
+    f[4] = 0
+    f[5] = 0
+    f[6] = 0
+    f[7] = 0
+    f[8] = 0
+    f[9] = xor_bcc(bytes(f[0:9]))
+    f[10] = CMD_TAIL
+    return bytes(f)
+
+
 def decode_telemetry(f: bytes) -> dict[str, Any]:
     """解析 24 字节主遥测帧。调用前必须已通过 帧头/帧尾/BCC 校验。"""
     return {
@@ -424,6 +460,10 @@ def decode_status(f: bytes) -> dict[str, Any]:
         "imu_probe_version": bool(f[39] & 0x01),
         "imu_probe_gyro": bool(f[39] & 0x02),
         "imu_probe_mag": bool(f[39] & 0x04),
+        # [39] 的 bit3/4/5 = 洗地车辅助按钮状态（固件 v5+，扫地车恒 0）
+        "aux_active": bool(f[39] & 0x08),
+        "aux_pb0": bool(f[39] & 0x10),
+        "aux_pb1": bool(f[39] & 0x20),
         "imu_ver": f[40],
         "boot_stage": boot,
         "boot_stage_text": BOOT_STAGE_NAMES.get(boot, "未知(%d)" % boot),
@@ -568,6 +608,14 @@ class CarHub:
         self.out_wz = 0.0
         self._ramp_t = 0.0           # 上一次推进斜坡的 monotonic 时间（0=还没推过）
         self.ramp_step_count = 0
+
+        # ---- 辅助按钮（洗地车 PB0/PB1，固件 v5）----
+        # pending 由 HTTP/WS 线程写、串口线程取走；只在 lock 内读写。
+        self.aux_pending: Optional[tuple[int, int]] = None   # (mask, hold_ms)
+        self.aux_last_mask = 0
+        self.aux_last_ms = 0
+        self.aux_count = 0
+        self.aux_time = 0.0
 
         # ---- 串口 ----
         self.link_open = False
@@ -742,6 +790,35 @@ class CarHub:
             else:
                 self.note("缓启缓停已关闭（指令直接阶跃到目标，停车也立即归零）")
             return True
+
+    def request_aux_btn(self, mask: int, hold_ms: int = 0) -> bool:
+        """请求按一下洗地车辅助按钮（PB0/PB1）。
+
+        只是把请求排队，真正的 11 字节功能帧由**串口线程**在下一个发送节拍
+        写出去（串口对象只能一个线程碰，见 LinkWorker 的注释）。
+        功能帧不改变速度目标，车该怎么跑还怎么跑。
+        """
+        mask = int(mask) & 0x03
+        if mask == 0:
+            return False
+        hold = int(hold_ms) if hold_ms else AUX_BTN_DEFAULT_MS
+        hold = int(clamp(float(hold), 10.0, float(AUX_BTN_MAX_MS)))
+        with self.lock:
+            self.aux_pending = (mask, hold)
+            self.aux_last_mask = mask
+            self.aux_last_ms = hold
+            self.aux_count += 1
+            self.aux_time = time.monotonic()
+            self.note("按辅助按钮 %s，保持 %d ms"
+                      % (AUX_BTN_NAMES.get(mask, str(mask)), hold))
+        return True
+
+    def take_aux_pending(self) -> Optional[tuple[int, int]]:
+        """串口线程取走待发的按钮请求（取一次就清空，避免重复按）。"""
+        with self.lock:
+            req = self.aux_pending
+            self.aux_pending = None
+            return req
 
     def estop_on(self, why: str = "网页急停") -> None:
         with self.lock:
@@ -1180,6 +1257,22 @@ class CarHub:
                 },
                 "telemetry": tel,
                 "status": st,
+                # 洗地车辅助按钮（PB0/PB1，固件 v5）：pending=已排队待发，
+                # active/pb0/pb1 来自状态帧 [39] 的回读（真机为准）
+                "aux": {
+                    "pending": self.aux_pending is not None,
+                    "count": self.aux_count,
+                    "last_mask": self.aux_last_mask,
+                    "last_hold_ms": self.aux_last_ms,
+                    "last_age_ms": (round((now - self.aux_time) * 1000.0, 0)
+                                    if self.aux_time else None),
+                    "active": bool(st and st.get("aux_active")),
+                    "pb0": bool(st and st.get("aux_pb0")),
+                    "pb1": bool(st and st.get("aux_pb1")),
+                    "default_ms": AUX_BTN_DEFAULT_MS,
+                    "max_ms": AUX_BTN_MAX_MS,
+                    "names": AUX_BTN_NAMES[1] + " / " + AUX_BTN_NAMES[2],
+                },
                 # IMU 派生量（模长/倾角/体检位）；没有遥测帧时为 None
                 "imu": imu,
                 "flags": flags,
@@ -1284,6 +1377,10 @@ class SimChassis:
         self._eff_vx = 0.0
         self._eff_wz = 0.0
 
+        # 辅助按钮（固件 v5）：最近一次按的是哪个 + 什么时候"松开"
+        self.aux_last_mask = 0
+        self.aux_until = 0.0
+
     # -- 随机数：不用 random 模块是为了让 sim 完全可复现 ----------------
     def _noise(self, scale: float) -> float:
         self._rng = (1103515245 * self._rng + 12345) & 0x7FFFFFFF
@@ -1298,6 +1395,13 @@ class SimChassis:
             if len(self.cmd_buf) == CMD_SIZE:
                 f = bytes(self.cmd_buf)
                 if f[0] == CMD_HEAD and f[10] == CMD_TAIL and xor_bcc(f[:9]) == f[9]:
+                    if f[1] == FUNC_AUX_BTN:
+                        # 功能帧：不动速度，只记录"按了哪个按钮"
+                        self.aux_last_mask = f[2] & 0x03
+                        hold = (f[3] * 10) if f[3] else AUX_BTN_DEFAULT_MS
+                        self.aux_until = time.monotonic() + hold / 1000.0
+                        self.cmd_buf.clear()
+                        continue
                     vx_mm = struct.unpack_from(">h", f, 3)[0]
                     wz_mrad = struct.unpack_from(">h", f, 7)[0]
                     self.last_cmd_t = time.monotonic()
@@ -1425,9 +1529,17 @@ class SimChassis:
         struct.pack_into(">H", f, 34, 20)
         struct.pack_into(">H", f, 36, int((now - self.start) * 1000) & 0xFFFF)
         f[38] = 0x6A                   # 扫到的 IMU I2C 地址
-        f[39] = 0x87                   # bit0/1/2 体检通过 + bit7 陀螺读到过
+        # bit0/1/2 体检通过 + bit7 陀螺读到过；bit3/4/5 = 辅助按钮(固件 v5)
+        aux_bits = 0
+        if now < self.aux_until:
+            aux_bits |= 0x08
+        if self.aux_last_mask & 0x01:
+            aux_bits |= 0x10
+        if self.aux_last_mask & 0x02:
+            aux_bits |= 0x20
+        f[39] = 0x87 | aux_bits
         f[40] = 1
-        f[41] = 1                      # 启动阶段：正常
+        f[41] = 0x41                   # 启动阶段=1 + bit6 命令锁存(与真固件一致)
         f[42] = xor_bcc(bytes(f[:42]))
         f[43] = ST_TAIL
         return bytes(f)
@@ -1528,6 +1640,11 @@ class LinkWorker(threading.Thread):
                     try:
                         self.link.write(build_cmd_frame(vx, wz))
                         self.hub.on_tx(vx, wz, now)
+                        # 辅助按钮功能帧：紧跟命令帧后面发（物理上就是"按一下"），
+                        # 请求来自 HTTP/WS 线程，只在这里取，避免多线程写串口。
+                        aux_req = self.hub.take_aux_pending()
+                        if aux_req is not None:
+                            self.link.write(build_aux_btn_frame(*aux_req))
                     except Exception as exc:          # noqa: BLE001
                         self._close("写失败：%s" % exc)
                         continue
@@ -1788,6 +1905,22 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._json({"ok": True, "gear": self.hub.snapshot()["gear"]})
             return
+        if path == "/api/aux_btn":
+            # 洗地车辅助按钮（PB0/PB1）：POST {"mask":1|2|3, "hold_ms":1000}
+            # mask: bit0=PB0, bit1=PB1；hold_ms 省略=固件默认 1000，上限 5000。
+            try:
+                mask = int(body.get("mask", 0) or 0)
+                hold_ms = int(float(body.get("hold_ms", 0) or 0))
+            except (TypeError, ValueError):
+                self._json({"ok": False, "error": "mask/hold_ms 必须是整数"}, 400)
+                return
+            if not self.hub.request_aux_btn(mask, hold_ms):
+                self._json({"ok": False,
+                            "error": "mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）"},
+                           400)
+                return
+            self._json({"ok": True, "aux": self.hub.snapshot()["aux"]})
+            return
         if path == "/api/estop":
             self.hub.estop_on("HTTP /api/estop")
             self._json({"ok": True, "estop": True})
@@ -2019,6 +2152,14 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.estop_off()
         elif t == "odom_reset":
             self.hub.reset_odom()
+        elif t == "aux_btn":
+            # 洗地车辅助按钮：{"t":"aux_btn","mask":1,"hold_ms":1000}
+            try:
+                mask = int(msg.get("mask", 0) or 0)
+                hold_ms = int(float(msg.get("hold_ms", 0) or 0))
+            except (TypeError, ValueError):
+                return
+            self.hub.request_aux_btn(mask, hold_ms)
         elif t == "ping":
             pass
 

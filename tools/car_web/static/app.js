@@ -591,6 +591,23 @@
 
   $("btnOdomReset").addEventListener("click", () => send({ t: "odom_reset" }));
 
+  // 洗地车辅助按钮：点一下让固件把 PB0/PB1 拉低 1 s 再回上拉输入。
+  // 功能帧不改变速度指令，所以不需要停摇杆、也不影响当前运动。
+  function sendAuxBtn(mask) {
+    const ok = send({ t: "aux_btn", mask: mask, hold_ms: 0 });
+    if (!ok) return;
+    S.auxLocalAt = performance.now();
+    const btn = $(mask === 1 ? "btnAux0" : "btnAux1");
+    if (btn) {
+      btn.classList.add("active");
+      setTimeout(() => btn.classList.remove("active"), 250);
+    }
+  }
+  const aux0 = $("btnAux0");
+  const aux1 = $("btnAux1");
+  if (aux0) aux0.addEventListener("click", () => sendAuxBtn(1));
+  if (aux1) aux1.addEventListener("click", () => sendAuxBtn(2));
+
   function updateEstopUI() {
     $("btnEstop").classList.toggle("active", S.estop);
     $("btnReset").hidden = !S.estop;
@@ -1010,8 +1027,50 @@
   function renderVersion(m) {
     const el = $("footerVer");
     if (!el) return;
-    const v = (m && m.version) || "1.5.1";
+    const v = (m && m.version) || "1.6.0";
     text("footerVer", `car_web ${v}`);
+  }
+
+  // 洗地车辅助按钮（固件 v5）：只有固件支持时才显示按钮，
+  // 免得在扫地车/老固件上点了没反应还以为是坏了。
+  function renderAux(m) {
+    const row = $("auxRow");
+    if (!row) return;
+    const aux = m && m.aux;
+    const st = m && m.status;
+    const ver = st ? Number(st.version || 0) : 0;
+    const supported = !!aux && (Number(aux.count || 0) > 0 || ver >= 5);
+    row.hidden = !supported;
+    if (!supported) return;
+    const btn0 = $("btnAux0");
+    const btn1 = $("btnAux1");
+    const active = !!aux.active;
+    const pb0 = !!(aux.pb0 || (active && (aux.last_mask & 1)));
+    const pb1 = !!(aux.pb1 || (active && (aux.last_mask & 2)));
+    if (btn0) btn0.classList.toggle("on", pb0);
+    if (btn1) btn1.classList.toggle("on", pb1);
+    const state = $("auxState");
+    if (state) {
+      if (aux.pending) {
+        state.textContent = "发送中…";
+        state.className = "aux-state warn";
+      } else if (active) {
+        state.textContent = "按下中";
+        state.className = "aux-state on";
+      } else if (aux.count) {
+        state.textContent = "已按 " + aux.count + " 次";
+        state.className = "aux-state";
+      } else {
+        state.textContent = "待机";
+        state.className = "aux-state";
+      }
+    }
+    const hint = $("auxHint");
+    if (hint) {
+      hint.textContent = "点一下让 PB0/PB1 拉低 "
+        + ((aux.last_hold_ms || aux.default_ms || 1000) / 1000).toFixed(1)
+        + " s 再回上拉；不改变速度指令";
+    }
   }
 
   function renderEvents(m) {
@@ -1111,6 +1170,7 @@
     renderOdom(m);
     renderDiag(m);
     renderDiagLine(m);
+    renderAux(m);
     renderEvents(m);
     renderBanner(m);
     renderSendState(m);

@@ -26,12 +26,12 @@
     38 最高档 ultra：实发 vx = 1.60 m/s，且不超过硬夹 2.0 / 固件 2.565
     39 最高档 ultra：实发 wz = 1.50 rad/s，且轮速不超固件 30 rad/s
   * 新增信息显示（40~45）：
-    40 版本号 1.5.1；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
+    40 版本号 1.6.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
     41 44B 新字段齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段
     42 ERR 中文映射完整（0/1 正常，5~E 按达妙错误码翻译）
     43 颜色分级阈值：温度 >70 橙 / >85 红；反馈年龄 >200 橙 / >500 红
     44 390px 移动端无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在
-    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.5.1）
+    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.6.0）
   * 1.4.0 手机端顿挫 / 链路抖动诊断（46~52）：
     46 摇杆 pad/knob/pad-wrap 都有 touch-action:none、页面禁下拉刷新、
        摇杆 touch 监听 passive:false、pointercancel 有处理
@@ -918,7 +918,7 @@ def run(checker: Checker, base: str, args) -> None:
     # 先把硬停锁存清掉：重新给非零指令即可。目标 0.3 加速 0.3 s 到位。
     hold_cmd(base, 0.3, 0.0, 0.7)
     st = wait_state(base, lambda s: s["cmd"]["tx_vx"] > 0.29, 1.0)
-    dec_expected = 0.30 / car_web.RAMP_VX_DEC     # 0.3 / 0.40 = 0.75 s
+    dec_expected = 0.30 / car_web.RAMP_VX_DEC     # 0.3 / 0.80 = 0.375 s
 
     # 关键：软停期间必须持续发 0 保住 500 ms 心跳（真实网页松手后就是 20 Hz 发 0）。
     t0 = time.monotonic()
@@ -946,11 +946,12 @@ def run(checker: Checker, base: str, args) -> None:
                   "sample=%s mode=%s" % (
                       sample, sample_state and sample_state["ramp"]["mode"]))
 
-    checker.check(35, "软停最终到 0，用时符合 DEC 斜率（0.3 / 0.40 ≈ 0.75 s）",
+    checker.check(35, "软停最终到 0，用时符合 DEC 斜率（0.3 / %.2f ≈ %.2f s）"
+                  % (car_web.RAMP_VX_DEC, dec_expected),
                   zero_at is not None
                   and st["cmd"]["tx_vx"] == 0 and st["cmd"]["tx_wz"] == 0
                   and abs(zero_at - dec_expected) <= 0.20
-                  and zero_at > 0.50,
+                  and zero_at > 0.20,
                   "zero_at=%s expected=%.2fs" % (
                       zero_at is not None and round(zero_at, 3), dec_expected))
 
@@ -1038,7 +1039,7 @@ def run(checker: Checker, base: str, args) -> None:
     imu = st.get("imu") or {}
     checker.check(
         40, "版本 1.4.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）",
-        st.get("version") == "1.5.1"
+        st.get("version") == "1.6.0"
         and 8.5 <= imu.get("accel_mag", 0.0) <= 11.0
         and abs(imu.get("tilt_deg", 99.0)) < 5.0
         and imu.get("gyro_mag", 99.0) < 0.5
@@ -1165,10 +1166,10 @@ def run(checker: Checker, base: str, args) -> None:
             })()""")
             note = (vals or {}).get("note", "")
             checker.check(
-                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.5.1",
+                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.6.0",
                 vals
-                and "1.5.1" in vals["version"]
-                and "1.5.1" in vals["cssHref"] and "1.5.1" in vals["jsSrc"]
+                and "1.6.0" in vals["version"]
+                and "1.6.0" in vals["cssHref"] and "1.6.0" in vals["jsSrc"]
                 and vals["age"].endswith(" ms") and "ok" in vals["ageCls"]
                 and vals["mos"].isdigit() and vals["coil"].isdigit()
                 and math.isfinite(float(vals["pos"]))
@@ -1337,6 +1338,73 @@ def run(checker: Checker, base: str, args) -> None:
             st_old["jitter"]["stale_packets"],
             st_new["jitter"]["session_resets"]))
     post_json(base, "/api/stop", {"hard": True})
+
+    # ---------------- 53~55：洗地车辅助按钮（固件 v5，PB0/PB1）----------------
+    try:
+        # 53：11 字节功能帧格式（不经过服务端，直接验组帧函数）
+        f_aux = car_web.build_aux_btn_frame(1, 1000)
+        f_aux_both = car_web.build_aux_btn_frame(3, 99999)
+        f_aux_def = car_web.build_aux_btn_frame(2, 0)
+        err_zero = False
+        try:
+            car_web.build_aux_btn_frame(0, 1000)
+        except ValueError:
+            err_zero = True
+        checker.check(
+            53, "辅助按钮帧：11 字节/头 0x7B 尾 0x7D/f[1]=0x09/mask 与 hold(×10ms) 正确",
+            len(f_aux) == car_web.CMD_SIZE == 11
+            and f_aux[0] == 0x7B and f_aux[10] == 0x7D
+            and f_aux[1] == car_web.FUNC_AUX_BTN == 0x09
+            and f_aux[2] == 1
+            and f_aux[3] == 100          # 1000 ms / 10 ms
+            and car_web.xor_bcc(f_aux[:9]) == f_aux[9]
+            and f_aux_both[2] == 3 and f_aux_both[3] == 255   # 99999 夹到 5000 ms
+            and f_aux_def[3] == 0                             # 0 = 用固件默认值
+            and err_zero,
+            "f=%s both=%s def=%s 空掩码抛错=%s" % (
+                f_aux.hex(), f_aux_both.hex(), f_aux_def.hex(), err_zero))
+
+        # 54：状态帧 [39] 的 bit3/4/5 解码
+        st_f = bytearray(car_web.ST_SIZE)
+        st_f[0] = car_web.ST_HEAD
+        st_f[43] = car_web.ST_TAIL
+        st_f[39] = 0x87 | 0x08 | 0x10        # 正在按 + 最近按过 PB0
+        st_f[42] = car_web.xor_bcc(bytes(st_f[:42]))
+        d = car_web.decode_status(bytes(st_f))
+        checker.check(
+            54, "状态帧 [39] bit3/4/5 -> aux_active / aux_pb0 / aux_pb1 解码正确",
+            d.get("aux_active") is True and d.get("aux_pb0") is True
+            and d.get("aux_pb1") is False,
+            "active=%s pb0=%s pb1=%s f39=0x%02X" % (
+                d.get("aux_active"), d.get("aux_pb0"), d.get("aux_pb1"),
+                st_f[39]))
+
+        # 55：端到端 —— 功能帧不改速度；状态帧回读 active；pending 被取走
+        # 用 hold_cmd 持续发，避免 500 ms 心跳超时把目标衰减掉导致对比失真。
+        hold_cmd(base, 0.12, 0.0, 0.6)
+        before = get_json(base, "/api/state")
+        code, body = post_json(base, "/api/aux_btn", {"mask": 1, "hold_ms": 1000})
+        after = wait_state(base, lambda s: (s.get("aux") or {}).get("count", 0) >= 1
+                           and (s.get("aux") or {}).get("active") is True
+                           and not (s.get("aux") or {}).get("pending"), 2.0)
+        aux_after = after.get("aux") or {}
+        checker.check(
+            55, "POST /api/aux_btn：请求被串口线程取走、速度指令不变、状态帧回读 active",
+            code == 200 and body.get("ok") is True
+            and aux_after.get("count", 0) >= 1
+            and aux_after.get("last_mask") == 1
+            and aux_after.get("last_hold_ms") == 1000
+            and aux_after.get("active") is True
+            and abs(after["cmd"]["vx"] - before["cmd"]["vx"]) < 1e-9
+            and abs(after["cmd"]["target_vx"] - before["cmd"]["target_vx"]) < 1e-9
+            and after["cmd"]["reason"] != "timeout",
+            "code=%s aux=%s target_before=%s target_after=%s" % (
+                code, aux_after, before.get("cmd", {}).get("target_vx"),
+                after.get("cmd", {}).get("target_vx")))
+        post_json(base, "/api/stop", {"hard": True})
+    except AttributeError as exc:
+        checker.check(53, "辅助按钮帧：11 字节/头 0x7B 尾 0x7D/f[1]=0x09",
+                      False, "car_web 里没有辅助按钮接口：%s" % exc)
 
     # 51~52：390px 移动端浏览器里验证计算样式 + 诊断行 + 触摸事件计数
     if args.no_browser:
