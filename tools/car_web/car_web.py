@@ -82,8 +82,8 @@ CMD_TAIL = 0x7D
 CMD_SIZE = 11
 
 # 主机功能帧（f[1]）。速度帧是 0x00/0x01，功能帧不会改变速度目标。
-FUNC_AUX_BTN = 0x09      # 模拟按一下洗地车辅助按钮（PB0/PB1），固件 v5+
-AUX_BTN_NAMES = {0x01: "PB0", 0x02: "PB1", 0x03: "PB0+PB1"}
+FUNC_AUX_BTN = 0x09      # 模拟按一下洗地车辅助按钮（PB0=刷盘 / PB1=风机），固件 v5+
+AUX_BTN_NAMES = {0x01: "PB0(刷盘)", 0x02: "PB1(风机)", 0x03: "PB0+PB1"}
 AUX_BTN_DEFAULT_MS = 200     # 与固件 AUX_BTN_MS 一致（v6 起 200 ms，普通按键手感）
 AUX_BTN_MIN_MS = 30          # 与固件 AUX_BTN_MIN_MS 一致（太短对方来不及消抖）
 AUX_BTN_MAX_MS = 5000        # 与固件 AUX_BTN_MAX_MS 一致

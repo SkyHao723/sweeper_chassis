@@ -977,10 +977,18 @@ static void LED_Tick(void)
 #define AUX_BTN_MIN_MS      30          /* 下限: 太短了对方来不及消抖 */
 #define AUX_BTN_MAX_MS      5000        /* 上位机自定义时长上限 */
 
+/* 按钮功能定义(对方主板上的两个按钮, 按一下就切换一次状态):
+ *   PB0 = 开关刷盘 (brush)
+ *   PB1 = 开关风机 (fan)
+ * 我们这侧只能"按一下", 读不到对方的开关状态 -> 真正的开关状态由
+ * 上位机自己记账(它每发一次就是"翻转一次")。 */
+#define AUX_BTN_MASK_BRUSH  0x01        /* f[2] bit0 -> PB0 -> 刷盘 */
+#define AUX_BTN_MASK_FAN    0x02        /* f[2] bit1 -> PB1 -> 风机 */
+
 #if (VEHICLE_SEL == 2)                  /* 洗地车才有 */
 #define AUX_BTN_PORT        GPIOB
-#define AUX_BTN_PIN0        GPIO_Pin_0  /* 旧继电器宏 RELAY_BRUSH_PIN */
-#define AUX_BTN_PIN1        GPIO_Pin_1  /* 旧继电器宏 RELAY_PUMP_PIN  */
+#define AUX_BTN_PIN0        GPIO_Pin_0  /* 刷盘按钮: 旧继电器宏 RELAY_BRUSH_PIN */
+#define AUX_BTN_PIN1        GPIO_Pin_1  /* 风机按钮: 旧继电器宏 RELAY_PUMP_PIN  */
 
 static uint8_t  g_aux_mask;             /* 当前正在"按下"的按钮掩码 */
 static uint8_t  g_aux_last_mask;        /* 最近一次命令的掩码(给上位机回读) */
