@@ -115,7 +115,8 @@
  * 下发足够; 再快只会增加总线负载, 不会让车响应更好。
  * 50 ms 上报 = 20 Hz。44 字节在 115200 下约 3.8 ms, 占用可控。
  *-----------------------------------------------------------------------*/
-#define CMD_TIMEOUT_MS      800         /* 上位机命令超时 */
+#define CMD_TIMEOUT_ENABLE  0           /* 0 = 命令不超时(一直执行最后一条命令); 1 = 超时清零 */
+#define CMD_TIMEOUT_MS      800         /* 上位机命令超时 (仅在 CMD_TIMEOUT_ENABLE=1 时生效) */
 #define FB_TIMEOUT_MS       2000        /* 电机反馈超时 */
 #define WHEEL_STALE_MS      200         /* 遥测帧轮速超过这么久没回码就按 0 报 */
 #define CTRL_PERIOD_MS      20          /* 控制/下发周期 */
@@ -152,22 +153,29 @@
 #define RAMP_WZ_ACC         4.0f        /* 角速度加速 rad/s^2 (同 web) */
 #define RAMP_WZ_DEC         1.5f        /* 角速度减速 rad/s^2 (同 web) */
 
-/* ★ 2026-11-07 定稿的停车语义 (只有一种情况会"急停", 其余一律软停):
+/* ★ 2026-11-07 定稿的停车语义 (v4: 命令锁存, 不超时):
  *
- *   唯一的急停入口: 任一电机反馈掉线 (FB_TIMEOUT_MS=2000 ms) —— 车可能
- *   正在动, 必须马上停(斜坡状态清零、目标直接给 0)。
+ *   ★ 默认行为: **没收到新命令就一直执行最后一条命令, 不会自己停**。
+ *     ("现在改成, 没收到命令, 就一直按上一次的命令执行, 不要停")
+ *     所以 CMD_TIMEOUT_ENABLE = 0, 目标只在收到新帧时才更新。
  *
- *   其余全部软停, 用减速斜坡:
- *      * 正常停车(收到 0 目标):        RAMP_VX_DEC  = 0.40 m/s^2 (丝滑)
- *      * 命令超时(CMD_TIMEOUT_MS):     RAMP_TIMEOUT_DEC = 0.70 m/s^2
- *        (键盘 teleop 一次按键只发一帧, 松手后必然超时一次; 用瞬停的话
- *         手感就是"松手立刻停住、看不到减速", 所以给一个稍快的斜坡)
+ *   能真正让车停下来的, 只有这几种:
+ *     1. 上位机主动发 0 目标 (键盘 k / 网页松手 / cmd_vel 0) -> 软停
+ *        RAMP_VX_DEC = 0.40 m/s^2 (丝滑, 0.3 m/s 约 0.75 s)
+ *     2. 任一电机反馈掉线 (FB_TIMEOUT_MS = 2000 ms) -> **急停**
+ *        (斜坡状态清零、目标直接给 0; 车可能正在动, 必须马上停)
+ *     3. 上位机自己重启/退出后, 由上层(ROS 节点 / car_web)决定发什么
+ *
+ *   ★ 风险(必须知道): 命令不超时 => 上位机进程崩了、串口线掉了、电脑关机,
+ *     车会**一直按最后一次速度跑下去**, 直到电机反馈掉线或有人断电。
+ *     需要"看门狗"语义时把 CMD_TIMEOUT_ENABLE 改回 1 即可(代码分支都还在),
+ *     超时减速用 RAMP_TIMEOUT_DEC。
  */
-#define RAMP_TIMEOUT_DEC    0.70f       /* 命令超时: 线速度减速 m/s^2 */
-#define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 */
+#define RAMP_TIMEOUT_DEC    0.70f       /* 命令超时: 线速度减速 m/s^2 (ENABLE=1 时才用) */
+#define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 (ENABLE=1 时才用) */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      3           /* 状态帧 [30] 版本号: v3 (心跳帧已移除, 帧格式不变) */
+#define STATUS_VERSION      4           /* 状态帧 [30] 版本号: v4 (命令锁存, 无命令看门狗) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -278,7 +286,7 @@ static int16_t  g_eff_vx_mm;            /* 本拍实际执行的 vx (超时则 0
 static int16_t  g_eff_wz_mrad;          /* 本拍实际执行的 wz (超时则 0) */
 static uint32_t g_last_cmd_ms;          /* 最近一次合法速度帧的时刻 */
 static uint32_t g_boot_reinit_ms;       /* 上电后补使能的节流时刻 (见主循环) */
-static uint8_t  g_cmd_timeout;          /* 1 = 超过 800 ms 没收到命令 */
+static uint8_t  g_cmd_timeout;          /* 1 = 命令看门狗超时 (默认关闭, 恒 0) */
 static float    g_target_omega[2];      /* 下发给电机的目标 rad/s */
 #if RAMP_ENABLE
 static float    g_ramp_vx;              /* 斜坡后的线速度指令 m/s (缓起缓停状态) */
@@ -762,15 +770,16 @@ static uint8_t g_cmd_len;
 static uint8_t  g_reinit_ok;               /* 成功执行次数 (饱和) */
 static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) */
 
-/*==================== 看门狗: 只有"命令超时"一种 ========================
- * 判据: 距最近一条合法命令帧超过 CMD_TIMEOUT_MS 没消息 -> 目标清零(软停)。
- * 这条判据同时覆盖两种情况, 不区分:
- *   A. 上位机还活着, 只是没有新命令(键盘松手、这一拍没出 cmd_vel)
- *   B. 上位机真的没了(进程崩了/线掉了)
- * 两种情况都该停, 所以不需要额外的心跳帧来区分 —— 心跳机制已移除。
+/*================= 看门狗: 默认关(命令锁存, 不自己停) ==================
+ * 用户 2026-11-07 的定稿: "没收到命令, 就一直按上一次的命令执行, 不要停"。
+ * 所以 CMD_TIMEOUT_ENABLE = 0: 目标只在收到新帧时更新, 不因"没有新命令"
+ * 而清零。键盘 teleop 按一次发一帧、松手不发 0 => 车会按最后一帧继续走,
+ * 这是**故意的**(不是 bug)。
  *
- * ★ 唯一会"瞬停"(瞬间清斜坡)的入口: 任一电机反馈掉线(FB_TIMEOUT_MS)。
- *   其余一律软停, 走 RAMP_TIMEOUT_DEC / RAMP_VX_DEC 斜坡。
+ * 想恢复"800 ms 没命令就软停"的老行为: 把 CMD_TIMEOUT_ENABLE 改回 1。
+ *
+ * ★ 唯一会"瞬停"(瞬间清斜坡、目标直接给 0)的入口:
+ *   任一电机反馈掉线(FB_TIMEOUT_MS = 2000 ms) —— 车可能正在动, 必须马上停。
  *=====================================================================*/
 
 static void Motors_Startup(void);          /* 定义在文件后半, 这里先声明 */
@@ -1256,8 +1265,10 @@ static void Send_MainTelemetry(void)
  *=====================================================================*/
 static void Bridge_Update(uint32_t now)
 {
-    /* 命令超时: 距最近一条合法命令帧超过 CMD_TIMEOUT_MS 就清零目标(软停)。 */
-    g_cmd_timeout = ((now - g_last_cmd_ms) > CMD_TIMEOUT_MS) ? 1 : 0;
+    /* 命令看门狗: 默认关闭(CMD_TIMEOUT_ENABLE=0) => 一直执行最后一条命令。
+     * 打开时: 距最近一条合法命令帧超过 CMD_TIMEOUT_MS 就清零目标(软停)。 */
+    g_cmd_timeout = (CMD_TIMEOUT_ENABLE &&
+                     ((now - g_last_cmd_ms) > CMD_TIMEOUT_MS)) ? 1 : 0;
 
     if (g_cmd_timeout)
     {
@@ -1304,9 +1315,9 @@ static void Control_Tick(void)
     /* ---- 缓起缓停 ----
      * 唯一的急停入口: 任一电机反馈掉线(FB_TIMEOUT_MS) —— 车可能正在动,
      *   必须马上停, 而且避免它重新上线时从一个很高的斜坡值瞬间跳到目标。
-     * 其余情况一律走斜坡: 正常减速用 RAMP_VX_DEC(丝滑),
-     *   命令超时(CMD_TIMEOUT_MS, 上位机没消息了)用 RAMP_TIMEOUT_DEC ——
-     *   比正常减速快一点, 但仍然看得见减速过程, 不会"啪"一下停住。 */
+     * 其余情况一律走斜坡: 正常减速(收到 0 目标)用 RAMP_VX_DEC(丝滑)。
+     *   g_cmd_timeout 在 CMD_TIMEOUT_ENABLE=0 时恒为 0(命令锁存不超时),
+     *   对应分支留作以后恢复看门狗时可切换。 */
     if ((!g_online[0]) || (!g_online[1]))
     {
         g_ramp_vx = 0.0f;
@@ -1503,8 +1514,9 @@ static void Status_Send(uint32_t now)
     f[38] = imu_found_addr;
     f[39] = (uint8_t)(imu_probe_flags | (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));
     f[40] = imu_ver_major;
-    f[41] = (uint8_t)BootStage();
-    /* bit0..2 = 启动阶段/错误码 (0~4); bit7 恒 0 (心跳机制已移除)。 */
+    /* bit0..2 = 启动阶段/错误码 (0~4); bit6 = 命令锁存(无命令看门狗);
+       bit7 保留恒 0。 */
+    f[41] = (uint8_t)(BootStage() | (CMD_TIMEOUT_ENABLE ? 0x00 : 0x40));
 
     for (i = 0; i < STATUS_FRAME_SIZE - 2; i++)
     {

@@ -40,7 +40,7 @@
 | 上层发布者 | **持续发布**的"当前期望"（Nav2、手柄遥控通常 10~20 Hz 连续发） |
 | 特例 | `teleop_twist_keyboard`（humble 版）**按一次键只发一条** Twist |
 | 底盘驱动 | 把最后收到的那条当作**持续有效的目标**（零阶保持） |
-| 我们的 STM32 | 最后一条命令 **800 ms** 内有效，过期把目标归零并减速停车（`CMD_TIMEOUT_MS`） |
+| 我们的 STM32 | **命令锁存**：没新命令就一直执行最后一条（`CMD_TIMEOUT_ENABLE=0`，v4 起）；只有收到 0 目标或电机反馈掉线才停 |
 
 业务推论：**"一直发" = "一直授权"；"停发" = "请求停车"**。所以遥控松手就停是设计行为，不是 bug。
 
@@ -257,7 +257,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 |---|---|---|
 | 收帧/校验 | `Cmd_FeedByte()` / `Cmd_Verify()` | 帧头 `0x7B`、帧尾 `0x7D`、BCC 全对才接受；**非法帧丢弃且不刷新看门狗** |
 | 解析 | `Cmd_Apply()`（`g_cmd_vx_mm = f[3]<<8\|f[4]`） | `vx` mm/s、`wz` mrad/s，大端 int16 |
-| 有效期 | `Bridge_Update()`：`CMD_TIMEOUT_MS = 800`（命令年龄，唯一一条看门狗） | 过期 → `g_eff_* = 0`，按 `RAMP_TIMEOUT_DEC = 0.70 m/s²` 软停（**只清零，不失能**：失能=输出关断=不制动会溜车） |
+| 有效期 | `Bridge_Update()`：`CMD_TIMEOUT_ENABLE = 0` → **不超时、目标锁存**（v4 起） | 收到 0 目标 → 按 `RAMP_VX_DEC = 0.40 m/s²` 软停（**只清零，不失能**：失能=输出关断=不制动会溜车）；改回 1 则 800 ms 超时软停（`RAMP_TIMEOUT_DEC 0.70`） |
 | **缓起缓停** | `Control_Tick()`：`Ramp_Step(g_ramp_vx, vx, RAMP_VX_ACC·dt, RAMP_VX_DEC·dt)` | **逆解之前**先对 `vx`/`wz` 做斜坡，保证起步/停车时两轮比例始终正确 |
 | 逆解 | `Control_Tick()`：`v_left = vx − wz·TRACK/2`、`v_right = vx + wz·TRACK/2` | 2.3 节公式 |
 | 换算+夹取 | `g_target_omega[i] = DM_DIR_x * ClampF(v/R, ±MAX_OMEGA_RAD_S)` | `MAX_OMEGA_RAD_S = 30` |
@@ -278,7 +278,8 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | `TRACK_WIDTH_MM` / `TRACK_WIDTH_M` | 716 / 456 → `/1000` | 由 Keil target Define 传入，有 `#error` 守门 |
 | `MAX_OMEGA_RAD_S` | `30.0f`（≈2.565 m/s） | 同上 |
 | `DM_DIR_LEFT` / `DM_DIR_RIGHT` | sweeper `+1/−1`；scrubber `−1/−1` | 按 `VEHICLE_SEL` 分支定义 |
-| `CMD_TIMEOUT_MS` | `800` | 命令看门狗 |
+| `CMD_TIMEOUT_ENABLE` | `0` | 命令看门狗开关（0=命令锁存，一直执行最后一条命令） |
+| `CMD_TIMEOUT_MS` | `800` | 命令看门狗阈值（仅 `CMD_TIMEOUT_ENABLE=1` 时生效） |
 | `RAMP_VX_ACC` / `RAMP_VX_DEC` | `1.0f` / `1.5f` m/s² | 缓起缓停（线速度） |
 | `RAMP_WZ_ACC` / `RAMP_WZ_DEC` | `2.0f` / `3.0f` rad/s² | 缓起缓停（角速度） |
 | `RAMP_ON_TIMEOUT` | `0` | 0 = 超时立即归零；1 = 超时也走斜坡 |
@@ -305,7 +306,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | 误解 | 事实 |
 |---|---|
 | "`cmd_vel` 是位置指令" | 是**速度**指令；位置是导航层的事 |
-| "发一次就够，底盘会一直跑" | 不会：800 ms 收不到新命令就软停（`CMD_TIMEOUT_MS`，唯一一条看门狗）。想连续走就连续发（teleop 按住会由终端 key repeat 产生 ~30 Hz 命令流） |
+| "发一次就够，底盘会一直跑" | **会**（v4 起）：没新命令就一直执行最后一条（命令锁存，`CMD_TIMEOUT_ENABLE=0`）。要停就显式发 0，或把 `CMD_TIMEOUT_ENABLE` 改回 1 |
 | "`linear.y` 可以用来横移" | 差速车无横移自由度，固件直接丢弃 |
 | "`wz>0` 是右转" | ROS 约定 **正 = 逆时针 = 左转** |
 | "轮速就是 RPM 直接发" | 发的是 **rad/s**，且要先做差速逆解 + 乘安装方向系数 |

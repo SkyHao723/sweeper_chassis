@@ -24,9 +24,11 @@
     2. 本程序：500 ms 没收到网页指令 → 分级衰减（300 ms 70%、380 ms 50%、
        460 ms 30%）并在 500 ms 归零；急停锁存后只发 0；
        |vx|<=2.0 m/s、|wz|<=1.5 rad/s 硬夹 + 档位夹（固件上限 2.565 m/s）。
-    3. STM32：800 ms 收不到合法命令帧 → 目标清零（固件里已实现）。
+    3. STM32：固件 v4 起**命令锁存**（没新命令就一直执行最后一条），
+       `CMD_TIMEOUT_ENABLE=0` —— 硬件层不再兜底。所以"网页断了车还在跑"
+       只能靠本程序清零，本文件的安全逻辑因此是唯一防线。
     ★ 分级衰减只让"网络抖动"的顿挫变柔和，绝不延长归零时间：
-      硬上限仍是 500 ms 开始/完成归零，比固件 800 ms 看门狗更早。
+      硬上限仍是 500 ms 开始/完成归零。
 
 缓启缓停（默认开，加减速分开）
     正常行驶指令在 step_output() 里按 vx 加速 1.0 / 减速 0.40 m/s²、
@@ -122,13 +124,13 @@ GEAR_ORDER = ("low", "mid", "high", "fast", "sprint", "ultra")
 HARD_VX_LIMIT = 2.00
 HARD_WZ_LIMIT = 1.50
 FIRMWARE_VX_MAX = WHEEL_OMEGA_MAX * WHEEL_R_M   # 2.565 m/s，只用于注释/自测对照
-CMD_TIMEOUT_MS = 500     # 网页心跳超时（< 固件的 800 ms，保证先由我们清零）
+CMD_TIMEOUT_MS = 500     # 网页心跳超时（固件 v4 起不再有命令看门狗，这里就是唯一兜底）
 
 # ---- 心跳分级衰减（1.4.0）-----------------------------------------------
 # 只用来说明"500 ms 之前"的阶段：手机 WiFi 抖动时，指令可能 300~500 ms 才到。
 # 旧行为是"到 500 ms 一步从全速跳到 0"，车会明显"冲一下-停-再冲"。
 # 现在按 (年龄阈值, 目标缩放) 分 3 档衰减，让减速更柔和；但 500 ms 仍然
-# 强制归零（不延长），固件 800 ms 看门狗仍在更外层兜底。
+# 强制归零（不延长）。注意固件 v4 起是"命令锁存"，硬件不会再兜底。
 #
 # ★ 安全边界（改之前先读）：
 #   * 最晚 300 ms 就开始降速，500 ms 必须到 0 —— 比原来的 500 ms 更早减速；
@@ -401,7 +403,8 @@ def decode_status(f: bytes) -> dict[str, Any]:
             "enabled": flags["left_enabled" if i == 0 else "right_enabled"],
         }
 
-    boot = f[41] & 0x07          # 低 3 位才是启动阶段；bit7 恒 0（心跳机制已移除）
+    boot = f[41] & 0x07          # 低 3 位才是启动阶段
+    latch = bool(f[41] & 0x40)   # bit6 = 命令锁存（固件 v4+：没有命令看门狗）
     return {
         "flags_raw": raw_flags,
         "flags": flags,
@@ -425,6 +428,9 @@ def decode_status(f: bytes) -> dict[str, Any]:
         "boot_stage": boot,
         "boot_stage_text": BOOT_STAGE_NAMES.get(boot, "未知(%d)" % boot),
         "boot_level": boot_level(boot),
+        "latch_mode": latch,
+        "latch_mode_text": ("命令锁存（没命令也一直执行最后一条）" if latch
+                            else "命令超时 800 ms"),
     }
 
 
@@ -1892,7 +1898,7 @@ class Handler(BaseHTTPRequestHandler):
                              st["cmd_vx"], st["cmd_wz"], st["boot_stage_text"],
                              st["boot_level"], st["imu_status_text"],
                              st["can_fail"], st["fb_count"]))
-            lines.append("  看门狗=命令超时 800 ms（心跳机制已移除）")
+            lines.append("  看门狗=%s" % st.get("latch_mode_text", "—"))
         else:
             lines.append("状态: 还没有收到 0x7E 帧")
         lines.append("里程: %.3f m  偏航=%.1f°  急停=%s" %
@@ -2057,7 +2063,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     ap.add_argument("--verbose", action="store_true", help="打印每秒统计与 HTTP 日志")
     a = ap.parse_args(argv)
     if not (20.0 <= a.tx_hz <= 50.0):
-        ap.error("--tx-hz 必须在 20~50 之间（STM32 有 800 ms 看门狗）")
+        ap.error("--tx-hz 必须在 20~50 之间（低于 20 跟不上上层 cmd_vel，高于 50 无收益）")
     return a
 
 
