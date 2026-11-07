@@ -591,16 +591,23 @@
 
   $("btnOdomReset").addEventListener("click", () => send({ t: "odom_reset" }));
 
-  // 洗地车辅助按钮：点一下让固件把 PB0/PB1 拉低 1 s 再回上拉输入。
+  // 洗地车辅助按钮：点一下让固件把 PB0/PB1 拉低（等于按下按钮）再回上拉输入。
   // 功能帧不改变速度指令，所以不需要停摇杆、也不影响当前运动。
+  // 按下时长取 #auxHold 的选择（默认 200 ms，模拟一次普通按键）。
+  function auxHoldMs() {
+    const sel = $("auxHold");
+    const v = sel ? parseInt(sel.value, 10) : 200;
+    return isFinite(v) && v > 0 ? v : 200;
+  }
   function sendAuxBtn(mask) {
-    const ok = send({ t: "aux_btn", mask: mask, hold_ms: 0 });
+    const hold = auxHoldMs();
+    const ok = send({ t: "aux_btn", mask: mask, hold_ms: hold });
     if (!ok) return;
     S.auxLocalAt = performance.now();
     const btn = $(mask === 1 ? "btnAux0" : "btnAux1");
     if (btn) {
       btn.classList.add("active");
-      setTimeout(() => btn.classList.remove("active"), 250);
+      setTimeout(() => btn.classList.remove("active"), Math.min(hold, 600));
     }
   }
   const aux0 = $("btnAux0");
@@ -1027,7 +1034,7 @@
   function renderVersion(m) {
     const el = $("footerVer");
     if (!el) return;
-    const v = (m && m.version) || "1.6.0";
+    const v = (m && m.version) || "1.6.1";
     text("footerVer", `car_web ${v}`);
   }
 
@@ -1067,9 +1074,10 @@
     }
     const hint = $("auxHint");
     if (hint) {
+      const hold = Number(aux.last_hold_ms || aux.default_ms || 200);
       hint.textContent = "点一下让 PB0/PB1 拉低 "
-        + ((aux.last_hold_ms || aux.default_ms || 1000) / 1000).toFixed(1)
-        + " s 再回上拉；不改变速度指令";
+        + (hold >= 1000 ? (hold / 1000).toFixed(1) + " s" : hold + " ms")
+        + " 再回上拉（等同于按一下按钮）；不改变速度指令";
     }
   }
 

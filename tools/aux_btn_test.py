@@ -3,13 +3,13 @@
 """洗地车辅助按钮直连测试（不经 ROS / 不经 car_web）。
 
 固件 v5 新增功能帧 f[1]=0x09：让 PB0/PB1 从"上拉输入"切成"推挽输出低"
-（等于按一下物理按钮），保持 f[3]*10 ms（0=默认 1000 ms，上限 5000 ms）
+（等于按一下物理按钮），保持 f[3]*10 ms（0=默认 200 ms，范围 30~5000 ms）
 后自动恢复上拉输入。功能帧**不改变速度目标**。
 
 本脚本做的事：
   1. 打开底盘串口（默认 /dev/wheeltec_controller @115200）
   2. 先发 30 帧零速命令，确认车是停的（安全）
-  3. 发一条功能帧（默认 mask=1 → PB0，保持 1000 ms）
+  3. 发一条功能帧（默认 mask=1 → PB0，保持 200 ms = 普通按键手感）
   4. 之后只发零速命令 + 收帧，打印状态帧 [30]固件版本 / [39] 的
      bit3(正在按) bit4(最近按过 PB0) bit5(最近按过 PB1) 随时间的变化
   5. 判据：功能帧发出后 ≤200 ms 应看到 bit3=1；1100~1500 ms 后 bit3 应回 0
@@ -41,7 +41,8 @@ CMD_TAIL = 0x7D
 
 FUNC_AUX_BTN = 0x09
 AUX_NAMES = {0x01: "PB0", 0x02: "PB1", 0x03: "PB0+PB1"}
-AUX_BTN_DEFAULT_MS = 1000
+AUX_BTN_DEFAULT_MS = 200        # 与固件 AUX_BTN_MS 一致（v6 起）
+AUX_BTN_MIN_MS = 30             # 与固件 AUX_BTN_MIN_MS 一致
 AUX_BTN_MAX_MS = 5000
 
 BIT_ACTIVE = 0x08     # 正在按
@@ -55,7 +56,7 @@ def build_aux_btn_frame(mask: int, hold_ms: int = 0) -> bytes:
     if mask == 0:
         raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
     hold = int(hold_ms) if hold_ms else AUX_BTN_DEFAULT_MS
-    hold = max(10, min(int(hold), AUX_BTN_MAX_MS))
+    hold = max(AUX_BTN_MIN_MS, min(int(hold), AUX_BTN_MAX_MS))
     hold_10ms = min(255, int(round(hold / 10.0)))
 
     f = bytearray(CMD_SIZE)
@@ -81,7 +82,7 @@ def main() -> int:
     ap.add_argument("--port", default="/dev/wheeltec_controller")
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--mask", type=int, default=1, help="1=PB0, 2=PB1, 3=两个")
-    ap.add_argument("--hold-ms", type=int, default=0, help="0=固件默认 1000")
+    ap.add_argument("--hold-ms", type=int, default=0, help="0=固件默认 200 ms")
     ap.add_argument("--cycles", type=int, default=1, help="重复按几次")
     ap.add_argument("--settle", type=float, default=0.6, help="按下后观察多久（s）")
     args = ap.parse_args()

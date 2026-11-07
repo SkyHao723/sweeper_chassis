@@ -75,7 +75,7 @@ from urllib.parse import unquote, urlparse
 
 # 页面/接口版本：改前端静态资源时一定要一起改，index.html 的 ?v= 会跟着变，
 # 否则浏览器会拿缓存的旧 app.js 跑新 HTML（现场排查过好几次）。
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
@@ -84,7 +84,8 @@ CMD_SIZE = 11
 # 主机功能帧（f[1]）。速度帧是 0x00/0x01，功能帧不会改变速度目标。
 FUNC_AUX_BTN = 0x09      # 模拟按一下洗地车辅助按钮（PB0/PB1），固件 v5+
 AUX_BTN_NAMES = {0x01: "PB0", 0x02: "PB1", 0x03: "PB0+PB1"}
-AUX_BTN_DEFAULT_MS = 1000    # 与固件 AUX_BTN_MS 一致
+AUX_BTN_DEFAULT_MS = 200     # 与固件 AUX_BTN_MS 一致（v6 起 200 ms，普通按键手感）
+AUX_BTN_MIN_MS = 30          # 与固件 AUX_BTN_MIN_MS 一致（太短对方来不及消抖）
 AUX_BTN_MAX_MS = 5000        # 与固件 AUX_BTN_MAX_MS 一致
 
 TEL_HEAD = 0x7B          # 24 字节主遥测帧（含 IMU 六轴）
@@ -356,14 +357,18 @@ def build_aux_btn_frame(mask: int, hold_ms: int = 0) -> bytes:
 
     f[1] = 0x09 让固件走功能帧分支，**不改变速度目标**：
       固件侧把 PB0/PB1 从"上拉输入"切成"推挽输出低"（等于按下按钮），
-      保持 hold_ms（0=默认 1000 ms，上限 5000 ms）后自动恢复上拉输入。
+      保持 hold_ms（0=默认 200 ms，范围 30~5000 ms）后自动恢复上拉输入。
     f[2] = 掩码：bit0 -> PB0，bit1 -> PB1（可同时按）
     f[3] = 保持时间，单位 10 ms（0 = 用固件默认值）
     """
     mask = int(mask) & 0x03
     if mask == 0:
         raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
-    hold_10ms = int(round(clamp(float(hold_ms), 0.0, AUX_BTN_MAX_MS) / 10.0))
+    if int(hold_ms) <= 0:
+        hold_10ms = 0                     # 交给固件用默认时长
+    else:
+        hold_10ms = int(round(clamp(float(hold_ms), float(AUX_BTN_MIN_MS),
+                                    float(AUX_BTN_MAX_MS)) / 10.0))
     hold_10ms = int(clamp(hold_10ms, 0, 255))
 
     f = bytearray(CMD_SIZE)
@@ -802,7 +807,8 @@ class CarHub:
         if mask == 0:
             return False
         hold = int(hold_ms) if hold_ms else AUX_BTN_DEFAULT_MS
-        hold = int(clamp(float(hold), 10.0, float(AUX_BTN_MAX_MS)))
+        hold = int(clamp(float(hold), float(AUX_BTN_MIN_MS),
+                         float(AUX_BTN_MAX_MS)))
         with self.lock:
             self.aux_pending = (mask, hold)
             self.aux_last_mask = mask
@@ -1270,6 +1276,7 @@ class CarHub:
                     "pb0": bool(st and st.get("aux_pb0")),
                     "pb1": bool(st and st.get("aux_pb1")),
                     "default_ms": AUX_BTN_DEFAULT_MS,
+                    "min_ms": AUX_BTN_MIN_MS,
                     "max_ms": AUX_BTN_MAX_MS,
                     "names": AUX_BTN_NAMES[1] + " / " + AUX_BTN_NAMES[2],
                 },

@@ -26,12 +26,12 @@
     38 最高档 ultra：实发 vx = 1.60 m/s，且不超过硬夹 2.0 / 固件 2.565
     39 最高档 ultra：实发 wz = 1.50 rad/s，且轮速不超固件 30 rad/s
   * 新增信息显示（40~45）：
-    40 版本号 1.6.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
+    40 版本号 1.6.1；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
     41 44B 新字段齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段
     42 ERR 中文映射完整（0/1 正常，5~E 按达妙错误码翻译）
     43 颜色分级阈值：温度 >70 橙 / >85 红；反馈年龄 >200 橙 / >500 红
     44 390px 移动端无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在
-    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.6.0）
+    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.6.1）
   * 1.4.0 手机端顿挫 / 链路抖动诊断（46~52）：
     46 摇杆 pad/knob/pad-wrap 都有 touch-action:none、页面禁下拉刷新、
        摇杆 touch 监听 passive:false、pointercancel 有处理
@@ -1039,7 +1039,7 @@ def run(checker: Checker, base: str, args) -> None:
     imu = st.get("imu") or {}
     checker.check(
         40, "版本 1.4.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）",
-        st.get("version") == "1.6.0"
+        st.get("version") == "1.6.1"
         and 8.5 <= imu.get("accel_mag", 0.0) <= 11.0
         and abs(imu.get("tilt_deg", 99.0)) < 5.0
         and imu.get("gyro_mag", 99.0) < 0.5
@@ -1166,10 +1166,10 @@ def run(checker: Checker, base: str, args) -> None:
             })()""")
             note = (vals or {}).get("note", "")
             checker.check(
-                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.6.0",
+                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.6.1",
                 vals
-                and "1.6.0" in vals["version"]
-                and "1.6.0" in vals["cssHref"] and "1.6.0" in vals["jsSrc"]
+                and "1.6.1" in vals["version"]
+                and "1.6.1" in vals["cssHref"] and "1.6.1" in vals["jsSrc"]
                 and vals["age"].endswith(" ms") and "ok" in vals["ageCls"]
                 and vals["mos"].isdigit() and vals["coil"].isdigit()
                 and math.isfinite(float(vals["pos"]))
@@ -1345,6 +1345,8 @@ def run(checker: Checker, base: str, args) -> None:
         f_aux = car_web.build_aux_btn_frame(1, 1000)
         f_aux_both = car_web.build_aux_btn_frame(3, 99999)
         f_aux_def = car_web.build_aux_btn_frame(2, 0)
+        f_aux_200 = car_web.build_aux_btn_frame(1, 200)      # 默认"普通按键"时长
+        f_aux_min = car_web.build_aux_btn_frame(1, 5)        # 太短 -> 夹到 30 ms
         err_zero = False
         try:
             car_web.build_aux_btn_frame(0, 1000)
@@ -1360,9 +1362,13 @@ def run(checker: Checker, base: str, args) -> None:
             and car_web.xor_bcc(f_aux[:9]) == f_aux[9]
             and f_aux_both[2] == 3 and f_aux_both[3] == 255   # 99999 夹到 5000 ms
             and f_aux_def[3] == 0                             # 0 = 用固件默认值
+            and f_aux_200[3] == 20                            # 200 ms = 默认普通按键
+            and f_aux_min[3] == 3                             # 5 ms 夹到下限 30 ms
+            and car_web.AUX_BTN_DEFAULT_MS == 200
             and err_zero,
-            "f=%s both=%s def=%s 空掩码抛错=%s" % (
-                f_aux.hex(), f_aux_both.hex(), f_aux_def.hex(), err_zero))
+            "f=%s both=%s def=%s 200ms=%s min=%s 空掩码抛错=%s" % (
+                f_aux.hex(), f_aux_both.hex(), f_aux_def.hex(),
+                f_aux_200.hex(), f_aux_min.hex(), err_zero))
 
         # 54：状态帧 [39] 的 bit3/4/5 解码
         st_f = bytearray(car_web.ST_SIZE)

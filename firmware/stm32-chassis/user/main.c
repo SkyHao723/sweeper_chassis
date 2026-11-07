@@ -177,7 +177,7 @@
 #define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 (ENABLE=1 时才用) */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      5           /* 状态帧 [30] 版本号: v5 (+洗地车辅助按钮, 帧格式不变) */
+#define STATUS_VERSION      6           /* 状态帧 [30] 版本号: v6 (辅助按钮默认时长 1000->200 ms) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -824,7 +824,7 @@ static void Cmd_Apply(const uint8_t *f)
     /* ---- 主机功能帧: f[1]=FUNC_AUX_BTN, 模拟按一下辅助按钮(仅洗地车) ---- */
     if (f[1] == FUNC_AUX_BTN)
     {
-        AuxBtn_Trigger(f[2], f[3]);     /* f[2]=掩码(f[3] 单位 10 ms, 0=默认 1 s) */
+        AuxBtn_Trigger(f[2], f[3]);     /* f[2]=掩码(f[3] 单位 10 ms, 0=默认 200 ms) */
         return;                         /* 功能帧不当速度帧用, 目标保持原值 */
     }
 
@@ -891,7 +891,7 @@ static void Port_ProcessCommands(void)
 
 /* 旧板上的滚刷/水泵继电器引脚。继电器逻辑已删, 但这两个引脚现在被
    **洗地车的辅助按钮**复用(PB0/PB1: 空闲上拉输入, 收到 FUNC_AUX_BTN 后
-   拉低 1 s 再回上拉, 见后面"辅助按钮输出"一节)。宏名保留: 旧接线图、
+   拉低 AUX_BTN_MS(默认 200 ms) 再回上拉, 见后面"辅助按钮输出"一节)。宏名保留: 旧接线图、
    旧工具和现场排线记录都按这两个名字引用。 */
 #define RELAY_BRUSH_PIN GPIO_Pin_0
 #define RELAY_PUMP_PIN  GPIO_Pin_1
@@ -953,7 +953,7 @@ static void LED_Tick(void)
  * 硬件: 洗地车 PB0 / PB1 各接一个按钮(或按钮式执行器的输入端)。
  *   空闲: 引脚 = **输入 + 上拉** -> 对方读到高电平, 相当于"没按";
  *   动作: 上位机下令后, 把对应引脚切成**推挽输出低电平**, 相当于"按下",
- *         保持 AUX_BTN_MS = 1000 ms, 然后恢复成输入上拉("松开")。
+ *         保持 AUX_BTN_MS = 200 ms(普通按键手感), 然后恢复成输入上拉("松开")。
  *
  * 为什么"上拉输入 -> 输出低 -> 回上拉"而不是"输出高/低":
  *   对方那侧本来就是靠上拉判断开/合的干接点式输入, 我们只是把这条线
@@ -966,13 +966,15 @@ static void LED_Tick(void)
  *
  * 命令帧: f[1] = FUNC_AUX_BTN(0x09), f[2] = 按钮掩码
  *   f[2].bit0 -> PB0   f[2].bit1 -> PB1   (可以同时按)
- *   f[3] = 保持时间, 单位 10 ms; 0 = 用默认 1000 ms (上限 5000 ms)
+ *   f[3] = 保持时间, 单位 10 ms; 0 = 用默认 200 ms
+ *          (上限 5000 ms, 下限 30 ms —— 太短了对方可能来不及消抖)
  *   这条帧**不改速度目标**, 车该怎么跑还怎么跑。
  *
  * 扫地车(sweeper)不接这两个按钮: 整个功能在 sweeper 里编成空操作,
  * 但仍然能安全收到该帧(不会被执行成速度命令)。
  *=====================================================================*/
-#define AUX_BTN_MS          1000        /* 默认"按下"保持时间 */
+#define AUX_BTN_MS          200         /* 默认"按下"保持时间(普通按键手感) */
+#define AUX_BTN_MIN_MS      30          /* 下限: 太短了对方来不及消抖 */
 #define AUX_BTN_MAX_MS      5000        /* 上位机自定义时长上限 */
 
 #if (VEHICLE_SEL == 2)                  /* 洗地车才有 */
@@ -1044,6 +1046,10 @@ static void AuxBtn_Trigger(uint8_t mask, uint8_t hold_10ms)
     if (hold == 0)
     {
         hold = AUX_BTN_MS;
+    }
+    if (hold < AUX_BTN_MIN_MS)
+    {
+        hold = AUX_BTN_MIN_MS;
     }
     if (hold > AUX_BTN_MAX_MS)
     {
