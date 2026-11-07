@@ -257,7 +257,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 |---|---|---|
 | 收帧/校验 | `Cmd_FeedByte()` / `Cmd_Verify()` | 帧头 `0x7B`、帧尾 `0x7D`、BCC 全对才接受；**非法帧丢弃且不刷新看门狗** |
 | 解析 | `Cmd_Apply()`（`g_cmd_vx_mm = f[3]<<8\|f[4]`） | `vx` mm/s、`wz` mrad/s，大端 int16 |
-| 有效期 | `Bridge_Update()`：老行为 `CMD_TIMEOUT_MS = 800`（命令年龄）；**心跳模式** `HB_TIMEOUT_MS = 300`（链路年龄，目标锁存） | 过期 → `g_eff_* = 0`（**只清零，不失能**：失能=输出关断=不制动会溜车） |
+| 有效期 | `Bridge_Update()`：`CMD_TIMEOUT_MS = 800`（命令年龄，唯一一条看门狗） | 过期 → `g_eff_* = 0`，按 `RAMP_TIMEOUT_DEC = 0.70 m/s²` 软停（**只清零，不失能**：失能=输出关断=不制动会溜车） |
 | **缓起缓停** | `Control_Tick()`：`Ramp_Step(g_ramp_vx, vx, RAMP_VX_ACC·dt, RAMP_VX_DEC·dt)` | **逆解之前**先对 `vx`/`wz` 做斜坡，保证起步/停车时两轮比例始终正确 |
 | 逆解 | `Control_Tick()`：`v_left = vx − wz·TRACK/2`、`v_right = vx + wz·TRACK/2` | 2.3 节公式 |
 | 换算+夹取 | `g_target_omega[i] = DM_DIR_x * ClampF(v/R, ±MAX_OMEGA_RAD_S)` | `MAX_OMEGA_RAD_S = 30` |
@@ -305,7 +305,7 @@ v_actual = (r'/r) · v_cmd                 ← 只由轮径决定
 | 误解 | 事实 |
 |---|---|
 | "`cmd_vel` 是位置指令" | 是**速度**指令；位置是导航层的事 |
-| "发一次就够，底盘会一直跑" | 默认不会：老行为是 800 ms 收不到就归零停车。发过心跳帧（`f[1]=0x08`）进入**心跳模式**后才会锁存最后命令，此时靠 300 ms 链路看门狗兜底 |
+| "发一次就够，底盘会一直跑" | 不会：800 ms 收不到新命令就软停（`CMD_TIMEOUT_MS`，唯一一条看门狗）。想连续走就连续发（teleop 按住会由终端 key repeat 产生 ~30 Hz 命令流） |
 | "`linear.y` 可以用来横移" | 差速车无横移自由度，固件直接丢弃 |
 | "`wz>0` 是右转" | ROS 约定 **正 = 逆时针 = 左转** |
 | "轮速就是 RPM 直接发" | 发的是 **rad/s**，且要先做差速逆解 + 乘安装方向系数 |

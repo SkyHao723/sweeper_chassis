@@ -26,12 +26,12 @@
     38 最高档 ultra：实发 vx = 1.60 m/s，且不超过硬夹 2.0 / 固件 2.565
     39 最高档 ultra：实发 wz = 1.50 rad/s，且轮速不超固件 30 rad/s
   * 新增信息显示（40~45）：
-    40 版本号 1.5.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
+    40 版本号 1.5.1；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）
     41 44B 新字段齐全且合理：位置/偏差/跟随度/温度分级/反馈年龄/CAN/启动阶段
     42 ERR 中文映射完整（0/1 正常，5~E 按达妙错误码翻译）
     43 颜色分级阈值：温度 >70 橙 / >85 红；反馈年龄 >200 橙 / >500 红
     44 390px 移动端无横向溢出，左右轮详情 + IMU 模长 + 反馈年龄都在
-    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.5.0）
+    45 页面新增值真实渲染（年龄 ms、温度、ERR 使能、|a|≈9.81、版本 1.5.1）
   * 1.4.0 手机端顿挫 / 链路抖动诊断（46~52）：
     46 摇杆 pad/knob/pad-wrap 都有 touch-action:none、页面禁下拉刷新、
        摇杆 touch 监听 passive:false、pointercancel 有处理
@@ -703,16 +703,8 @@ def run(checker: Checker, base: str, args) -> None:
                   and wz_mrad == -500,
                   "wz_mrad=%s frame=%s" % (wz_mrad, frame.hex()))
 
-    # 24b 心跳帧（固件 v3+ 用它把看门狗从"命令"切成"链路"）
-    hb = car_web.build_heartbeat_frame()
-    hb_bcc = 0
-    for b in hb[0:9]:
-        hb_bcc ^= b
-    checker.check(53, "心跳帧：11 字节/帧头帧尾对/f[1]=0x08/全零负载/BCC 正确",
-                  len(hb) == 11 and hb[0] == 0x7B and hb[10] == 0x7D
-                  and hb[1] == 0x08 and hb[2:9] == b"\x00" * 7
-                  and hb[9] == hb_bcc,
-                  "frame=%s" % hb.hex())
+    # 注意：固件侧的心跳机制（f[1]=0x08）已在 2026-11-07 移除，
+    # car_web 也不再发心跳帧 —— 原来的第 53 项（心跳帧格式）随之删除。
 
     # ---------------- 新增 25~27（浏览器端到端）----------------
     # 25 无 JS 异常/无横向溢出/canvas 有绘制
@@ -1046,7 +1038,7 @@ def run(checker: Checker, base: str, args) -> None:
     imu = st.get("imu") or {}
     checker.check(
         40, "版本 1.4.0；IMU 加速度模长 |a|≈9.81（由 24B 帧 ax/ay/az 计算）",
-        st.get("version") == "1.5.0"
+        st.get("version") == "1.5.1"
         and 8.5 <= imu.get("accel_mag", 0.0) <= 11.0
         and abs(imu.get("tilt_deg", 99.0)) < 5.0
         and imu.get("gyro_mag", 99.0) < 0.5
@@ -1173,10 +1165,10 @@ def run(checker: Checker, base: str, args) -> None:
             })()""")
             note = (vals or {}).get("note", "")
             checker.check(
-                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.5.0",
+                45, "页面新增值：反馈年龄 ms / 温度 / ERR 使能 / |a|≈9.81 / 版本 1.5.1",
                 vals
-                and "1.5.0" in vals["version"]
-                and "1.5.0" in vals["cssHref"] and "1.5.0" in vals["jsSrc"]
+                and "1.5.1" in vals["version"]
+                and "1.5.1" in vals["cssHref"] and "1.5.1" in vals["jsSrc"]
                 and vals["age"].endswith(" ms") and "ok" in vals["ageCls"]
                 and vals["mos"].isdigit() and vals["coil"].isdigit()
                 and math.isfinite(float(vals["pos"]))

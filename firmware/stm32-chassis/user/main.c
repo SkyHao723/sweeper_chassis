@@ -152,25 +152,22 @@
 #define RAMP_WZ_ACC         4.0f        /* 角速度加速 rad/s^2 (同 web) */
 #define RAMP_WZ_DEC         1.5f        /* 角速度减速 rad/s^2 (同 web) */
 
-/* ★ 2026-11-06 定稿的停车语义 (只有两种情况会"急停", 其余一律软停):
+/* ★ 2026-11-07 定稿的停车语义 (只有一种情况会"急停", 其余一律软停):
  *
- *   1) **心跳模式下的链路超时** (HB_TIMEOUT_MS=300 ms): 立即急停 —— 斜坡
- *      状态清零、目标直接给 0。这是整个底盘**唯一**的瞬停时机, 含义是
- *      "上位机进程崩了 / 串口线掉了 / 主机死机了", 必须马上停。
- *   2) 任一电机反馈掉线 (FB_TIMEOUT_MS): 同样立即急停(车可能正在动)。
+ *   唯一的急停入口: 任一电机反馈掉线 (FB_TIMEOUT_MS=2000 ms) —— 车可能
+ *   正在动, 必须马上停(斜坡状态清零、目标直接给 0)。
  *
  *   其余全部软停, 用减速斜坡:
- *      * 正常停车(收到 0 目标):         RAMP_VX_DEC  = 0.40 m/s^2 (丝滑)
- *      * 非心跳模式下命令超时(800 ms):  RAMP_TIMEOUT_DEC = 0.70 m/s^2
- *        (键盘 teleop 一次按键只发一帧, 每 800 ms 必然超时一次, 用瞬停的话
- *         手感就是"松手立刻停住、看不到减速"; 但也不能太慢, 所以比正常
- *         减速快一些)
+ *      * 正常停车(收到 0 目标):        RAMP_VX_DEC  = 0.40 m/s^2 (丝滑)
+ *      * 命令超时(CMD_TIMEOUT_MS):     RAMP_TIMEOUT_DEC = 0.70 m/s^2
+ *        (键盘 teleop 一次按键只发一帧, 松手后必然超时一次; 用瞬停的话
+ *         手感就是"松手立刻停住、看不到减速", 所以给一个稍快的斜坡)
  */
-#define RAMP_TIMEOUT_DEC    0.70f       /* 非心跳模式命令超时: 线速度减速 m/s^2 */
-#define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 非心跳模式命令超时: 角速度减速 rad/s^2 */
+#define RAMP_TIMEOUT_DEC    0.70f       /* 命令超时: 线速度减速 m/s^2 */
+#define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      3           /* 状态帧 [30] 版本号: v2 = 功能帧(重新使能), v3 = 心跳帧(链路看门狗) */
+#define STATUS_VERSION      3           /* 状态帧 [30] 版本号: v3 (心跳帧已移除, 帧格式不变) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -765,54 +762,23 @@ static uint8_t g_cmd_len;
 static uint8_t  g_reinit_ok;               /* 成功执行次数 (饱和) */
 static uint8_t  g_reinit_reject;           /* 因车没停被拒次数 (饱和) */
 
-/*==================== 心跳帧 + 看门狗语义切换 (v3 新增) =================
- * 为什么要有心跳帧:
- *   原来的看门狗看的是"最近一条速度命令"。上位机只要没有新的速度要发
- *   (比如手柄松手、Nav2 这一拍没出 cmd_vel), 就等同于"链路掉了" —— 车
- *   必须停。但这两件事其实不是一回事:
- *       A. 上位机还活着, 只是没有新命令  -> 应该保持上一条命令
- *       B. 上位机真的没了                 -> 必须停
- *   心跳帧就是把 A 和 B 分开:
- *       f[1] = 0x08: FUNC_HEARTBEAT —— 只"续命", 不改任何目标
+/*==================== 看门狗: 只有"命令超时"一种 ========================
+ * 判据: 距最近一条合法命令帧超过 CMD_TIMEOUT_MS 没消息 -> 目标清零(软停)。
+ * 这条判据同时覆盖两种情况, 不区分:
+ *   A. 上位机还活着, 只是没有新命令(键盘松手、这一拍没出 cmd_vel)
+ *   B. 上位机真的没了(进程崩了/线掉了)
+ * 两种情况都该停, 所以不需要额外的心跳帧来区分 —— 心跳机制已移除。
  *
- * 语义(向后兼容, 关键):
- *   - 任何一条合法帧(速度帧或心跳帧)都同时刷新"链路存活"计时,
- *     所以老上位机(只发速度帧)一条心跳都不发也照常工作;
- *   - **收到过至少一条心跳帧之后**, 固件才进入"心跳模式":
- *         看门狗计时 = HB_TIMEOUT_MS (默认 300 ms, 比 800 更快抓到真掉线)
- *         速度目标     = 锁存最后一条命令, 不再因为"没发新命令"而过期
- *   - 没收到过心跳 = 保持老行为 (CMD_TIMEOUT_MS = 800 ms 命令看门狗)。
- *
- * ★ 安全含义要说清楚: 心跳模式下车会**一直执行最后一条命令**, 直到
- *   ①上位机发新命令(含 0) ②心跳断掉。所以发心跳的一方必须保证:
- *   "自己还在跑"和"还想让车按这条命令跑"是同一件事。car_web 这类
- *   单进程独占串口的工具适合; 中间隔了一层 broker 的场景要小心。
+ * ★ 唯一会"瞬停"(瞬间清斜坡)的入口: 任一电机反馈掉线(FB_TIMEOUT_MS)。
+ *   其余一律软停, 走 RAMP_TIMEOUT_DEC / RAMP_VX_DEC 斜坡。
  *=====================================================================*/
-#define FUNC_HEARTBEAT             0x08
-#define HB_TIMEOUT_MS              300     /* 心跳模式下的链路看门狗 */
-#define HB_STALE_MS                600     /* 心跳源消失判定: 超过这么久没收到心跳帧 -> 退出心跳模式 */
-#define HB_ENABLE                  1       /* 0 = 完全退回老的 800 ms 命令看门狗 */
-static uint32_t g_hb_last_ms;              /* 最近一次收到任何合法帧的时刻 */
-static uint8_t  g_hb_mode;                 /* 1 = 已进入心跳模式 */
 
 static void Motors_Startup(void);          /* 定义在文件后半, 这里先声明 */
 
 static void Cmd_Apply(const uint8_t *f)
 {
-    /* 能进到这里说明帧头、帧尾、BCC 全对, 足以证明上位机活着。
-       两条计时都刷新: g_last_cmd_ms 给"老命令看门狗"用,
-       g_hb_last_ms 给"心跳模式链路看门狗"用(速度帧也算心跳)。 */
+    /* 能进到这里说明帧头、帧尾、BCC 全对 —— 刷新命令看门狗。 */
     g_last_cmd_ms = g_tick_ms;
-    g_hb_last_ms = g_tick_ms;
-
-    /* ---- 心跳帧: 只续命, 不改目标, 也绝不触碰速度指令 ---- */
-#if HB_ENABLE
-    if (f[1] == FUNC_HEARTBEAT)
-    {
-        g_hb_mode = 1;
-        return;
-    }
-#endif
 
     /* ---- 主机功能帧: f[1]=FUNC_MOTOR_REINIT, 重新写模式 + 使能 ---- */
     if (f[1] == FUNC_MOTOR_REINIT)
@@ -1290,38 +1256,8 @@ static void Send_MainTelemetry(void)
  *=====================================================================*/
 static void Bridge_Update(uint32_t now)
 {
-#if HB_ENABLE
-    /* 心跳模式: 只看"链路还活着吗", 不看"有没有新命令"。
-       速度目标锁存最后一条命令, 直到上位机发新命令或心跳断掉。
-       ★ 但心跳模式**不能永久粘住**: 一旦心跳源(比如 car_web)退出, 后面来的
-       只有键盘/ROS 的一次性速度帧; 若还按 300 ms 心跳看门狗算, 每帧命令
-       只能管 300 ms, 松键就超时 —— 车"走一下突然停", 且目标永远在超时和
-       恢复之间抖。所以加"心跳源消失"判定: 超过 HB_STALE_MS 没收到心跳帧
-       就清掉 g_hb_mode, 回到老的 800 ms 命令看门狗(任何帧都续命)。 */
-    if (g_hb_mode && ((now - g_hb_last_ms) > HB_STALE_MS))
-    {
-        g_hb_mode = 0;
-    }
-
-    if (g_hb_mode)
-    {
-        g_cmd_timeout = ((now - g_hb_last_ms) > HB_TIMEOUT_MS) ? 1 : 0;
-        if (g_cmd_timeout)
-        {
-            /* 心跳断了 = 上位机没了: 立即急停(Control_Tick 里会清斜坡),
-               同时**丢弃锁存的命令** —— 否则链路闪断一次恢复后, 车会自己
-               又按断线前那条命令冲出去。恢复后必须由上位机重新下发命令。 */
-            g_cmd_vx_mm   = 0;
-            g_cmd_wz_mrad = 0;
-        }
-    }
-    else
-    {
-        g_cmd_timeout = ((now - g_last_cmd_ms) > CMD_TIMEOUT_MS) ? 1 : 0;
-    }
-#else
+    /* 命令超时: 距最近一条合法命令帧超过 CMD_TIMEOUT_MS 就清零目标(软停)。 */
     g_cmd_timeout = ((now - g_last_cmd_ms) > CMD_TIMEOUT_MS) ? 1 : 0;
-#endif
 
     if (g_cmd_timeout)
     {
@@ -1366,13 +1302,12 @@ static void Control_Tick(void)
 
 #if RAMP_ENABLE
     /* ---- 缓起缓停 ----
-     * 急停只有两个入口(见上面 RAMP_TIMEOUT_DEC 上的说明):
-     *   a) 心跳模式 + 链路超时(300 ms) —— 上位机进程/串口/主机没了;
-     *   b) 任一电机反馈掉线(FB_TIMEOUT_MS) —— 车可能正在动, 必须马上停。
-     * 其余情况一律走斜坡: 正常减速用 RAMP_VX_DEC(丝滑), 非心跳模式的
-     * 命令超时用 RAMP_TIMEOUT_DEC(比正常减速快, 但仍然看得见减速过程)。 */
-    if ((g_hb_mode && g_cmd_timeout) ||
-        (!g_online[0]) || (!g_online[1]))
+     * 唯一的急停入口: 任一电机反馈掉线(FB_TIMEOUT_MS) —— 车可能正在动,
+     *   必须马上停, 而且避免它重新上线时从一个很高的斜坡值瞬间跳到目标。
+     * 其余情况一律走斜坡: 正常减速用 RAMP_VX_DEC(丝滑),
+     *   命令超时(CMD_TIMEOUT_MS, 上位机没消息了)用 RAMP_TIMEOUT_DEC ——
+     *   比正常减速快一点, 但仍然看得见减速过程, 不会"啪"一下停住。 */
+    if ((!g_online[0]) || (!g_online[1]))
     {
         g_ramp_vx = 0.0f;
         g_ramp_wz = 0.0f;
@@ -1381,7 +1316,7 @@ static void Control_Tick(void)
     {
         float dec_vx = RAMP_VX_DEC;
         float dec_wz = RAMP_WZ_DEC;
-        if (g_cmd_timeout)          /* 只可能是非心跳模式的命令超时 */
+        if (g_cmd_timeout)          /* 命令超时 -> 稍快地软停 */
         {
             dec_vx = RAMP_TIMEOUT_DEC;
             dec_wz = RAMP_TIMEOUT_WZ_DEC;
@@ -1454,8 +1389,7 @@ static void Control_Tick(void)
  *   [41] 低 3 位 = 启动阶段/错误码 (以前恒 0):
  *        0=启动中(串口上不会出现, 帧都在主循环里发) 1=正常
  *        2=CAN 初始化失败已降级  3=IMU 从没读到已跳过  4=两者都失败
- *        **bit7 = 已进入心跳模式**(= 收到过 f[1]=0x08 心跳帧):
- *        此时链路看门狗是 300 ms 且速度目标锁存; 清 0 = 老的 800 ms 命令看门狗。
+ *        bit7 恒 0 (心跳机制已移除, 保留这一位只为不改变帧格式)。
  *        老上位机只读低 3 位, 不受影响。
  *   [42] BCC = XOR(f[0..41])         [43] 0x7D
  *
@@ -1569,10 +1503,8 @@ static void Status_Send(uint32_t now)
     f[38] = imu_found_addr;
     f[39] = (uint8_t)(imu_probe_flags | (uint8_t)(imu_gyro_ok ? 0x80 : 0x00));
     f[40] = imu_ver_major;
-    f[41] = (uint8_t)(BootStage() | (uint8_t)(g_hb_mode ? 0x80 : 0x00));
-    /* [41] 高 bit7 置 1 = 已进入**心跳模式**(链路看门狗 300 ms, 目标锁存);
-       bit0..2 = 启动阶段/错误码 (0~4)。加之前该字节恒 0~4, 老上位机读
-       bit0..2 不受影响。 */
+    f[41] = (uint8_t)BootStage();
+    /* bit0..2 = 启动阶段/错误码 (0~4); bit7 恒 0 (心跳机制已移除)。 */
 
     for (i = 0; i < STATUS_FRAME_SIZE - 2; i++)
     {

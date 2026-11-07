@@ -73,13 +73,11 @@ from urllib.parse import unquote, urlparse
 
 # 页面/接口版本：改前端静态资源时一定要一起改，index.html 的 ?v= 会跟着变，
 # 否则浏览器会拿缓存的旧 app.js 跑新 HTML（现场排查过好几次）。
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
 CMD_SIZE = 11
-FUNC_HEARTBEAT = 0x08    # 心跳帧 f[1]：只续命、不改目标（固件 v3+ 才有意义）
-HB_PERIOD_S = 0.2        # 心跳 5 Hz
 
 TEL_HEAD = 0x7B          # 24 字节主遥测帧（含 IMU 六轴）
 TEL_TAIL = 0x7D
@@ -345,31 +343,6 @@ def build_cmd_frame(vx_m_s: float, wz_rad_s: float) -> bytes:
     return bytes(f)
 
 
-def build_heartbeat_frame() -> bytes:
-    """组 11 字节心跳帧（f[1] = 0x08 FUNC_HEARTBEAT）。
-
-    只"续命"，不带任何速度信息 —— 固件收到后既不改目标、也不动斜坡。
-    用途：让固件进入**心跳模式**（链路看门狗 300 ms + 速度目标锁存），
-    这样"上位机真的掉了"能在 300 ms 内被抓到，而"上位机只是没发新命令"
-    不会被误判成掉线。老固件（< v3）不认识 0x08，会把它当成
-    AutoRecharge 标志位忽略 —— 帧本身合法（帧头/帧尾/BCC 都对），
-    不会造成解析错乱，只是退化成老行为。
-    """
-    f = bytearray(CMD_SIZE)
-    f[0] = CMD_HEAD
-    f[1] = FUNC_HEARTBEAT         # 0x08：只续命、不改目标
-    f[2] = 0
-    f[3] = 0
-    f[4] = 0
-    f[5] = 0
-    f[6] = 0
-    f[7] = 0
-    f[8] = 0
-    f[9] = xor_bcc(bytes(f[0:9]))
-    f[10] = CMD_TAIL
-    return bytes(f)
-
-
 def decode_telemetry(f: bytes) -> dict[str, Any]:
     """解析 24 字节主遥测帧。调用前必须已通过 帧头/帧尾/BCC 校验。"""
     return {
@@ -428,8 +401,7 @@ def decode_status(f: bytes) -> dict[str, Any]:
             "enabled": flags["left_enabled" if i == 0 else "right_enabled"],
         }
 
-    boot = f[41] & 0x07          # 低 3 位才是启动阶段；bit7 = 心跳模式(固件 v3+)
-    hb_mode = bool(f[41] & 0x80)  # 链路看门狗 300 ms + 目标锁存
+    boot = f[41] & 0x07          # 低 3 位才是启动阶段；bit7 恒 0（心跳机制已移除）
     return {
         "flags_raw": raw_flags,
         "flags": flags,
@@ -452,8 +424,6 @@ def decode_status(f: bytes) -> dict[str, Any]:
         "imu_ver": f[40],
         "boot_stage": boot,
         "boot_stage_text": BOOT_STAGE_NAMES.get(boot, "未知(%d)" % boot),
-        "hb_mode": hb_mode,
-        "hb_mode_text": "心跳模式(链路看门狗 300 ms, 目标锁存)" if hb_mode else "命令看门狗(800 ms)",
         "boot_level": boot_level(boot),
     }
 
@@ -1516,7 +1486,6 @@ class LinkWorker(threading.Thread):
     def run(self) -> None:
         period = 1.0 / self.args.tx_hz
         next_tx = time.monotonic()
-        next_hb = time.monotonic()
         last_stats = time.monotonic()
         try:
             while not self._stop_evt.is_set():
@@ -1545,20 +1514,6 @@ class LinkWorker(threading.Thread):
 
                 # ---- 定时发命令帧（20~50 Hz）----
                 now = time.monotonic()
-
-                # 心跳帧：5 Hz，独立于命令帧。作用见 build_heartbeat_frame()。
-                # 之所以要单独发而不是"命令帧本身就当心跳"，是因为将来固件
-                # 可能要求"只有心跳帧才能进入心跳模式"；现在两者都算存活，
-                # 多这一帧的成本是 11 字节 × 5 Hz ≈ 0.5% 的串口带宽。
-                if now >= next_hb:
-                    try:
-                        self.link.write(build_heartbeat_frame())
-                    except Exception as exc:          # noqa: BLE001
-                        self._close("写心跳失败：%s" % exc)
-                        continue
-                    next_hb += HB_PERIOD_S
-                    if next_hb < now:
-                        next_hb = now + HB_PERIOD_S
 
                 if now >= next_tx:
                     # step_output 是唯一推进斜坡的地方：急停/超时/硬停立即归零，
@@ -1937,7 +1892,7 @@ class Handler(BaseHTTPRequestHandler):
                              st["cmd_vx"], st["cmd_wz"], st["boot_stage_text"],
                              st["boot_level"], st["imu_status_text"],
                              st["can_fail"], st["fb_count"]))
-            lines.append("  看门狗=%s" % st["hb_mode_text"])
+            lines.append("  看门狗=命令超时 800 ms（心跳机制已移除）")
         else:
             lines.append("状态: 还没有收到 0x7E 帧")
         lines.append("里程: %.3f m  偏航=%.1f°  急停=%s" %
