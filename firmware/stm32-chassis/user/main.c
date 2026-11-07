@@ -177,7 +177,7 @@
 #define RAMP_TIMEOUT_WZ_DEC 2.5f        /* 命令超时: 角速度减速 rad/s^2 (ENABLE=1 时才用) */
 
 #define LED_BLINK_MS        500         /* PB9 心跳翻转周期 */
-#define STATUS_VERSION      7           /* 状态帧 [30] 版本号: v7 (辅助按钮改驱动低边 MOS 栅极, 极性修正) */
+#define STATUS_VERSION      8           /* 状态帧 [30] 版本号: v8 (新增独立功能帧 0x7A) */
 #define STATUS_FRAME_SIZE   44
 #define STATUS_HEAD         0x7E
 #define STATUS_TAIL         0x7D
@@ -201,6 +201,28 @@
 #define CMD_FRAME_SIZE      11
 #define CMD_HEAD            0x7B
 #define CMD_TAIL            0x7D
+
+/*--------------------------- 功能帧 (独立帧类型) -------------------------
+ * 和速度帧**完全分开的一帧**, 有自己的帧头, 长度也不同:
+ *
+ *   [0] 0x7A 帧头
+ *   [1] func  功能码
+ *   [2] p0    [3] p1    [4] p2    [5] p3      参数(按功能码定义)
+ *   [6] BCC   = XOR(f[0..5])
+ *   [7] 0x7D 帧尾
+ *
+ * 为什么单独一帧: 速度帧是 20 ms 一拍的高频流, 功能命令(按按钮/重新使能)
+ * 是偶发事件。分开以后上位机可以只在需要时发, 不会和速度帧抢字段,
+ * 也不用担心"功能帧被当成速度帧"。速度帧的解析**一个字节都没动**。
+ *
+ * 已有的功能码:
+ *   func=0x01 按一下辅助按钮: p0 = 按钮掩码(bit0 PB0 刷盘 / bit1 PB1 风机)
+ *                              p1 = 保持时间 ×10 ms (0 = 默认 200 ms)
+ *                              p2/p3 保留填 0
+ *-----------------------------------------------------------------------*/
+#define FUNC_FRAME_SIZE     8
+#define FUNC_FRAME_HEAD     0x7A
+#define FUNC_ID_AUX_BTN     0x01        /* 按一下辅助按钮 */
 
 /*--------------------------- 达妙 DM 协议 --------------------------------
  * 控制帧 ID = 0x200 + CAN_ID, 速度模式下数据是 float32 小端 rad/s。
@@ -740,10 +762,15 @@ static void USART1_Init(void)
 }
 
 /*============================ 命令帧 ==================================
- * 11 字节, 大端:
+ * 主机 -> STM32 有**两种帧**, 靠帧头区分, 各走各的解析:
+ *
+ * ① 速度帧 (0x7B, 11 字节, 大端):
  *   [0]=0x7B  [1]=AutoRecharge(忽略)  [2]=SecurityPLY(忽略)
  *   [3..4]=vx int16 mm/s  [5..6]=vy(忽略)  [7..8]=wz int16 mrad/s
  *   [9]=XOR(f[0..8])  [10]=0x7D
+ *
+ * ② 功能帧 (0x7A, 8 字节) —— 见上面"功能帧 (独立帧类型)"的说明:
+ *   [0]=0x7A  [1]=func  [2..5]=参数  [6]=XOR(f[0..5])  [7]=0x7D
  *
  * 校验失败/头尾不对时**逐字节左移**重新找帧头。这样总线上丢一个字节
  * 之后, 最多 11 个字节就能重新对上, 不需要上位机复位。
@@ -756,6 +783,7 @@ static uint8_t g_cmd_len;
  *   f[1] = 0x00/0x01: 普通速度帧 (0x01 是旧协议的"回充"标志, 本固件忽略)
  *   f[1] = 0x06:      FUNC_MOTOR_REINIT —— 主机要求重新"写速度模式 + 使能"
  *   f[1] = 0x09:      FUNC_AUX_BTN —— 模拟按一下辅助按钮(仅洗地车, PB0/PB1)
+ *                     **旧写法, 仅为兼容保留**; 新代码请用功能帧 0x7A func=0x01
  *
  * 为什么需要: DM 驱动器上电后默认失能, 只能由 STM32 发 FFx7+0xFC 使能。
  * 而 STM32 只在**自己启动时**发一次(3 次重试, 总预算 400 ms)。整车断电
@@ -835,39 +863,111 @@ static void Cmd_Apply(const uint8_t *f)
        差速车没有横向自由度, 回充和安全防护由 RK3588 自己管。 */
 }
 
+/* ---- 功能帧 (0x7A, 8 字节): 与速度帧完全分开的一帧 ---- */
+static void Func_Apply(const uint8_t *f)
+{
+    switch (f[1])
+    {
+    case FUNC_ID_AUX_BTN:
+        /* p0 = 掩码(bit0 PB0 刷盘 / bit1 PB1 风机), p1 = 保持时间 ×10 ms */
+        AuxBtn_Trigger(f[2], f[3]);
+        break;
+
+    default:
+        /* 未知功能码: 静默丢弃。功能帧**不刷新**速度看门狗、不动速度目标,
+           这样"发错一帧功能命令"绝不会影响车怎么跑。 */
+        break;
+    }
+}
+
+/* 按帧头判断这一帧还要收多少字节; 返回 0 = 缓冲空, 返回 1 = 该丢一个字节 */
+static uint8_t Cmd_FrameNeed(void)
+{
+    if (g_cmd_len == 0)
+    {
+        return 0;
+    }
+    if (g_cmd_frame[0] == CMD_HEAD)
+    {
+        return CMD_FRAME_SIZE;
+    }
+    if (g_cmd_frame[0] == FUNC_FRAME_HEAD)
+    {
+        return FUNC_FRAME_SIZE;
+    }
+    return 1;
+}
+
 static void Cmd_FeedByte(uint8_t value)
 {
     uint8_t i;
     uint8_t bcc;
+    uint8_t need;
 
+    /* 缓冲最多 11 字节; 走到这里时一定已经处理过, 不会溢出 */
     if (g_cmd_len >= CMD_FRAME_SIZE)
     {
-        /* 上一帧校验没过: 丢掉最老的一个字节, 窗口左移一位 */
-        for (i = 1; i < CMD_FRAME_SIZE; i++)
+        for (i = 1; i < g_cmd_len; i++)
         {
             g_cmd_frame[i - 1] = g_cmd_frame[i];
         }
-        g_cmd_len = CMD_FRAME_SIZE - 1;
+        g_cmd_len--;
     }
 
     g_cmd_frame[g_cmd_len++] = value;
 
-    if (g_cmd_len == CMD_FRAME_SIZE)
+    for (;;)
     {
+        need = Cmd_FrameNeed();
+
+        if (need == 0)
+        {
+            return;
+        }
+
+        if (need == 1)
+        {
+            /* 帧头不认识: 丢掉最老的一个字节, 重新找帧头 */
+            for (i = 1; i < g_cmd_len; i++)
+            {
+                g_cmd_frame[i - 1] = g_cmd_frame[i];
+            }
+            g_cmd_len--;
+            continue;
+        }
+
+        if (g_cmd_len < need)
+        {
+            return;                 /* 这一帧还没收够 */
+        }
+
         bcc = 0;
-        for (i = 0; i < CMD_FRAME_SIZE - 2; i++)
+        for (i = 0; i < (uint8_t)(need - 2); i++)
         {
             bcc ^= g_cmd_frame[i];
         }
 
-        if ((g_cmd_frame[0] == CMD_HEAD) &&
-            (g_cmd_frame[CMD_FRAME_SIZE - 1] == CMD_TAIL) &&
-            (bcc == g_cmd_frame[CMD_FRAME_SIZE - 2]))
+        if ((g_cmd_frame[need - 1] == CMD_TAIL) &&
+            (bcc == g_cmd_frame[need - 2]))
         {
-            Cmd_Apply(g_cmd_frame);
+            if (g_cmd_frame[0] == CMD_HEAD)
+            {
+                Cmd_Apply(g_cmd_frame);
+            }
+            else
+            {
+                Func_Apply(g_cmd_frame);
+            }
             g_cmd_len = 0;
+            return;
         }
-        /* 校验失败: 保留 11 字节, 下个字节进来时再左移重试 */
+
+        /* 校验失败: 丢掉最老的一个字节, 继续找 */
+        for (i = 1; i < g_cmd_len; i++)
+        {
+            g_cmd_frame[i - 1] = g_cmd_frame[i];
+        }
+        g_cmd_len--;
     }
 }
 

@@ -75,18 +75,23 @@ from urllib.parse import unquote, urlparse
 
 # 页面/接口版本：改前端静态资源时一定要一起改，index.html 的 ?v= 会跟着变，
 # 否则浏览器会拿缓存的旧 app.js 跑新 HTML（现场排查过好几次）。
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
 CMD_SIZE = 11
 
 # 主机功能帧（f[1]）。速度帧是 0x00/0x01，功能帧不会改变速度目标。
-FUNC_AUX_BTN = 0x09      # 模拟按一下洗地车辅助按钮（PB0=刷盘 / PB1=风机），固件 v5+
+FUNC_AUX_BTN = 0x09      # 【旧写法·仅兼容】辅助按钮塞在 0x7B 速度帧里，固件 v5~v7
 AUX_BTN_NAMES = {0x01: "PB0(刷盘)", 0x02: "PB1(风机)", 0x03: "PB0+PB1"}
 AUX_BTN_DEFAULT_MS = 200     # 与固件 AUX_BTN_MS 一致（v6 起 200 ms，普通按键手感）
 AUX_BTN_MIN_MS = 30          # 与固件 AUX_BTN_MIN_MS 一致（太短对方来不及消抖）
 AUX_BTN_MAX_MS = 5000        # 与固件 AUX_BTN_MAX_MS 一致
+
+# 功能帧（0x7A，8 字节）—— 和速度帧完全分离的一帧，固件 v8+
+FUNC_FRAME_HEAD = 0x7A
+FUNC_FRAME_SIZE = 8
+FUNC_ID_AUX_BTN = 0x01   # p0=掩码，p1=保持时间 ×10 ms（0=默认 200 ms），p2/p3 保留
 
 TEL_HEAD = 0x7B          # 24 字节主遥测帧（含 IMU 六轴）
 TEL_TAIL = 0x7D
@@ -352,35 +357,64 @@ def build_cmd_frame(vx_m_s: float, wz_rad_s: float) -> bytes:
     return bytes(f)
 
 
+def _clamp_hold_10ms(hold_ms: int) -> int:
+    """把"保持时间(ms)"换成帧里那个字节：0 = 交给固件用默认 200 ms。"""
+    if int(hold_ms) <= 0:
+        return 0
+    return int(clamp(round(float(hold_ms) / 10.0),
+                     round(AUX_BTN_MIN_MS / 10.0), 255))
+
+
+def build_func_frame(func: int, p0: int = 0, p1: int = 0,
+                     p2: int = 0, p3: int = 0) -> bytes:
+    """组 8 字节**功能帧**（固件 v8+，独立帧类型，与速度帧分离）::
+
+        7A <func> <p0> <p1> <p2> <p3> <BCC> 7D
+                                    └ BCC = XOR(f[0..5])
+
+    功能帧不碰速度目标、也不喂速度看门狗，所以发功能命令不会影响车怎么跑。
+    """
+    f = bytearray(FUNC_FRAME_SIZE)
+    f[0] = FUNC_FRAME_HEAD
+    f[1] = int(func) & 0xFF
+    f[2] = int(p0) & 0xFF
+    f[3] = int(p1) & 0xFF
+    f[4] = int(p2) & 0xFF
+    f[5] = int(p3) & 0xFF
+    f[6] = xor_bcc(bytes(f[0:6]))
+    f[7] = CMD_TAIL
+    return bytes(f)
+
+
+def build_aux_func_frame(mask: int, hold_ms: int = 0) -> bytes:
+    """组"按一下辅助按钮"的功能帧（0x7A func=0x01）—— 推荐写法。"""
+    mask = int(mask) & 0x03
+    if mask == 0:
+        raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
+    return build_func_frame(FUNC_ID_AUX_BTN, mask, _clamp_hold_10ms(hold_ms))
+
+
 def build_aux_btn_frame(mask: int, hold_ms: int = 0) -> bytes:
-    """组 11 字节"辅助按钮"功能帧（固件 v5，仅洗地车有实际动作）。
+    """组 11 字节"辅助按钮"功能帧（**旧写法**，固件 v5~v7 兼容用）。
 
     f[1] = 0x09 让固件走功能帧分支，**不改变速度目标**：
       固件侧把 PB0/PB1 栅极拉高 -> 低边 MOS(AO3400A) 导通 -> 对方按钮线接 GND（等于按下按钮），
       保持 hold_ms（0=默认 200 ms，范围 30~5000 ms）后栅极拉低 -> MOS 关断 -> 线路放开。
     f[2] = 掩码：bit0 -> PB0，bit1 -> PB1（可同时按）
     f[3] = 保持时间，单位 10 ms（0 = 用固件默认值）
+
+    新代码请用 build_aux_func_frame()（0x7A 功能帧）。
     """
     mask = int(mask) & 0x03
     if mask == 0:
         raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
-    if int(hold_ms) <= 0:
-        hold_10ms = 0                     # 交给固件用默认时长
-    else:
-        hold_10ms = int(round(clamp(float(hold_ms), float(AUX_BTN_MIN_MS),
-                                    float(AUX_BTN_MAX_MS)) / 10.0))
-    hold_10ms = int(clamp(hold_10ms, 0, 255))
+    hold_10ms = _clamp_hold_10ms(hold_ms)
 
     f = bytearray(CMD_SIZE)
     f[0] = CMD_HEAD
     f[1] = FUNC_AUX_BTN
     f[2] = mask
     f[3] = hold_10ms
-    f[4] = 0
-    f[5] = 0
-    f[6] = 0
-    f[7] = 0
-    f[8] = 0
     f[9] = xor_bcc(bytes(f[0:9]))
     f[10] = CMD_TAIL
     return bytes(f)
@@ -1363,6 +1397,8 @@ class SimChassis:
         self.cmd_wz = 0.0
         self.cmd_buf = bytearray()
         self.cmd_bad = 0
+        self.func_buf = bytearray()      # 功能帧（0x7A, 8 字节）独立缓冲
+        self.func_count = 0
 
         # 轮子状态（电机原始 ω，方向系数按车型分：DM_DIR_LEFT / DM_DIR_RIGHT，
         # 扫地车左轮 +1、右轮 -1，洗地车两个都 -1；见 docs/vehicle-params.md §4.1）
@@ -1396,6 +1432,27 @@ class SimChassis:
     # -- 命令解析：逐字节左移重试，和固件 Cmd_FeedByte 等价 -------------
     def write(self, data: bytes) -> None:
         for b in data:
+            # 功能帧（0x7A, 8 字节）单独一条缓冲，和速度帧互不干扰
+            if len(self.func_buf) >= FUNC_FRAME_SIZE:
+                del self.func_buf[0]
+            self.func_buf.append(b)
+            if len(self.func_buf) == FUNC_FRAME_SIZE:
+                ff = bytes(self.func_buf)
+                if (ff[0] == FUNC_FRAME_HEAD and ff[7] == CMD_TAIL
+                        and xor_bcc(ff[:6]) == ff[6]):
+                    self.func_count += 1
+                    if ff[1] == FUNC_ID_AUX_BTN:
+                        # 按一下辅助按钮：不动速度，只记录"按了哪个按钮"
+                        self.aux_last_mask = ff[2] & 0x03
+                        hold = (ff[3] * 10) if ff[3] else AUX_BTN_DEFAULT_MS
+                        self.aux_until = time.monotonic() + hold / 1000.0
+                    self.func_buf.clear()
+                elif ff[0] == 0x7B:
+                    # 速度帧被错放进功能缓冲（不会发生），丢一个字节重找
+                    del self.func_buf[0]
+                else:
+                    del self.func_buf[0]
+
             if len(self.cmd_buf) >= CMD_SIZE:
                 del self.cmd_buf[0]
             self.cmd_buf.append(b)
@@ -1403,7 +1460,7 @@ class SimChassis:
                 f = bytes(self.cmd_buf)
                 if f[0] == CMD_HEAD and f[10] == CMD_TAIL and xor_bcc(f[:9]) == f[9]:
                     if f[1] == FUNC_AUX_BTN:
-                        # 功能帧：不动速度，只记录"按了哪个按钮"
+                        # 【旧写法】功能塞在速度帧里（固件 v5~v7 兼容）
                         self.aux_last_mask = f[2] & 0x03
                         hold = (f[3] * 10) if f[3] else AUX_BTN_DEFAULT_MS
                         self.aux_until = time.monotonic() + hold / 1000.0
@@ -1647,11 +1704,12 @@ class LinkWorker(threading.Thread):
                     try:
                         self.link.write(build_cmd_frame(vx, wz))
                         self.hub.on_tx(vx, wz, now)
-                        # 辅助按钮功能帧：紧跟命令帧后面发（物理上就是"按一下"），
+                        # 辅助按钮功能帧：紧跟命令帧后面发（物理上就是"按一下"）。
+                        # 用独立的 0x7A 功能帧（固件 v8+），不再塞进速度帧里。
                         # 请求来自 HTTP/WS 线程，只在这里取，避免多线程写串口。
                         aux_req = self.hub.take_aux_pending()
                         if aux_req is not None:
-                            self.link.write(build_aux_btn_frame(*aux_req))
+                            self.link.write(build_aux_func_frame(*aux_req))
                     except Exception as exc:          # noqa: BLE001
                         self._close("写失败：%s" % exc)
                         continue

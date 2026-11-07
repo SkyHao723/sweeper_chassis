@@ -2,9 +2,18 @@
 # -*- coding: utf-8 -*-
 """洗地车辅助按钮直连测试（不经 ROS / 不经 car_web）。
 
-固件 v5 新增功能帧 f[1]=0x09：把 PB0/PB1 栅极拉高，低边 MOS 导通
-（等于按一下物理按钮），保持 f[3]*10 ms（0=默认 200 ms，范围 30~5000 ms）
-后再拉低栅极放开。功能帧**不改变速度目标**。
+固件 v8 起用**独立的功能帧**（0x7A，8 字节，与速度帧完全分开）：
+
+    7A <func> <p0> <p1> <p2> <p3> <BCC> 7D      BCC = XOR(f[0..5])
+
+    func=0x01 按一下辅助按钮：p0 = 掩码（1=PB0 刷盘，2=PB1 风机，3=两个），
+              p1 = 保持时间 x10 ms（0 = 固件默认 200 ms，范围 30~5000 ms）
+
+固件把对应引脚（低边 MOS 的栅极）拉高 -> 管子导通 -> 对方按钮线接 GND
+（等于按一下物理按钮），到时间再拉低 -> 松开。功能帧**不改变速度目标**。
+
+（固件 v5~v7 的旧写法 f[1]=0x09 塞在 11 字节速度帧里，现在仍然兼容，
+  加 --legacy 可以验证那条老路径。）
 
 本脚本做的事：
   1. 打开底盘串口（默认 /dev/wheeltec_controller @115200）
@@ -16,14 +25,14 @@
 
 用法（在 RK3588 上，先停掉占串口的进程：car_web / wheeltec_robot_node）：
 
-    python3 aux_btn_test.py                       # 按 PB0 1 s
-    python3 aux_btn_test.py --mask 2              # 按 PB1
+    python3 aux_btn_test.py                       # 按一下刷盘(PB0, 200 ms)
+    python3 aux_btn_test.py --mask 2              # 按一下风机(PB1)
     python3 aux_btn_test.py --mask 3 --hold-ms 2000
     python3 aux_btn_test.py --port /dev/ttyUSB0 --cycles 3
 
 注意：
   - 固件 < v5（扫地车或老版本）会把这个帧当普通命令帧吃掉，看不到 bit3 变化；
-    脚本会打印 [30] 版本号，>=5 才是支持辅助按钮的固件。
+    脚本会打印 [30] 版本号：>=5 有辅助按钮；>=8 才有 0x7A 功能帧。
   - 功能帧不改变速度；但为安全起见脚本全程只发零速命令。
 """
 
@@ -39,8 +48,11 @@ CMD_SIZE = 11
 CMD_HEAD = 0x7B
 CMD_TAIL = 0x7D
 
-FUNC_AUX_BTN = 0x09
-AUX_NAMES = {0x01: "PB0", 0x02: "PB1", 0x03: "PB0+PB1"}
+FUNC_AUX_BTN = 0x09          # 旧写法（固件 v5~v7）：塞在速度帧里
+FUNC_FRAME_HEAD = 0x7A       # 功能帧（固件 v8+）
+FUNC_FRAME_SIZE = 8
+FUNC_ID_AUX_BTN = 0x01
+AUX_NAMES = {0x01: "PB0(刷盘)", 0x02: "PB1(风机)", 0x03: "PB0+PB1"}
 AUX_BTN_DEFAULT_MS = 200        # 与固件 AUX_BTN_MS 一致（v6 起）
 AUX_BTN_MIN_MS = 30             # 与固件 AUX_BTN_MIN_MS 一致
 AUX_BTN_MAX_MS = 5000
@@ -50,20 +62,38 @@ BIT_PB0 = 0x10        # 最近按过 PB0
 BIT_PB1 = 0x20        # 最近按过 PB1
 
 
-def build_aux_btn_frame(mask: int, hold_ms: int = 0) -> bytes:
-    """功能帧：f[1]=0x09, f[2]=掩码, f[3]=保持时间(单位 10 ms)。"""
+def _hold_10ms(hold_ms: int) -> int:
+    if int(hold_ms) <= 0:
+        return 0                     # 0 = 交给固件用默认 200 ms
+    hold = max(AUX_BTN_MIN_MS, min(int(hold_ms), AUX_BTN_MAX_MS))
+    return min(255, int(round(hold / 10.0)))
+
+
+def build_aux_func_frame(mask: int, hold_ms: int = 0) -> bytes:
+    """功能帧（固件 v8+，推荐）：0x7A func=0x01, p0=掩码, p1=保持时间(10 ms)。"""
     mask = int(mask) & 0x03
     if mask == 0:
         raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
-    hold = int(hold_ms) if hold_ms else AUX_BTN_DEFAULT_MS
-    hold = max(AUX_BTN_MIN_MS, min(int(hold), AUX_BTN_MAX_MS))
-    hold_10ms = min(255, int(round(hold / 10.0)))
+    f = bytearray(FUNC_FRAME_SIZE)
+    f[0] = FUNC_FRAME_HEAD
+    f[1] = FUNC_ID_AUX_BTN
+    f[2] = mask
+    f[3] = _hold_10ms(hold_ms)
+    f[6] = bcc8(f[0:6])
+    f[7] = CMD_TAIL
+    return bytes(f)
 
+
+def build_aux_btn_frame(mask: int, hold_ms: int = 0) -> bytes:
+    """旧写法（固件 v5~v7）：11 字节速度帧里 f[1]=0x09, f[2]=掩码, f[3]=保持时间(10 ms)。"""
+    mask = int(mask) & 0x03
+    if mask == 0:
+        raise ValueError("mask 至少选一个按钮（1=PB0, 2=PB1, 3=两个）")
     f = bytearray(CMD_SIZE)
     f[0] = CMD_HEAD
     f[1] = FUNC_AUX_BTN
     f[2] = mask
-    f[3] = hold_10ms
+    f[3] = _hold_10ms(hold_ms)
     f[9] = bcc8(f[0:9])
     f[10] = CMD_TAIL
     return bytes(f)
@@ -84,6 +114,8 @@ def main() -> int:
     ap.add_argument("--mask", type=int, default=1, help="1=PB0, 2=PB1, 3=两个")
     ap.add_argument("--hold-ms", type=int, default=0, help="0=固件默认 200 ms")
     ap.add_argument("--cycles", type=int, default=1, help="重复按几次")
+    ap.add_argument("--legacy", action="store_true",
+                    help="用旧写法（塞在 11 字节速度帧里, 固件 v5~v7）")
     ap.add_argument("--settle", type=float, default=0.6, help="按下后观察多久（s）")
     args = ap.parse_args()
 
@@ -165,7 +197,9 @@ def main() -> int:
                  AUX_NAMES.get(args.mask & 0x03, "?")), flush=True)
         mark = len(rows)
         hold = args.hold_ms or AUX_BTN_DEFAULT_MS
-        pump(0.4, extra=build_aux_btn_frame(args.mask, args.hold_ms))
+        pump(0.4, extra=(build_aux_btn_frame(args.mask, args.hold_ms)
+                           if args.legacy else
+                           build_aux_func_frame(args.mask, args.hold_ms)))
         pump(max(0.8, hold / 1000.0 + 0.4))
 
         seg = rows[mark:]
