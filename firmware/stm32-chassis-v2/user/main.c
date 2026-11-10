@@ -464,8 +464,11 @@ int main(void)
         Delay_ms(TICK_MS);
         tick++;
 
-        /* ---- 收上位机串口数据 (每次最多 32 字节, 不阻塞) ---- */
-        for (byte = 0; byte < 32u; byte++)
+        /* ---- 收上位机串口数据 (每次最多 128 字节, 不阻塞)
+               字节由 USART1 中断搬进 256B 环形缓冲, 这里排空;
+               10ms 一轮最多可以排 128 字节 = 12.8 kB/s, 比 115200 的 11.5 kB/s 略大,
+               所以连续高速发也不会溢出（真溢出了看 Board_UartRxOverrun()）。 ---- */
+        for (byte = 0; byte < 128u; byte++)
         {
             uint8_t value;
             if (Board_UartReadByte(&value) == 0u)

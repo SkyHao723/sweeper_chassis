@@ -76,8 +76,15 @@ void Board_UartSendBytes(const uint8_t *data, uint16_t length);
 void Board_UartSendU32(uint32_t value);
 void Board_UartSendHex8(uint8_t value);
 
-/* 非阻塞读一个字节: 1 = 读到 (放进 *out), 0 = 当前没有数据 */
+/* 非阻塞读一个字节: 1 = 读到 (放进 *out), 0 = 当前没有数据
+   字节由 USART1 接收中断搬进 256 字节环形缓冲, 主循环慢慢取不丢数据 */
 uint8_t Board_UartReadByte(uint8_t *out);
+
+/* 环形缓冲里还有多少字节没取走 */
+uint16_t Board_UartRxPending(void);
+
+/* 累计接收溢出次数（正常应一直为 0） */
+uint16_t Board_UartRxOverrun(void);
 
 /* 板载按键: 1 = 按下, 0 = 松开 */
 void Board_KeyInit(void);

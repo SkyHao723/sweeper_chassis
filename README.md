@@ -335,6 +335,9 @@ TB01-CAN-USART/
 │   ├── v2_monitor.py                解读 V2 的 32 字节遥测帧（串口实时 / --ram 读 RAM 快照）
 │   ├── v2_gamepad.py               手柄/遥控链路: 注入 15 字节 HID 帧(0x78) + 解析 0x79/0x7E 上行帧
 │   ├── v2_rcinject.py              无手柄时用 DAPLink 往 RC 环形缓冲塞 15 字节，验证解析与映射
+│   ├── v2_linkcheck.py             调试串口自测：发 100 帧后读 RAM 计数器判 PC->MCU 通不通/丢不丢
+│   ├── v2_uart_wire_probe.py       判定 CH343 的 TXD 接在哪个脚（读 GPIOA_IDR）
+│   ├── v2_uart_txprobe.py          判定 CH343 的 RXD 有没有接到 PA9（把 PA9 拉低看 PC 收到什么）
 │   ├── ramp_test.py                 直连串口做缓起缓停阶跃测试（发 11 B/收 44 B+24 B，存 JSON）
 │   ├── analyze_ramp.py              斜坡阶梯/到顶时间分析
 │   ├── imu_probe.py                 静态探测 IMU 状态位与六轴原始值（不动车）

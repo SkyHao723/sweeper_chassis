@@ -75,10 +75,53 @@ void Board_ParkUnusedPins(void)
 
 /* ------------------------------ 串口 ------------------------------ */
 
+/* 接收环形缓冲: USART1 用中断收, 主循环慢慢取。
+   ★ 2026-11-10: 原来是"主循环每 10ms 轮询一次 RXNE", 115200 下 87us 就来一个字节,
+   RDR 只能存 1 个, 结果 10ms 里最多收到 1 个字节, 其余全部溢出丢掉
+   -> 表现是"上位机发 100 帧, 计数器只涨几十、一帧都拼不出来"。
+   改成 RXNE 中断 + 256 字节环形缓冲后, 10ms 内来的 115 个字节一个都不丢。 */
+#define BOARD_UART_RX_RING 256u
+
+static volatile uint8_t  s_rx_buf[BOARD_UART_RX_RING];
+static volatile uint16_t s_rx_head;      /* 中断里写 */
+static volatile uint16_t s_rx_tail;      /* 主循环读 */
+static volatile uint16_t s_rx_overrun;   /* 溢出次数（理论上应该一直是 0）*/
+
+void USART1_IRQHandler(void)
+{
+    if (USART_GetITStatus(BOARD_UART, USART_IT_RXNE) != RESET)
+    {
+        uint8_t data = (uint8_t)(USART_ReceiveData(BOARD_UART) & 0xFF);
+        uint16_t next = (uint16_t)((s_rx_head + 1u) % BOARD_UART_RX_RING);
+        if (next != s_rx_tail)
+        {
+            s_rx_buf[s_rx_head] = data;
+            s_rx_head = next;
+        }
+        else
+        {
+            s_rx_overrun++;
+        }
+        /* 读 DR 已经把 RXNE 清了, 不用再手动清 */
+    }
+
+    /* 溢出错误: 必须在读 DR 之后清 ORE, 否则会一直触发中断 */
+    if (USART_GetFlagStatus(BOARD_UART, USART_FLAG_ORE) != RESET)
+    {
+        (void)USART_ReceiveData(BOARD_UART);
+        s_rx_overrun++;
+    }
+}
+
 void Board_UartInit(uint32_t baudrate)
 {
     GPIO_InitTypeDef gpio;
     USART_InitTypeDef uart;
+    NVIC_InitTypeDef nvic;
+
+    s_rx_head = 0;
+    s_rx_tail = 0;
+    s_rx_overrun = 0;
 
     RCC_APB2PeriphClockCmd(BOARD_UART_GPIO_CLK | BOARD_UART_CLK, ENABLE);
 
@@ -102,6 +145,14 @@ void Board_UartInit(uint32_t baudrate)
     USART_Init(BOARD_UART, &uart);
 
     USART_Cmd(BOARD_UART, ENABLE);
+
+    /* 接收中断: 让每个字节都在 87us 内被搬进环形缓冲, 不靠主循环轮询 */
+    USART_ITConfig(BOARD_UART, USART_IT_RXNE, ENABLE);
+    nvic.NVIC_IRQChannel = USART1_IRQn;
+    nvic.NVIC_IRQChannelPreemptionPriority = 2;
+    nvic.NVIC_IRQChannelSubPriority = 2;
+    nvic.NVIC_IRQChannelCmd = ENABLE;
+    NVIC_Init(&nvic);
 }
 
 void Board_UartPutChar(char ch)
@@ -138,19 +189,36 @@ void Board_UartSendBytes(const uint8_t *data, uint16_t length)
 }
 
 /* 非阻塞读一个字节: 返回 1 = 读到了, 0 = 现在没有数据。
-   主循环每 10ms 调一次, 把读到的字节喂给协议解析器, 不占中断。 */
+   字节由 USART1_IRQHandler 提前搬进环形缓冲, 这里只取。 */
 uint8_t Board_UartReadByte(uint8_t *out)
 {
     if (out == 0)
     {
         return 0;
     }
-    if (USART_GetFlagStatus(BOARD_UART, USART_FLAG_RXNE) == RESET)
+    if (s_rx_tail == s_rx_head)
     {
         return 0;
     }
-    *out = (uint8_t)(USART_ReceiveData(BOARD_UART) & 0xFF);
+    *out = s_rx_buf[s_rx_tail];
+    s_rx_tail = (uint16_t)((s_rx_tail + 1u) % BOARD_UART_RX_RING);
     return 1;
+}
+
+/* 环形缓冲里还有多少字节没取走 */
+uint16_t Board_UartRxPending(void)
+{
+    if (s_rx_head >= s_rx_tail)
+    {
+        return (uint16_t)(s_rx_head - s_rx_tail);
+    }
+    return (uint16_t)(BOARD_UART_RX_RING - s_rx_tail + s_rx_head);
+}
+
+/* 累计溢出次数（环形缓冲满了 / 硬件 ORE），正常应该一直是 0 */
+uint16_t Board_UartRxOverrun(void)
+{
+    return s_rx_overrun;
 }
 
 void Board_UartSendU32(uint32_t value)
