@@ -122,6 +122,21 @@ void Board_UartSend(const char *text)
     }
 }
 
+/* 发送任意二进制数据 (遥测帧用)。不能用 Board_UartSend, 因为帧里一定有 0x00 */
+void Board_UartSendBytes(const uint8_t *data, uint16_t length)
+{
+    uint16_t index;
+
+    if (data == 0)
+    {
+        return;
+    }
+    for (index = 0; index < length; index++)
+    {
+        Board_UartPutChar((char)data[index]);
+    }
+}
+
 /* 非阻塞读一个字节: 返回 1 = 读到了, 0 = 现在没有数据。
    主循环每 10ms 调一次, 把读到的字节喂给协议解析器, 不占中断。 */
 uint8_t Board_UartReadByte(uint8_t *out)

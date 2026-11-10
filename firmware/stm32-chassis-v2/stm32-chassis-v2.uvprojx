@@ -455,6 +455,16 @@
               <FilePath>.\user\proto.h</FilePath>
             </File>
             <File>
+              <FileName>telemetry.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\user\telemetry.c</FilePath>
+            </File>
+            <File>
+              <FileName>telemetry.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\user\telemetry.h</FilePath>
+            </File>
+            <File>
               <FileName>stm32f10x_conf.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\user\stm32f10x_conf.h</FilePath>
@@ -493,6 +503,36 @@
               <FileName>ssd1306.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\hardware\ssd1306.h</FilePath>
+            </File>
+            <File>
+              <FileName>softi2c.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\hardware\softi2c.c</FilePath>
+            </File>
+            <File>
+              <FileName>softi2c.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\hardware\softi2c.h</FilePath>
+            </File>
+            <File>
+              <FileName>icm42670.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\hardware\icm42670.c</FilePath>
+            </File>
+            <File>
+              <FileName>icm42670.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\hardware\icm42670.h</FilePath>
+            </File>
+            <File>
+              <FileName>aht20.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\hardware\aht20.c</FilePath>
+            </File>
+            <File>
+              <FileName>aht20.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\hardware\aht20.h</FilePath>
             </File>
           </Files>
         </Group>

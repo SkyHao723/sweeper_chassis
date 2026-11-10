@@ -1,106 +1,20 @@
 #include "stm32f10x.h"
 #include "board.h"
+#include "softi2c.h"
 #include "ssd1306.h"
 
 /**
   ******************************************************************************
   * @file    ssd1306.c
-  * @brief   SSD1306 128x64 OLED 驱动, 软件模拟 I2C (PB8=SCL, PB9=SDA)
+  * @brief   SSD1306 128x64 OLED 驱动, 走 PB8/PB9 的软件 I2C (见 softi2c.c)
   *
-  * 硬件说明:
-  *   PB8/PB9 都配成开漏输出 (Out_OD)。开漏写 1 = 释放总线(靠上拉变高),
-  *   写 0 = 主动拉低; 读 IDR 就是读实际电平。所以读 ACK 不需要切换输入模式。
+  * 这条总线上还挂着 AHT20 温湿度 (见 aht20.c), 两边共用 softi2c 的底层。
   ******************************************************************************
   */
 
-#define SSD_PORT GPIOB
-#define SSD_SCL_PIN GPIO_Pin_8
-#define SSD_SDA_PIN GPIO_Pin_9
-#define SSD_CLK RCC_APB2Periph_GPIOB
-
 #define SSD_I2C_ADDRESS 0x78 /* 0x3C << 1 */
-#define SSD_I2C_HALF_DELAY 200 /* 约 2.8us 半周期 => SCL ~180kHz */
 #define SSD_PAGE_COUNT 8
 #define SSD_COLUMN_COUNT 128
-
-/* --------------------------- 软件 I2C 底层 --------------------------- */
-
-static void Ssd_I2cDelay(void)
-{
-    Board_DwtDelayCycles(SSD_I2C_HALF_DELAY);
-}
-
-static void Ssd_Scl(uint8_t high)
-{
-    if (high != 0)
-    {
-        GPIO_SetBits(SSD_PORT, SSD_SCL_PIN);
-    }
-    else
-    {
-        GPIO_ResetBits(SSD_PORT, SSD_SCL_PIN);
-    }
-    Ssd_I2cDelay();
-}
-
-static void Ssd_Sda(uint8_t high)
-{
-    if (high != 0)
-    {
-        GPIO_SetBits(SSD_PORT, SSD_SDA_PIN);
-    }
-    else
-    {
-        GPIO_ResetBits(SSD_PORT, SSD_SDA_PIN);
-    }
-    Ssd_I2cDelay();
-}
-
-static void Ssd_I2cStart(void)
-{
-    Ssd_Sda(1);
-    Ssd_Scl(1);
-    Ssd_Sda(0);
-    Ssd_Scl(0);
-}
-
-static void Ssd_I2cStop(void)
-{
-    Ssd_Sda(0);
-    Ssd_Scl(1);
-    Ssd_Sda(1);
-}
-
-/* 写一个字节, 返回 0 = 收到 ACK, 1 = 没有 ACK */
-static uint8_t Ssd_I2cWriteByte(uint8_t value)
-{
-    uint8_t bit;
-    uint8_t ack;
-    uint8_t mask;
-
-    for (bit = 0; bit < 8; bit++)
-    {
-        mask = (uint8_t)(0x80 >> bit);
-        if ((value & mask) != 0)
-        {
-            Ssd_Sda(1);
-        }
-        else
-        {
-            Ssd_Sda(0);
-        }
-        Ssd_Scl(1);
-        Ssd_Scl(0);
-    }
-
-    /* 第 9 个时钟: 释放 SDA, 读从机的应答 */
-    Ssd_Sda(1);
-    Ssd_Scl(1);
-    ack = (GPIO_ReadInputDataBit(SSD_PORT, SSD_SDA_PIN) == Bit_RESET) ? 0 : 1;
-    Ssd_Scl(0);
-
-    return ack;
-}
 
 /* --------------------------- SSD1306 命令/数据 --------------------------- */
 
@@ -108,17 +22,17 @@ static uint8_t Ssd_WriteCommand(uint8_t command)
 {
     uint8_t result;
 
-    Ssd_I2cStart();
-    result = Ssd_I2cWriteByte(SSD_I2C_ADDRESS);
+    SoftI2c_Start();
+    result = SoftI2c_WriteByte(SSD_I2C_ADDRESS);
     if (result == 0)
     {
-        result = Ssd_I2cWriteByte(0x00); /* 0x00 = 后面是命令 */
+        result = SoftI2c_WriteByte(0x00); /* 0x00 = 后面是命令 */
     }
     if (result == 0)
     {
-        result = Ssd_I2cWriteByte(command);
+        result = SoftI2c_WriteByte(command);
     }
-    Ssd_I2cStop();
+    SoftI2c_Stop();
 
     return result;
 }
@@ -205,9 +119,9 @@ uint8_t Ssd1306_Probe(void)
 {
     uint8_t result;
 
-    Ssd_I2cStart();
-    result = Ssd_I2cWriteByte(SSD_I2C_ADDRESS);
-    Ssd_I2cStop();
+    SoftI2c_Start();
+    result = SoftI2c_WriteByte(SSD_I2C_ADDRESS);
+    SoftI2c_Stop();
 
     if (result == 0)
     {
@@ -218,7 +132,6 @@ uint8_t Ssd1306_Probe(void)
 
 uint8_t Ssd1306_Init(void)
 {
-    GPIO_InitTypeDef gpio;
     static const uint8_t commands[] = {
         0xAE, 0x20, 0x10, 0xB0, 0xC8, 0x00, 0x10, 0x40,
         0x81, 0x7F, 0xA1, 0xA6, 0xA8, 0x3F, 0xA4, 0xD3,
@@ -226,20 +139,9 @@ uint8_t Ssd1306_Init(void)
         0x20, 0x8D, 0x14, 0xAF};
     uint8_t index;
 
-    RCC_APB2PeriphClockCmd(SSD_CLK, ENABLE);
-
-    /* 先当普通推挽输出把两根线都拉高(给总线一个空闲状态), 再切开漏 */
-    GPIO_SetBits(SSD_PORT, SSD_SCL_PIN | SSD_SDA_PIN);
-    gpio.GPIO_Pin = SSD_SCL_PIN | SSD_SDA_PIN;
-    gpio.GPIO_Mode = GPIO_Mode_Out_PP;
-    gpio.GPIO_Speed = GPIO_Speed_50MHz;
-    GPIO_Init(SSD_PORT, &gpio);
-    Board_DwtDelayCycles(72000 * 2); /* 等 2ms 让 OLED 上电稳定 */
-
-    gpio.GPIO_Mode = GPIO_Mode_Out_OD;
-    GPIO_Init(SSD_PORT, &gpio);
-    Ssd_Scl(1);
-    Ssd_Sda(1);
+    /* 总线初始化(PB8/PB9 开漏 + 上拉空闲), 总线可能被卡住就先复位一下 */
+    SoftI2c_Init();
+    SoftI2c_BusReset();
 
     if (Ssd1306_Probe() == 0)
     {
@@ -267,14 +169,14 @@ void Ssd1306_Clear(void)
     for (page = 0; page < SSD_PAGE_COUNT; page++)
     {
         Ssd_SetPage(page);
-        Ssd_I2cStart();
-        (void)Ssd_I2cWriteByte(SSD_I2C_ADDRESS);
-        (void)Ssd_I2cWriteByte(0x40); /* 0x40 = 后面是显存数据 */
+        SoftI2c_Start();
+        (void)SoftI2c_WriteByte(SSD_I2C_ADDRESS);
+        (void)SoftI2c_WriteByte(0x40); /* 0x40 = 后面是显存数据 */
         for (column = 0; column < SSD_COLUMN_COUNT; column++)
         {
-            (void)Ssd_I2cWriteByte(0x00);
+            (void)SoftI2c_WriteByte(0x00);
         }
-        Ssd_I2cStop();
+        SoftI2c_Stop();
     }
 }
 
@@ -291,9 +193,9 @@ void Ssd1306_ShowLine(uint8_t page, const char *text)
     }
 
     Ssd_SetPage(page);
-    Ssd_I2cStart();
-    (void)Ssd_I2cWriteByte(SSD_I2C_ADDRESS);
-    (void)Ssd_I2cWriteByte(0x40);
+    SoftI2c_Start();
+    (void)SoftI2c_WriteByte(SSD_I2C_ADDRESS);
+    (void)SoftI2c_WriteByte(0x40);
 
     for (column = 0; column < SSD_COLUMN_COUNT; column++)
     {
@@ -305,9 +207,9 @@ void Ssd1306_ShowLine(uint8_t page, const char *text)
         {
             value = Ssd_Glyph(text[character_index])[glyph_column];
         }
-        (void)Ssd_I2cWriteByte(value);
+        (void)SoftI2c_WriteByte(value);
     }
-    Ssd_I2cStop();
+    SoftI2c_Stop();
 }
 
 void Ssd1306_ShowLineU32(uint8_t page, const char *prefix, uint32_t value)

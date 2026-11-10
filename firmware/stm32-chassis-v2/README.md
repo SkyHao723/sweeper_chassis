@@ -1,7 +1,7 @@
 # 底盘主控 V2（新板，STM32F103C8T6）
 
-新底盘主控板的第一版固件，只做**点灯验证**：把 OLED 屏点亮、把 RGB 灯点亮、把板载按键读出来，
-同时从调试串口打同样的信息。用来确认新板焊接、供电、晶振是否正常。
+新底盘主控板固件：点灯、读按键、跑**三种工作模式**，并且**读 IMU（ICM-42670-P）与温湿度（AHT20）**，
+把数据打进 32 字节上行遥测帧发给上位机。
 
 > 旧底盘（洗地车 / 扫地车）的固件仍在 [`../stm32-chassis/`](../stm32-chassis/)，稳定版归档在
 > [`../releases/fw-v8.0-20261110/`](../releases/fw-v8.0-20261110/MANIFEST.md)，**两者互不影响**。
@@ -12,22 +12,24 @@
 
 | 外设 | 引脚 | 实现 | 现象 |
 |------|------|------|------|
-| OLED（SSD1306 128×64） | PB8=SCL, PB9=SDA | **软件 I2C**（开漏，见 §3.1） | 屏上 8 行：板子信息 + **当前模式** + 命令计数 + 运行计数 |
+| OLED（SSD1306 128×64） | PB8=SCL, PB9=SDA | **软件 I2C**（开漏，见 §3.1） | 屏上 8 行：板子信息 + 模式 + 加速度/角速度 + 温湿度 + 计数 |
 | RGB 灯（XL-5050） | PB5 | WS2812 单线时序，DWT 周期计数器打拍，**软件调光 30 %** | **颜色 = 当前模式**：蓝=上位机控制 / 绿=遥控 / 橙=推行 |
 | 板载按键 SW1 | PA15 | 上拉输入（需先关 JTAG，见 §3.2） | **每按一下切模式**：HOST → RC → PUSH → HOST |
-| 调试串口 | PA9=TX, PA10=RX | USART1 115200 8N1 → CH343P → USB | 上电横幅 + 模式切换日志；**同时接收上位机的"切换模式"命令** |
+| 调试串口 | PA9=TX, PA10=RX | USART1 115200 8N1 → CH343P → USB | 上电横幅 + 模式日志 + **20 Hz 32 字节遥测帧**（§1.2） |
+| IMU（ICM-42670-P） | PB6=SCL, PB7=SDA | **硬件 I2C1** 400 kHz，±4g / ±1000dps / 200 Hz | 屏幕第 3/4 行显示加速度(g)与角速度(°/s) |
+| 温湿度（AHT20） | PB8/PB9（与 OLED 共总线） | 软件 I2C，**非阻塞两步采样**（触发 → 80 ms 后取） | 屏幕第 5 行显示温度(°C)与湿度(%RH) |
 
-上电后屏幕应该是（第 5 行随模式变）：
+上电后屏幕应该是（第 1 行随模式变，第 3/4/5 行随传感器数据变）：
 
 ```
 TB01 CHASSIS V2
-MCU F103C8T6
-CLK 72 MHZ
-OLED OK
-MODE HOST
-UART CMD OK
+CLK 72 MODE HOST
+IMU 0x68 AHT OK
+a 0.025 0.021 1.024
+g 0.3 -0.5 0.1
+T 19.7C H 30.2%
 RX 0 RJ 0
-RUN 000123
+RUN 000012
 ```
 
 串口（115200）同时打印：
@@ -35,12 +37,19 @@ RUN 000123
 ```
 ======================================
  TB01 chassis controller V2
+ modes: HOST / RC / PUSH
 ======================================
 SYSCLK = 72 MHz
 OLED   = OK (SSD1306 @0x3C, soft I2C PB8/PB9)
 LED    = WS2812 on PB5, brightness 30 %
 KEY    = PA15: press to switch mode
 UART   = mode cmd: 7A 02 <mode> 00 00 00 <bcc> 7D
+UPLINK = telemetry 32B @20Hz (see telemetry.h)
+IMU    = ICM-42670-P on hardware I2C1 (PB6/PB7)
+AHT20  = on soft I2C (PB8/PB9), 500ms sample
+
+[imu] addr=0x68 whoami=0x67 OK
+[aht20] OK
 [mode] power on = HOST
 ```
 
@@ -78,9 +87,58 @@ python tools/v2_mode.py COM15 rc --speed 200  # 切遥控后再发一条 200mm/s
 
 **看这两行就知道板子基本是好的**：
 
-- `CLK 72 MHZ` —— 8 MHz 晶振起振了（显示 `CLK 8 MHZ` 说明 HSE 没起来、退回内部 HSI，
+- `CLK 72` —— 8 MHz 晶振起振了（显示 `CLK 8` 说明 HSE 没起来、退回内部 HSI，
   查 X1、18 pF、C7、BOOT0 下拉电阻）。
-- `OLED OK` —— 显示这一路 I2C 有应答（`OLED NO ACK` 见 §4 排查）。
+- `IMU 0x68` / `AHT OK` —— 两条 I2C 总线上都有应答（`IMU` 显示 `0x00` 或 `AHT ERR` 见 §4）。
+
+### 1.2 上行遥测帧（32 字节，20 Hz）
+
+每 50 ms 从 USART1 发一帧。**大端 int16，和旧底盘的速度帧一致**，上位机可以复用解析代码。
+
+```
+[0]     0x7E  帧头
+[1]     flags bit0=IMU 有效, bit1=AHT20 有有效样本, bit2..3=模式
+[2]     mode  0=HOST 1=RC 2=PUSH
+[3..4]  vx 指令 mm/s        (int16 BE)
+[5..6]  wz 指令 mrad/s      (int16 BE)
+[7..8]  acc X mg            (int16 BE)   ← 0.001 g
+[9..10] acc Y mg
+[11..12]acc Z mg
+[13..14]gyro X 0.1°/s       (int16 BE)
+[15..16]gyro Y 0.1°/s
+[17..18]gyro Z 0.1°/s
+[19..20]IMU 内部温度 0.01°C (int16 BE)
+[21..22]湿度 0.01 %RH       (uint16 BE)
+[23..24]AHT20 温度 0.01°C   (int16 BE)
+[25..26]tick ms 低 16 位    (uint16 BE)
+[27]    接受的 host 速度帧数（饱和 255）
+[28]    因模式不对被丢的帧数（饱和 255）
+[29]    协议版本 1
+[30]    BCC = XOR([0..29])
+[31]    0x7D 帧尾
+```
+
+两种读法：
+
+```powershell
+# 1) 板子 USB 插在电脑上: 实时解读 (每秒 20 行)
+python tools/v2_monitor.py --port COM15
+python tools/v2_monitor.py --port COM15 --seconds 5
+
+# 2) 没插 USB(只有 DAPLink): 直接用调试器把 RAM 里"最后发出的一帧"读出来
+python tools/v2_monitor.py --ram
+```
+
+`--ram` 读的是 `telemetry.c` 里的 `s_last_frame` 快照（地址从 `.map` 里查），适合板上没引 USB 时排除问题：
+
+```
+mode=HOST imu=OK aht=OK acc[g]=( 0.025  0.021  1.024) gyro[dps]=(  0.30  -0.50   0.10)
+T_imu=19.63C RH=30.27% T_aht=19.75C v_cmd=(   0,    0) tick= 5800 rx=0   rj=0
+```
+
+**怎么判断数据是真的**：板子静止放在桌上 → `acc` 的 Z 轴 ≈ 1.000 g（重力）、X/Y ≈ 0，
+`gyro` 三轴 ≈ 0；把板子翻转 Z 变 -1；用手捂一下 AHT20 湿度和温度会往上走。
+
 
 ---
 
@@ -97,7 +155,7 @@ $p = Start-Process -FilePath $uv -ArgumentList @('-b','-r',$proj,'-t','chassis-v
 ```
 
 产物：`Objects/chassis-v2/chassis-v2.hex`
-（hex 18358 B MD5 `49F922757687DEA5A89A64F2A19317DC`；镜像 6508 B MD5 `0D9A3AC5B4DF7A0808D07905F1615F20`；Code 5928 B / RO 516 B / RW 64 B / ZI 1648 B）。
+（hex 30717 B MD5 `8119B11E0478DDF07443BBFA7307DC38`；镜像 10900 B MD5 `B45660EA963EC06AE179E114221FBA3F`；Code 10252 B / RO 556 B / RW 92 B / ZI 1676 B）。
 
 **推荐用脚本烧（会自己回读校验，并处理 NRST 没接的问题）**：
 
@@ -136,10 +194,18 @@ STM32F103 的 **I2C2 只在 PB10/PB11**，而这块板把 PB10/PB11 给了 CH554
 
 所以分工是：
 
-- **IMU（ICM-42670-P）** 走 PB6/PB7 的**硬件 I2C1**（以后做）
-- **OLED + AHT20** 走 PB8/PB9 的**软件 I2C**（本版已实现，刷屏够用）
+- **IMU（ICM-42670-P）** 走 PB6/PB7 的**硬件 I2C1**（400 kHz，`I2C_Init` + StdPeriph 轮询）
+- **OLED + AHT20** 走 PB8/PB9 的**软件 I2C**（`hardware/softi2c.c`，两条设备共总线）
 
-总线地址：OLED `0x3C`（写 `0x78`）、AHT20 `0x38`，不冲突。
+总线地址：OLED `0x3C`（写 `0x78`）、AHT20 `0x38`（写 `0x70`），不冲突；IMU `0x68`
+（`AD0` 接高则是 `0x69`，固件两个地址都会试）。
+
+### 3.1.1 软件 I2C 读数据必须把地址最低位置 1
+
+`SoftI2c_ReadBytes()` 里发的是 `address | 0x01`（R/W=1）。**这个坑真踩过**：一开始写成 `address`，
+从机照常回 ACK（所以"通信正常"），但它以为主机在写，一直不驱动 SDA —— 读回来**全是 `0xFF`**。
+AHT20 的 BUSY 位正好是 bit7，于是一直"忙"、温度湿度恒为 0，看起来像传感器坏了/没焊。
+判断特征：**读出来的字节全是 0xFF**。
 
 ### 3.2 PA15 是 JTDI，用之前必须先关 JTAG
 
@@ -192,6 +258,11 @@ PB2 引到了 CN6 排针。复位瞬间 PB2 被拉高会从**内置 SRAM** 启�
 | 按键没反应 / 模式不切 | 是否调了 `Board_SwdOnly()`；PA15 是否被调试器占用；按下是否真把脚拉到 GND（万用表量）；消抖是 30 ms（3×10 ms 采样），按太短会漏 |
 | 上位机发命令没反应 | COM 口选错（要选 CH343P 那个）；波特率必须 115200；帧必须 8 字节且 BCC 对；最快判据是屏幕第 7 行 `RX` / `RJ` 有没有变化 |
 | `RJ` 一直猛涨 | `RJ` 记的是"因模式不对被丢掉的速度帧"，若在 HOST 模式下还涨说明波特率不对或帧被截断（正常应为 0） |
+| 屏幕第 2 行 `IMU 0x00` | IMU 没应答：PB6/PB7 是否接对；模块有没有上拉（多数自带 4.7k）；地址是 `0x68` 还是 `0x69`（固件都会试）；`WHO_AM_I` 必须是 `0x67`（不对说明是别的型号） |
+| 屏幕第 2 行 `AHT ERR` | AHT20 没应答：确认挂在 PB8/PB9 这条总线上；地址 `0x38`；上电要等 40 ms 才能通信（固件已等 45 ms） |
+| 温湿度一直是 0 / 一直 `AHT ERR` | **先看是不是读回全 `0xFF`**（§3.1.1）——那是 R/W 位没置 1 的典型症状，不是传感器坏 |
+| IMU 数值不动 / 全是 0 | 是不是没等陀螺稳定（固件初始化后等 60 ms）；`PWR_MGMT0` 是否写成 `0x0F`；`I2C1` 是否被重复初始化 |
+| `acc Z` 不是 ±1g | 模块贴装方向不同（Z 轴朝桌面还是朝上），不是故障；拿重力当场标定 |
 
 用 DAPLink 直接读寄存器也很好使（GPIOB 基址 `0x40010C00`）：
 
@@ -209,38 +280,42 @@ GPIOB_IDR  = 0x0000fc10   # 实际电平
 stm32-chassis-v2/
 ├── stm32-chassis-v2.uvprojx   单 target: chassis-v2（宏: USE_STDPERIPH_DRIVER）
 ├── user/
-│   ├── main.c                 bring-up 主程序（屏幕 8 行 + 模式显示 + 按键 + 串口）
-│   ├── board.c / board.h      板级：DWT 延时、关 JTAG、未用脚驻留、USART1(收发)、按键
+│   ├── main.c                 bring-up 主程序（屏幕 8 行 + 模式 + 传感器 + 按键 + 串口）
+│   ├── board.c / board.h      板级：DWT 延时、关 JTAG、未用脚驻留、USART1(收发/发二进制)、按键
 │   ├── mode.c / mode.h        工作模式状态机（HOST / RC / PUSH）
 │   ├── proto.c / proto.h      上位机串口协议（0x7B 速度帧 / 0x7A 功能帧，切模式）
+│   ├── telemetry.c / .h       32 字节上行遥测帧（模式/指令/IMU/温湿度/计数）
 │   ├── stm32f10x_conf.h       标准外设库裁剪
 │   └── stm32f10x_it.c/h       中断向量
 ├── hardware/
 │   ├── ws2812.c / .h          WS2812 单线驱动（DWT 打拍，发送期间关中断）
-│   └── ssd1306.c / .h         SSD1306 驱动（软件 I2C + 5x7 字库 + 页寻址）
+│   ├── ssd1306.c / .h         SSD1306 驱动（软件 I2C + 5x7 字库 + 页寻址）
+│   ├── softi2c.c / .h         PB8/PB9 软件 I2C 主机（OLED + AHT20 共用）
+│   ├── icm42670.c / .h        ICM-42670-P 六轴 IMU（硬件 I2C1，±4g/±1000dps/200Hz）
+│   └── aht20.c / .h           AHT20 温湿度（软件 I2C，非阻塞 触发→80ms 后取）
 ├── sys/Delay.c / .h           SysTick 微秒/毫秒延时（沿用旧工程）
 ├── start/                     CMSIS + 启动文件（startup_stm32f10x_md.s）
 └── lib/                       ST 标准外设库 3.5.0
 ```
 
 工程文件由脚本从旧工程生成（`tools/gen_v2_project.py`）：只改 target 名、输出目录、宏定义
-和 user/hardware 两个文件组，编译选项与调试器配置沿用旧工程。
+和 user/hardware 两个文件组，编译选项与调试器配置沿用旧工程。**新增 .c 文件后要在这个脚本里登记并重跑。**
 
-当前体积：**Code 4352 B / RO 524 B / RW 44 B / ZI 1636 B**（64 KB Flash，余量充足）。
+当前体积：**Code 10252 B / RO 556 B / RW 92 B / ZI 1676 B**（64 KB Flash，余量充足）。
 
 ---
 
 ## 6. 进度与下一步（按顺序）
 
-已完成：点亮 OLED / RGB / 按键 → 亮度可调 → **三种工作模式（HOST / RC / PUSH，按键 + 串口命令切换）**。
+已完成：点亮 OLED / RGB / 按键 → 亮度可调 → **三种工作模式（HOST / RC / PUSH，按键 + 串口命令切换）**
+→ **IMU（ICM-42670-P，硬件 I2C1）读到真实加速度/角速度** → **AHT20 读到真实温湿度** → **20 Hz 32 字节上行遥测帧**。
 
-1. **IMU**：ICM-42670-P 上硬件 I2C1（PB6/PB7），先读 WHO_AM_I（`0x75` 应为 `0x67`），再出角速度
-2. **AHT20**：挂在现有软件 I2C 上（地址 `0x38`）
-3. **CH554G**：USART3（PB10/PB11）通信协议待定（对方 MCU 负责 USB-A 主机口）
-4. **CAN**：PA11/PA12 + TJA1050，1 Mbps 标准帧，从旧固件搬达妙电机协议（速度帧 + 反馈解析）
-5. **运动控制**：速度帧已经在收了（`Proto_GetHostCmd()` 拿 vx/wz），接上电机后按模式分发：
-   HOST 用上位机命令、RC 用遥控输入、PUSH 电机释放
-6. **串口回包**：把旧固件的 24 B 遥测帧 / 44 B 诊断帧搬过来，上位机（car_web）不用改
+1. **CH554G**：USART3（PB10/PB11）通信协议待定（对方 MCU 负责 USB-A 主机口）
+2. **CAN**：PA11/PA12 + TJA1050，1 Mbps 标准帧，从旧固件搬达妙电机协议（速度帧 + 反馈解析）
+3. **运动控制**：速度指令已经在收（`Proto_GetHostCmd()` 拿 vx/wz），接上电机后按模式分发：
+   HOST 用上位机命令、RC 用遥控输入、PUSH 电机释放（达妙失能不制动，语义天然吻合）
+4. **IMU 闭环/姿态**：现在只给原始数据，后面要做倾角/角速度零偏标定再谈闭环
+5. **回退到旧协议**：旧固件的 24 B 遥测帧 / 44 B 诊断帧可以并行发，car_web 不用改
 
 旧固件可参考：`firmware/stm32-chassis/user/main.c` 的 CAN 收发与达妙协议；
 `firmware/stm32-chassis/hardware/YbImu.c` 是老的 YbImu（不是 ICM-42670-P），只能参考写法。

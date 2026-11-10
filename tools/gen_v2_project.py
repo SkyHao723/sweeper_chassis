@@ -65,6 +65,8 @@ USER_GROUP = group("user", [
     ("mode.h", 5, ".\\user\\mode.h"),
     ("proto.c", 1, ".\\user\\proto.c"),
     ("proto.h", 5, ".\\user\\proto.h"),
+    ("telemetry.c", 1, ".\\user\\telemetry.c"),
+    ("telemetry.h", 5, ".\\user\\telemetry.h"),
     ("stm32f10x_conf.h", 5, ".\\user\\stm32f10x_conf.h"),
     ("stm32f10x_it.c", 1, ".\\user\\stm32f10x_it.c"),
     ("stm32f10x_it.h", 5, ".\\user\\stm32f10x_it.h"),
@@ -75,6 +77,12 @@ HW_GROUP = group("hardware", [
     ("ws2812.h", 5, ".\\hardware\\ws2812.h"),
     ("ssd1306.c", 1, ".\\hardware\\ssd1306.c"),
     ("ssd1306.h", 5, ".\\hardware\\ssd1306.h"),
+    ("softi2c.c", 1, ".\\hardware\\softi2c.c"),
+    ("softi2c.h", 5, ".\\hardware\\softi2c.h"),
+    ("icm42670.c", 1, ".\\hardware\\icm42670.c"),
+    ("icm42670.h", 5, ".\\hardware\\icm42670.h"),
+    ("aht20.c", 1, ".\\hardware\\aht20.c"),
+    ("aht20.h", 5, ".\\hardware\\aht20.h"),
 ])
 
 pat_user = re.compile(r"<Group>\s*<GroupName>user</GroupName>.*?</Group>", re.S)

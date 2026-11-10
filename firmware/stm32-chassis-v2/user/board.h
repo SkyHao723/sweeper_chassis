@@ -71,6 +71,8 @@ void Board_ParkUnusedPins(void);
 void Board_UartInit(uint32_t baudrate);
 void Board_UartPutChar(char ch);
 void Board_UartSend(const char *text);
+/* 发送任意二进制数据 (遥测帧用; 不做任何转义) */
+void Board_UartSendBytes(const uint8_t *data, uint16_t length);
 void Board_UartSendU32(uint32_t value);
 void Board_UartSendHex8(uint8_t value);
 
