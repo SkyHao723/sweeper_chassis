@@ -1,4 +1,12 @@
 # 二进制文件, 禁止任何行尾/编码转换
+#
+# ★ 顺序有意义: gitattributes 里**后面的规则覆盖前面的**,
+#   所以 `* text=auto` 不能放在这些 binary 规则后面 ——
+#   放后面会把 *.hex 又变回 text=auto (autocrlf=true 时提交 CRLF->LF,
+#   归档 hex 的 MD5 就变了)。这条曾经真的踩过(2026-11-10)。
+* text=auto
+
+# 二进制文件, 禁止任何行尾/编码转换
 *.pdf   binary
 *.axf   binary
 *.hex   binary
@@ -6,5 +14,5 @@
 *.elf   binary
 *.apk   binary
 
-# 默认按文本处理并自动识别
-* text=auto
+# 固件归档目录里的 hex 必须逐字节保留(烧录用), 再显式钉一次
+firmware/releases/**/*.hex binary

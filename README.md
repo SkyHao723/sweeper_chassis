@@ -285,7 +285,12 @@ Start-Process -FilePath "D:\Keil\UV4\UV4.exe" `
   -ArgumentList '-b','-r','stm32-chassis.uvprojx','-t','sweeper','-o','build.log' -Wait
 ```
 
-验收门槛：日志里 **`0 Error(s), 0 Warning(s)`**，当前 Code ≈ 11392 B。
+验收门槛：日志里 **`0 Error(s), 0 Warning(s)`**，当前两 target 的 ROM 占用约 **12.4 KB / 64 KB**。
+
+**★ 确认稳定的版本会原样归档**到 [`firmware/releases/`](firmware/releases/README.md)
+（连 hex 一起进版本库，`Objects/` 里的会被下一次编译覆盖）。
+当前存档：[**fw-v8.0（2026-11-10，第一版可交付）**](firmware/releases/fw-v8.0-20261110/MANIFEST.md)
+—— 带 hex MD5、烧录命令、30 秒上车自检清单。
 
 **烧录前必读**：车轮架空 **或** 驱动器断电。历史上在地面带载烧录时
 发生过底盘原地暴冲（目标被夹到上限、单轮 −40 A），这条不能破。
