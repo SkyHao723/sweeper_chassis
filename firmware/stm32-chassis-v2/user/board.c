@@ -122,6 +122,22 @@ void Board_UartSend(const char *text)
     }
 }
 
+/* 非阻塞读一个字节: 返回 1 = 读到了, 0 = 现在没有数据。
+   主循环每 10ms 调一次, 把读到的字节喂给协议解析器, 不占中断。 */
+uint8_t Board_UartReadByte(uint8_t *out)
+{
+    if (out == 0)
+    {
+        return 0;
+    }
+    if (USART_GetFlagStatus(BOARD_UART, USART_FLAG_RXNE) == RESET)
+    {
+        return 0;
+    }
+    *out = (uint8_t)(USART_ReceiveData(BOARD_UART) & 0xFF);
+    return 1;
+}
+
 void Board_UartSendU32(uint32_t value)
 {
     char digits[11];

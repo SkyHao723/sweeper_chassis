@@ -3,111 +3,149 @@
 #include "Delay.h"
 #include "ws2812.h"
 #include "ssd1306.h"
+#include "mode.h"
+#include "proto.h"
 
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   底盘主控 V2 (STM32F103C8T6) 第一步点灯程序
+  * @brief   底盘主控 V2 (STM32F103C8T6) —— 点灯 + 工作模式
   *
-  * 功能:
-  *   1) OLED (SSD1306 128x64, 软件 I2C PB8/PB9) 显示板子信息、当前颜色、运行计数
-  *   2) RGB 灯 (XL-5050 / WS2812 协议, PB5) —— 上电红色, 按一下 PA15 换下一个颜色
-  *      颜色顺序: 红 -> 绿 -> 蓝 -> 白 -> 灭 -> 红 ... (亮度见 WS2812_BRIGHTNESS_PERCENT, 默认 50%)
-  *   3) 同样的信息从 USART1 (PA9/PA10, 115200) 打出来, 方便没屏时看
+  * 屏幕 8 行:
+  *   0  TB01 CHASSIS V2
+  *   1  MCU F103C8T6
+  *   2  CLK 72 MHZ          ← 不是 72 说明 8MHz 晶振没起振
+  *   3  OLED OK             ← NO ACK 说明显示 I2C 不通
+  *   4  MODE HOST           ← 当前工作模式
+  *   5  UART CMD OK         ← 该模式的一句话说明
+  *   6  RX 12 RJ 0          ← 接受的速度帧数 / 因模式不对被丢的帧数
+  *   7  RUN 000123
   *
-  * 上电后屏幕应该看到:
-  *   TB01 CHASSIS V2
-  *   MCU F103C8T6
-  *   CLK 72 MHZ
-  *   OLED OK
-  *   LED PB5 WS2812
-  *   KEY UP
-  *   COLOR RED
-  *   RUN 000123
-  * 如果第三行不是 72 MHZ, 说明 8MHz 晶振没起振 (退到内部 HSI 8MHz);
-  * 如果第四行是 OLED NO ACK, 说明显示这一路 I2C 没应答 (接线/上拉/地址)。
+  * 三种模式 (见 mode.h):
+  *   HOST 上位机控制  灯=蓝   接受上位机速度命令
+  *   RC   遥控        灯=绿   忽略上位机速度命令
+  *   PUSH 推行        灯=橙   电机释放, 忽略上位机速度命令
+  *
+  * 切换方式:
+  *   1) 按板载按键 PA15: 每按一下切下一个 (HOST -> RC -> PUSH -> HOST)
+  *   2) 上位机发功能帧: 7A 02 <mode> 00 00 00 <bcc> 7D
+  *      上位机控制 7A 02 00 00 00 00 78 7D
+  *      遥控       7A 02 01 00 00 00 79 7D
+  *      推行       7A 02 02 00 00 00 7A 7D
+  *
+  * 串口 (USART1, 115200 8N1) 同时打印横幅、模式切换、命令统计。
   ******************************************************************************
   */
 
-/* 颜色表: 红 绿 蓝 白 灭 */
-static const uint8_t color_table[5][3] = {
-    {255, 0, 0},
-    {0, 255, 0},
-    {0, 0, 255},
-    {255, 255, 255},
-    {0, 0, 0}};
+/* 每种模式的灯色 (R,G,B)。0~255 会再按 WS2812_BRIGHTNESS_PERCENT 缩放 */
+static const uint8_t mode_led_color[MODE_COUNT][3] = {
+    {0, 0, 255},   /* HOST 蓝 */
+    {0, 255, 0},   /* RC   绿 */
+    {255, 120, 0}, /* PUSH 橙 */
+};
 
-static const char *Color_Name(uint8_t index)
+/* ---------------------------- 字符串拼装 ---------------------------- */
+
+static void Line_AppendText(char *line, uint8_t *pos, const char *text)
 {
-    switch (index)
+    while ((*text != '\0') && (*pos < 21u))
     {
-        case 0: return "RED";
-        case 1: return "GREEN";
-        case 2: return "BLUE";
-        case 3: return "WHITE";
-        default: return "OFF";
+        line[*pos] = *text;
+        (*pos)++;
+        text++;
     }
 }
 
-/* 屏幕第 6 页显示 "COLOR 颜色名" */
-static void Show_ColorLine(uint8_t oled_ok, uint8_t index)
+static void Line_AppendU32(char *line, uint8_t *pos, uint32_t value)
 {
-    char line[16];
-    const char *name;
-    uint8_t pos = 0;
-    uint8_t i;
+    char digits[11];
+    uint8_t count = 0;
 
-    if (oled_ok == 0)
+    if (value == 0u)
+    {
+        digits[count] = '0';
+        count++;
+    }
+    while ((value > 0u) && (count < 10u))
+    {
+        digits[count] = (char)('0' + (value % 10u));
+        value = value / 10u;
+        count++;
+    }
+    while ((count > 0u) && (*pos < 21u))
+    {
+        count--;
+        line[*pos] = digits[count];
+        (*pos)++;
+    }
+    line[*pos] = '\0';
+}
+
+static void Line_Reset(char *line, uint8_t *pos)
+{
+    *pos = 0;
+    line[0] = '\0';
+}
+
+/* ---------------------------- 显示 / 灯 ---------------------------- */
+
+/* 把当前模式刷到灯和屏幕上 (模式或统计变化时调用) */
+static void Show_Mode(uint8_t oled_ok, uint8_t mode)
+{
+    char line[22];
+    uint8_t pos;
+
+    /* 灯 */
+    Ws2812_SetAll(mode_led_color[mode][0], mode_led_color[mode][1],
+                  mode_led_color[mode][2]);
+    Ws2812_Show();
+
+    if (oled_ok == 0u)
     {
         return;
     }
 
-    name = Color_Name(index);
+    /* 第 4 行: MODE xxx */
+    Line_Reset(line, &pos);
+    Line_AppendText(line, &pos, "MODE ");
+    Line_AppendText(line, &pos, Mode_Name(mode));
+    Ssd1306_ShowLine(4, line);
 
-    /* 前缀 "COLOR " */
-    for (i = 0; i < 6; i++)
-    {
-        line[pos] = "COLOR "[i];
-        pos++;
-    }
-    /* 颜色名 */
-    while ((name[0] != '\0') && (pos < 15))
-    {
-        line[pos] = name[0];
-        pos++;
-        name++;
-    }
-    line[pos] = '\0';
+    /* 第 5 行: 该模式的一句话说明 */
+    Ssd1306_ShowLine(5, Mode_Hint(mode));
+}
 
+/* 第 6 行: 命令统计 */
+static void Show_Counters(uint8_t oled_ok)
+{
+    char line[22];
+    uint8_t pos;
+
+    if (oled_ok == 0u)
+    {
+        return;
+    }
+
+    Line_Reset(line, &pos);
+    Line_AppendText(line, &pos, "RX ");
+    Line_AppendU32(line, &pos, Proto_HostCmdCount());
+    Line_AppendText(line, &pos, " RJ ");
+    Line_AppendU32(line, &pos, Proto_HostRejectCount());
     Ssd1306_ShowLine(6, line);
 }
 
-/* 切换颜色: 点灯 + 屏幕 + 串口, 三处一致 */
-static void Apply_Color(uint8_t oled_ok, uint8_t index)
-{
-    Ws2812_SetAll(color_table[index][0], color_table[index][1],
-                  color_table[index][2]);
-    Ws2812_Show();
-
-    Show_ColorLine(oled_ok, index);
-
-    Board_UartSend("[led] color = ");
-    Board_UartSend(Color_Name(index));
-    Board_UartSend("\r\n");
-}
-
-/* 开场: 屏幕固定行 + 串口横幅 */
 static void Show_BoardInfo(uint8_t oled_ok)
 {
     Board_UartSend("\r\n\r\n");
     Board_UartSend("======================================\r\n");
-    Board_UartSend(" TB01 chassis controller V2 bring-up\r\n");
+    Board_UartSend(" TB01 chassis controller V2\r\n");
+    Board_UartSend(" modes: HOST / RC / PUSH\r\n");
     Board_UartSend("======================================\r\n");
     Board_UartSend("SYSCLK = ");
     Board_UartSendU32((uint32_t)(SystemCoreClock / 1000000));
     Board_UartSend(" MHz\r\n");
     Board_UartSend("OLED   = ");
-    if (oled_ok != 0)
+    if (oled_ok != 0u)
     {
         Board_UartSend("OK (SSD1306 @0x3C, soft I2C PB8/PB9)\r\n");
     }
@@ -118,10 +156,11 @@ static void Show_BoardInfo(uint8_t oled_ok)
     Board_UartSend("LED    = WS2812 on PB5, brightness ");
     Board_UartSendU32(WS2812_BRIGHTNESS_PERCENT);
     Board_UartSend(" %\r\n");
-    Board_UartSend("KEY    = PA15 (pull-up, active low), press to change color\r\n");
+    Board_UartSend("KEY    = PA15: press to switch mode\r\n");
+    Board_UartSend("UART   = mode cmd: 7A 02 <mode> 00 00 00 <bcc> 7D\r\n");
     Board_UartSend("\r\n");
 
-    if (oled_ok == 0)
+    if (oled_ok == 0u)
     {
         return;
     }
@@ -130,18 +169,33 @@ static void Show_BoardInfo(uint8_t oled_ok)
     Ssd1306_ShowLine(1, "MCU F103C8T6");
     Ssd1306_ShowLineU32(2, "CLK ", (uint32_t)(SystemCoreClock / 1000000));
     Ssd1306_ShowLine(3, "OLED OK");
-    Ssd1306_ShowLine(4, "LED PB5 WS2812");
-    Ssd1306_ShowLine(5, "KEY UP");
 }
+
+/* 模式切换时打一行日志 */
+static void Log_ModeChange(uint8_t old_mode, uint8_t new_mode, uint8_t source)
+{
+    Board_UartSend("[mode] ");
+    Board_UartSend(Mode_Name(old_mode));
+    Board_UartSend(" -> ");
+    Board_UartSend(Mode_Name(new_mode));
+    Board_UartSend(" by ");
+    Board_UartSend(Mode_SourceName(source));
+    Board_UartSend("\r\n");
+}
+
+/* ------------------------------- 主程序 ------------------------------- */
 
 int main(void)
 {
     uint8_t oled_ok;
-    uint8_t color_index = 0;
-    uint8_t run_count_lo = 0;
+    uint8_t run_lo = 0;
     uint32_t run_count = 0;
+    uint32_t i;
+    uint8_t byte;
+    uint8_t old_mode;
+    uint8_t source;
 
-    /* 按键消抖用 */
+    /* 按键消抖 */
     uint8_t key_raw = 0;
     uint8_t key_state = 0;
     uint8_t key_stable_cnt = 0;
@@ -155,74 +209,87 @@ int main(void)
     Ws2812_Init();
     oled_ok = Ssd1306_Init();
 
+    Mode_Init();
+    Proto_Init();
+
     Show_BoardInfo(oled_ok);
-    Apply_Color(oled_ok, color_index);
+
+    /* 上电默认模式: 灯色 + 屏幕 + 一行日志 */
+    old_mode = Mode_Get();
+    Show_Mode(oled_ok, old_mode);
+    Board_UartSend("[mode] power on = ");
+    Board_UartSend(Mode_Name(old_mode));
+    Board_UartSend("\r\n");
 
     for (;;)
     {
         Delay_ms(10);
 
-        /* 每 100ms 刷一次运行计数 (软件 I2C 刷一整页约 3ms, 别刷太勤) */
-        run_count_lo = (uint8_t)(run_count_lo + 1);
-        if (run_count_lo >= 10)
+        /* ---- 收上位机串口数据 (每次最多 32 字节, 不阻塞) ---- */
+        for (i = 0; i < 32u; i++)
         {
-            run_count_lo = 0;
-            run_count++;
-            if (oled_ok != 0)
+            if (Board_UartReadByte(&byte) == 0u)
             {
-                Ssd1306_ShowLineU32(7, "RUN ", run_count);
+                break;
             }
+            Proto_FeedByte(byte);
         }
 
-        /* 按键: 连续 3 次采样(30ms)一致才认, 只在"按下"的边沿换色 */
-        if (Board_KeyDown() != 0)
+        /* ---- 按键: 连续 3 次采样(30ms)一致才认边沿, 按下时切模式 ---- */
+        if (Board_KeyDown() != 0u)
         {
-            if (key_raw == 0)
+            if (key_raw == 0u)
             {
-                key_raw = 1;
+                key_raw = 1u;
                 key_stable_cnt = 0;
             }
-            else if (key_stable_cnt < 3)
+            else if (key_stable_cnt < 3u)
             {
                 key_stable_cnt++;
             }
         }
         else
         {
-            if (key_raw != 0)
+            if (key_raw != 0u)
             {
-                key_raw = 0;
+                key_raw = 0u;
                 key_stable_cnt = 0;
             }
-            else if (key_stable_cnt < 3)
+            else if (key_stable_cnt < 3u)
             {
                 key_stable_cnt++;
             }
         }
 
-        if ((key_stable_cnt >= 3) && (key_raw != key_state))
+        if ((key_stable_cnt >= 3u) && (key_raw != key_state))
         {
             key_state = key_raw;
-
-            if (key_state != 0)
+            if (key_state != 0u)
             {
-                /* 按下: 换下一个颜色 */
-                color_index = (uint8_t)((color_index + 1) % 5);
-                Apply_Color(oled_ok, color_index);
-
-                if (oled_ok != 0)
-                {
-                    Ssd1306_ShowLine(5, "KEY DOWN");
-                }
-                Board_UartSend("[key] SW1 pressed\r\n");
+                old_mode = Mode_Get();
+                Mode_Next(MODE_SRC_KEY);
             }
-            else
+        }
+
+        /* ---- 模式变了: 刷灯 + 刷屏 + 日志 (按键和上位机命令都会走这里) ---- */
+        if (Mode_TakeChanged() != 0u)
+        {
+            source = Mode_ChangedSource();
+            Show_Mode(oled_ok, Mode_Get());
+            Log_ModeChange(old_mode, Mode_Get(), source);
+            old_mode = Mode_Get();
+        }
+
+        /* ---- 每 100ms 刷一次计数和运行时间 ---- */
+        run_lo++;
+        if (run_lo >= 10u)
+        {
+            run_lo = 0;
+            run_count++;
+            Show_Counters(oled_ok);
+            if (oled_ok != 0u)
             {
-                if (oled_ok != 0)
-                {
-                    Ssd1306_ShowLine(5, "KEY UP");
-                }
-                Board_UartSend("[key] SW1 released\r\n");
+                Ssd1306_ShowLineU32(7, "RUN ", run_count);
             }
         }
     }

@@ -435,6 +435,26 @@
               <FilePath>.\user\board.h</FilePath>
             </File>
             <File>
+              <FileName>mode.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\user\mode.c</FilePath>
+            </File>
+            <File>
+              <FileName>mode.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\user\mode.h</FilePath>
+            </File>
+            <File>
+              <FileName>proto.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\user\proto.c</FilePath>
+            </File>
+            <File>
+              <FileName>proto.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\user\proto.h</FilePath>
+            </File>
+            <File>
               <FileName>stm32f10x_conf.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\user\stm32f10x_conf.h</FilePath>

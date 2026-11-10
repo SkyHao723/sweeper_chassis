@@ -74,6 +74,9 @@ void Board_UartSend(const char *text);
 void Board_UartSendU32(uint32_t value);
 void Board_UartSendHex8(uint8_t value);
 
+/* 非阻塞读一个字节: 1 = 读到 (放进 *out), 0 = 当前没有数据 */
+uint8_t Board_UartReadByte(uint8_t *out);
+
 /* 板载按键: 1 = 按下, 0 = 松开 */
 void Board_KeyInit(void);
 uint8_t Board_KeyDown(void);

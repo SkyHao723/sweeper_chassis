@@ -12,21 +12,21 @@
 
 | 外设 | 引脚 | 实现 | 现象 |
 |------|------|------|------|
-| OLED（SSD1306 128×64） | PB8=SCL, PB9=SDA | **软件 I2C**（开漏，见 §3.1） | 屏上 8 行字 + 每 100 ms 自增的运行计数 |
-| RGB 灯（XL-5050） | PB5 | WS2812 单线时序，DWT 周期计数器打拍，**软件调光 30 %** | 上电红色，**按一下按键换下一个颜色**：红→绿→蓝→白→灭→红… |
-| 板载按键 SW1 | PA15 | 上拉输入（需先关 JTAG，见 §3.2） | **切换 RGB 颜色**；屏上 `KEY DOWN`/`KEY UP`，串口打印边沿 |
-| 调试串口 | PA9=TX, PA10=RX | USART1 115200 8N1 → CH343P → USB | 上电横幅 + 按键/换色日志 |
+| OLED（SSD1306 128×64） | PB8=SCL, PB9=SDA | **软件 I2C**（开漏，见 §3.1） | 屏上 8 行：板子信息 + **当前模式** + 命令计数 + 运行计数 |
+| RGB 灯（XL-5050） | PB5 | WS2812 单线时序，DWT 周期计数器打拍，**软件调光 30 %** | **颜色 = 当前模式**：蓝=上位机控制 / 绿=遥控 / 橙=推行 |
+| 板载按键 SW1 | PA15 | 上拉输入（需先关 JTAG，见 §3.2） | **每按一下切模式**：HOST → RC → PUSH → HOST |
+| 调试串口 | PA9=TX, PA10=RX | USART1 115200 8N1 → CH343P → USB | 上电横幅 + 模式切换日志；**同时接收上位机的"切换模式"命令** |
 
-上电后屏幕应该是：
+上电后屏幕应该是（第 5 行随模式变）：
 
 ```
 TB01 CHASSIS V2
 MCU F103C8T6
 CLK 72 MHZ
 OLED OK
-LED PB5 WS2812
-KEY UP
-COLOR RED
+MODE HOST
+UART CMD OK
+RX 0 RJ 0
 RUN 000123
 ```
 
@@ -34,19 +34,47 @@ RUN 000123
 
 ```
 ======================================
- TB01 chassis controller V2 bring-up
+ TB01 chassis controller V2
 ======================================
 SYSCLK = 72 MHz
 OLED   = OK (SSD1306 @0x3C, soft I2C PB8/PB9)
 LED    = WS2812 on PB5, brightness 30 %
-KEY    = PA15 (pull-up, active low), press to change color
+KEY    = PA15: press to switch mode
+UART   = mode cmd: 7A 02 <mode> 00 00 00 <bcc> 7D
+[mode] power on = HOST
 ```
 
-按一下 PA15，屏幕第 6 行会变成 `KEY DOWN`、第 7 行 `COLOR GREEN`（再红→蓝→白→灭），
-松开变回 `KEY UP`；串口对应打印 `[key] SW1 pressed` / `[key] SW1 released` / `[led] color = GREEN`。
+### 1.1 三种工作模式
+
+| 模式 | 编号 | 灯色 | 上位机速度帧（`0x7B`） | 屏幕第 5 行 |
+|------|------|------|------------------------|-------------|
+| **HOST** 上位机控制 | 0 | 蓝 | **接受**（`RX` 计数 +1） | `UART CMD OK` |
+| **RC** 遥控 | 1 | 绿 | 忽略，记到 `RJ` | `REMOTE ONLY` |
+| **PUSH** 推行 | 2 | 橙 | 忽略，记到 `RJ`（电机释放，人工推车） | `MOTOR FREE` |
+
+两种切换方式，效果一样（都会刷灯 + 刷屏 + 打一行 `[mode] A -> B by key/uart`）：
+
+1. **按板载按键 PA15**：每按一下切下一个（30 ms 消抖）。
+2. **上位机发功能帧**（8 字节，`BCC = XOR(前 6 字节)`，尾 `0x7D`）：
+
+```
+上位机控制  7A 02 00 00 00 00 78 7D
+遥控        7A 02 01 00 00 00 79 7D
+推行        7A 02 02 00 00 00 7A 7D
+```
+
+用电脑试（串口走 CH343P，先装上 CH343 驱动，设备管理器看是哪个 COM）：
+
+```powershell
+python tools/v2_mode.py COM15 host            # 切上位机控制
+python tools/v2_mode.py COM15 rc --listen 3   # 切遥控, 并监听 3 秒串口打印
+python tools/v2_mode.py COM15 cycle           # HOST -> RC -> PUSH -> HOST 各切一次
+python tools/v2_mode.py COM15 rc --speed 200  # 切遥控后再发一条 200mm/s 速度帧
+                                              # （应被拒绝: 屏幕 RX 不变, RJ +1）
+```
 
 **亮度**：`hardware/ws2812.h` 里的 `WS2812_BRIGHTNESS_PERCENT`（默认 **30**，0~100），
-直接等比缩小 RGB 数值。觉得还亮就改 30、觉得暗就改 70，改完重新编译烧录即可。
+直接等比缩小 RGB 数值。觉得还亮就改 20、觉得暗就改 50，改完重新编译烧录即可。
 
 **看这两行就知道板子基本是好的**：
 
@@ -69,7 +97,7 @@ $p = Start-Process -FilePath $uv -ArgumentList @('-b','-r',$proj,'-t','chassis-v
 ```
 
 产物：`Objects/chassis-v2/chassis-v2.hex`
-（hex 14533 B MD5 `BFEA4CB80C7EC24A7AF5A95652507F46`；镜像 5148 B MD5 `6F55E787A6511D84A6833B5B40A0BBAB`；Code 4580 B / RO 524 B / RW 44 B / ZI 1636 B）。
+（hex 18358 B MD5 `49F922757687DEA5A89A64F2A19317DC`；镜像 6508 B MD5 `0D9A3AC5B4DF7A0808D07905F1615F20`；Code 5928 B / RO 516 B / RW 64 B / ZI 1648 B）。
 
 **推荐用脚本烧（会自己回读校验，并处理 NRST 没接的问题）**：
 
@@ -159,9 +187,11 @@ PB2 引到了 CN6 排针。复位瞬间 PB2 被拉高会从**内置 SRAM** 启�
 | `OLED NO ACK` | SDA/SCL 接反；模块有没有上拉（多数 0.96" 模块自带 4.7k）；屏是否 3.3 V；地址是 0x3C 还是 0x3D；PB8/PB9 被别的代码占用 |
 | 屏亮但全黑/花屏 | 初始化序列（对比度 `0x81 0x7F`、复用率 `0xA8 0x3F`、最后必须 `0xAF` 开显示） |
 | 灯不亮 | §3.3 电平问题（最常见）；PB5 是否接到灯珠 DIN；灯珠方向（DIN/DOUT 反了不亮） |
-| 灯亮但颜色错 | WS2812 是 **G→R→B** 顺序，不是 RGB；`Ws2812_SetPixel(i, r, g, b)` 内部已换成 G,R,B |
+| 灯亮但颜色不对 | WS2812 是 **G→R→B** 顺序，不是 RGB；`Ws2812_SetPixel(i, r, g, b)` 内部已换成 G,R,B。**正常情况灯色 = 模式**（蓝/绿/橙），出现红/白/灭说明跑的是旧固件 |
 | 灯**太亮/太暗** | 调 `hardware/ws2812.h` 的 `WS2812_BRIGHTNESS_PERCENT`（默认 30，0~100），这是软件调光、等比缩小 RGB 数值 |
-| 按键没反应 / 不换色 | 是否调了 `Board_SwdOnly()`；PA15 是否被调试器占用；按下是否真把脚拉到 GND（万用表量）；消抖是 30 ms（3×10 ms 采样），按太短会漏 |
+| 按键没反应 / 模式不切 | 是否调了 `Board_SwdOnly()`；PA15 是否被调试器占用；按下是否真把脚拉到 GND（万用表量）；消抖是 30 ms（3×10 ms 采样），按太短会漏 |
+| 上位机发命令没反应 | COM 口选错（要选 CH343P 那个）；波特率必须 115200；帧必须 8 字节且 BCC 对；最快判据是屏幕第 7 行 `RX` / `RJ` 有没有变化 |
+| `RJ` 一直猛涨 | `RJ` 记的是"因模式不对被丢掉的速度帧"，若在 HOST 模式下还涨说明波特率不对或帧被截断（正常应为 0） |
 
 用 DAPLink 直接读寄存器也很好使（GPIOB 基址 `0x40010C00`）：
 
@@ -179,8 +209,10 @@ GPIOB_IDR  = 0x0000fc10   # 实际电平
 stm32-chassis-v2/
 ├── stm32-chassis-v2.uvprojx   单 target: chassis-v2（宏: USE_STDPERIPH_DRIVER）
 ├── user/
-│   ├── main.c                 bring-up 主程序（屏幕 8 行 + 按键换色 + 串口）
-│   ├── board.c / board.h      板级：DWT 延时、关 JTAG、未用脚驻留、USART1、按键
+│   ├── main.c                 bring-up 主程序（屏幕 8 行 + 模式显示 + 按键 + 串口）
+│   ├── board.c / board.h      板级：DWT 延时、关 JTAG、未用脚驻留、USART1(收发)、按键
+│   ├── mode.c / mode.h        工作模式状态机（HOST / RC / PUSH）
+│   ├── proto.c / proto.h      上位机串口协议（0x7B 速度帧 / 0x7A 功能帧，切模式）
 │   ├── stm32f10x_conf.h       标准外设库裁剪
 │   └── stm32f10x_it.c/h       中断向量
 ├── hardware/
@@ -198,13 +230,17 @@ stm32-chassis-v2/
 
 ---
 
-## 6. 下一步（按顺序）
+## 6. 进度与下一步（按顺序）
+
+已完成：点亮 OLED / RGB / 按键 → 亮度可调 → **三种工作模式（HOST / RC / PUSH，按键 + 串口命令切换）**。
 
 1. **IMU**：ICM-42670-P 上硬件 I2C1（PB6/PB7），先读 WHO_AM_I（`0x75` 应为 `0x67`），再出角速度
 2. **AHT20**：挂在现有软件 I2C 上（地址 `0x38`）
 3. **CH554G**：USART3（PB10/PB11）通信协议待定（对方 MCU 负责 USB-A 主机口）
 4. **CAN**：PA11/PA12 + TJA1050，1 Mbps 标准帧，从旧固件搬达妙电机协议（速度帧 + 反馈解析）
-5. **串口协议**：把旧固件的 24 B 遥测帧 / 44 B 诊断帧 / 0x7A 功能帧搬过来（上位机不用改）
+5. **运动控制**：速度帧已经在收了（`Proto_GetHostCmd()` 拿 vx/wz），接上电机后按模式分发：
+   HOST 用上位机命令、RC 用遥控输入、PUSH 电机释放
+6. **串口回包**：把旧固件的 24 B 遥测帧 / 44 B 诊断帧搬过来，上位机（car_web）不用改
 
 旧固件可参考：`firmware/stm32-chassis/user/main.c` 的 CAN 收发与达妙协议；
 `firmware/stm32-chassis/hardware/YbImu.c` 是老的 YbImu（不是 ICM-42670-P），只能参考写法。
