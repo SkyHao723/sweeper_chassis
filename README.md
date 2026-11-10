@@ -338,6 +338,7 @@ TB01-CAN-USART/
 │   ├── v2_linkcheck.py             调试串口自测：发 100 帧后读 RAM 计数器判 PC->MCU 通不通/丢不丢
 │   ├── v2_uart_wire_probe.py       判定 CH343 的 TXD 接在哪个脚（读 GPIOA_IDR）
 │   ├── v2_uart_txprobe.py          判定 CH343 的 RXD 有没有接到 PA9（把 PA9 拉低看 PC 收到什么）
+│   ├── v2_web.py                   网页面板: 实时显示 IMU/温湿度/模式/遥控/链路 + 网页下发切模式与速度
 │   ├── ramp_test.py                 直连串口做缓起缓停阶跃测试（发 11 B/收 44 B+24 B，存 JSON）
 │   ├── analyze_ramp.py              斜坡阶梯/到顶时间分析
 │   ├── imu_probe.py                 静态探测 IMU 状态位与六轴原始值（不动车）
