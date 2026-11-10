@@ -207,6 +207,28 @@ python tools/v2_gamepad.py COM18 play --mode rc --seconds 6 --listen
 屏幕第 3 行就是遥控状态：`RC X<n> Y<n> h<n>`（左摇杆千分制 + 十字键），最右边 `b0xNN` 是按钮字节；
 离线时显示 `RC -- (no pad)`。
 
+**没有 CH554G / 接收器时怎么验证**：`tools/v2_rcinject.py` 直接用 DAPLink 把一帧 15 字节塞进 `rc.c` 的
+环形缓冲（`s_ring` + `s_ring_head`，地址从 `.map` 里查），主循环照常 `Rc_Poll()` 解码，然后复位 → 等 150 ms →
+`halt` 读回状态。**注意必须在同一次 openocd 会话里做完**：在线判定 300 ms 就超时，两次调用之间光启动就 1 s。
+
+```powershell
+python tools/v2_rcinject.py 1   # 切 RC 模式跑完整用例
+python tools/v2_rcinject.py 0   # 保持 HOST 模式
+```
+
+实测结果（2026-11-10，chassis-v2 固件）：
+
+| 注入帧 | `s_state` | `s_vx/s_wz` | 遥测 `v_cmd` |
+|--------|-----------|-------------|--------------|
+| 左摇杆推满向前 | `y=65535` | `+600 mm/s` | 与之一致 |
+| 左摇杆推满向右 | `x=65535` | `wz=-798 mrad/s` | 与之一致 |
+| 中位 | `x=32768 y=32767` | `0 / 0` | `(0,0)` |
+| 按 A + 十字键右 | `btn=0x01 hat=3` | — | — |
+| LT 按到底 | `z=65408`（=32768+255×128） | — | — |
+
+即：帧同步、15 字节布局、摇杆映射、按钮/十字键/扳机解码、`0x79` 上行与遥测里的 `v_cmd` 全部跑通；
+只差 CH554G 那颗 MCU 把字节真的送进来。
+
 
 ---
 
