@@ -19,9 +19,9 @@
 *     CH554G P3.0 (RXD0)  <-  STM32 PB10 (USART3_TX)   [本固件不发，只收]
 *     CH554G GND          ->  STM32 GND
 *     CH554G V33/VCC      ->  3.3V
-*     注意：P3.0/P3.1 同时是 CH554 的 ISP 下载口（见 README 的烧录章节），
-*           所以烧 CH554 时要么走 USB-A 口（A-A 线），要么临时把这两根线让给 USB-TTL。
-*           （P1.4/P1.6/P1.7 是 SPI0 的 SCS/MISO/SCK，也复用 UART1，但本板没接到 STM32）
+*     注意：数据口用的 P3.0/P3.1 是 UART0；CH554 的串口 ISP 下载口是 **UART1 =
+*           P1.6(RXD1)/P1.7(TXD1)**（板上丝印 MISO/SCK），和数据口分开，互不影响。
+*           烧录方法见 README §4（USB-TTL 接 P1.6/P1.7/GND，WCHISPStudio 选"串口下载"）。
 *
 *   编译：Keil C51（uVision4/5），工程文件 CH554Gamepad.uvproj，输出 CH554Gamepad.hex
 *   烧录：WCHISPStudio / WCHISPTool，USB 下载方式（见 README.md）
