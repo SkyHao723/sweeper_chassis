@@ -14,13 +14,14 @@
 *        做法：USB 侧收到什么就缓存下来，主循环按 GAMEPAD_SEND_MS 的节奏固定重发。
 *     3. 不允许在中断里发 UART：15 字节 @115200 约 1.3 ms，会打乱 USB 轮询。
 *
-*   硬件连接（与 STM32 的连线）：
-*     CH554G P1.7 (TXD1)  ->  STM32 PB11 (USART3_RX)
-*     CH554G P1.6 (RXD1)  <-  STM32 PB10 (USART3_TX)   [本固件不发，只收]
+*   硬件连接（与 STM32 的连线，按实际焊接：P3.0 / P3.1）：
+*     CH554G P3.1 (TXD0)  ->  STM32 PB11 (USART3_RX)
+*     CH554G P3.0 (RXD0)  <-  STM32 PB10 (USART3_TX)   [本固件不发，只收]
 *     CH554G GND          ->  STM32 GND
 *     CH554G V33/VCC      ->  3.3V
-*     注意：这块 CH554 板把 P1.4/P1.6/P1.7 标成 SCS/MISO/SCK（SPI0 从机脚），
-*           但 CH554 的 UART1 默认就用 P1.6/P1.7，两者是同一组引脚。
+*     注意：P3.0/P3.1 同时是 CH554 的 ISP 下载口（见 README 的烧录章节），
+*           所以烧 CH554 时要么走 USB-A 口（A-A 线），要么临时把这两根线让给 USB-TTL。
+*           （P1.4/P1.6/P1.7 是 SPI0 的 SCS/MISO/SCK，也复用 UART1，但本板没接到 STM32）
 *
 *   编译：Keil C51（uVision4/5），工程文件 CH554Gamepad.uvproj，输出 CH554Gamepad.hex
 *   烧录：WCHISPStudio / WCHISPTool，USB 下载方式（见 README.md）
@@ -37,8 +38,8 @@
  *-------------------------------------------------------------------------*/
 #define GAMEPAD_REPORT_SIZE     15      /* 手柄输入报告长度（字节），STM32 侧写死 15 */
 #define GAMEPAD_SEND_MS          8      /* 转发节奏：8 ms = 125 Hz（STM32 侧 300 ms 超时）*/
-#define GAMEPAD_UART1_ALTER      0      /* 0 = TXD1/RXD1 在 P1.7/P1.6；1 = 在 P3.2/P3.4 */
-#define GAMEPAD_DEBUG_UART0      0      /* 1 = 用 UART0(P3.1) 打调试信息（115200）*/
+#define GAMEPAD_UART0_ALTER      0      /* 0 = TXD0/RXD0 在 P3.1/P3.0；1 = 改到 P1.3/P1.2 */
+#define GAMEPAD_DEBUG_UART1      0      /* 1 = 用 UART1(P1.6/P1.7) 打调试信息（与数据口分开） */
 
 /*---------------------------------------------------------------------------
  * USB 主机库要求由应用提供的数据（保持与 WCH 官方例程一致）
@@ -111,54 +112,74 @@ UINT16  g_usb_packets;                          /* USB IN 成功包数（调试�
 UINT8   g_other_len;                            /* 最近一次非 15 字节包的长度（调试用） */
 
 /*---------------------------------------------------------------------------
- * UART1：115200 8N1，默认引脚 P1.6(RXD1)/P1.7(TXD1)
+ * 数据口：UART0，115200 8N1，默认引脚 P3.1(TXD0)/P3.0(RXD0)
+ *   P3.1 (TXD0) -> STM32 PB11 (USART3_RX)      [本固件只发]
+ *   P3.0 (RXD0) <- STM32 PB10 (USART3_TX)      [本固件不收]
+ *   注意：P3.0/P3.1 同时是 CH554 的 ISP 下载口，烧录时要么走 USB-A 口，
+ *         要么让 STM32 让开这两根线（见 firmware/ch554-gamepad/README.md）
  *-------------------------------------------------------------------------*/
-static void Uart1_Init( void )
+static void DataUart_Init( void )
 {
-    U1SM0  = 0;                                 /* 8 位数据位 */
-    U1SMOD = 1;                                 /* 快速模式：Fsys/16/(256-SBAUD1) */
-    U1REN  = 1;                                 /* 允许接收（本应用不用，留着以后收命令） */
-    SBAUD1 = 0 - ( FREQ_SYS / 16 / UART1_BUAD );
-    U1TI   = 0;
+    mInitSTDIO();                               /* 官方 Debug.C：UART0 模式1，T1 做波特率，115200 */
 
-#if ( GAMEPAD_UART1_ALTER )
-    PIN_FUNC |= bUART1_PIN_X;                   /* TXD1/RXD1 改到 P3.2/P3.4 */
+#if ( GAMEPAD_UART0_ALTER )
+    PIN_FUNC |= bUART0_PIN_X;                   /* TXD0/RXD0 改到 P1.3/P1.2 */
+    P1_MOD_OC &= ~0x08;  P1_DIR_PU |=  0x08;    /* P1.3 TXD 推挽输出 */
+    P1_MOD_OC |=  0x04;  P1_DIR_PU |=  0x04;    /* P1.2 RXD 准双向带上拉 */
 #else
-    PIN_FUNC &= ~bUART1_PIN_X;                  /* 默认 P1.7/P1.6 */
+    PIN_FUNC &= ~bUART0_PIN_X;                  /* 默认 P3.1/P3.0 */
+    P3_MOD_OC &= ~0x02;  P3_DIR_PU |=  0x02;    /* P3.1 TXD 推挽输出 */
+    P3_MOD_OC |=  0x01;  P3_DIR_PU |=  0x01;    /* P3.0 RXD 准双向带上拉 */
 #endif
-    /* P1.7 (TXD1) 推挽输出：P1_MOD_OC.7=0, P1_DIR_PU.7=1
-       用 |= / &= 的方式，不能直接赋值，否则会把其它引脚配错 */
-    P1_MOD_OC &= ~0x80;
-    P1_DIR_PU |=  0x80;
+    /* 只动低 2 位，绝不碰 P3.6/P3.7（USB D+/D-） */
+    TI = 0;                                     /* mInitSTDIO 结束时 TI=1，这里清掉 */
 }
 
-static void Uart1_SendByte( UINT8 dat )
+static void DataUart_SendByte( UINT8 dat )
 {
-    U1TI = 0;
-    SBUF1 = dat;
-    while ( U1TI == 0 );
-    U1TI = 0;
+    TI = 0;                                     /* 必须先清，否则第一字节会立即返回（漏发） */
+    SBUF = dat;
+    while ( TI == 0 );
+    TI = 0;
 }
 
-static void Uart1_SendBytes( const UINT8X *buf, UINT8 len )
+static void DataUart_SendBytes( const UINT8X *buf, UINT8 len )
 {
     UINT8 i;
     for ( i = 0; i < len; i++ )
     {
-        Uart1_SendByte( buf[ i ] );
+        DataUart_SendByte( buf[ i ] );
     }
 }
 
-#if ( GAMEPAD_DEBUG_UART0 )
-static void Uart0_Init( void )
+#if ( GAMEPAD_DEBUG_UART1 )
+/* 调试口：UART1，P1.7(TXD1)/P1.6(RXD1)，和数据口分开，不影响手柄转发 */
+static void Debug_Uart_Init( void )
 {
-    mInitSTDIO();                               /* 官方 Debug.C：T1 做波特率，115200 */
+    U1SM0  = 0;                                 /* 8 位数据位 */
+    U1SMOD = 1;                                 /* 快速模式：Fsys/16/(256-SBAUD1) */
+    U1REN  = 0;
+    SBAUD1 = 0 - ( FREQ_SYS / 16 / UART1_BUAD );
+    U1TI   = 0;
+    PIN_FUNC &= ~bUART1_PIN_X;                  /* 默认 P1.7/P1.6 */
+    P1_MOD_OC &= ~0x80;                         /* P1.7 TXD1 推挽输出 */
+    P1_DIR_PU |=  0x80;
 }
 
-static void Uart0_Hex( UINT8 v )
+static void Debug_PutChar( UINT8 c )
 {
-    UINT8 lo = v & 0x0F;
-    CH554UART0SendByte( lo < 10 ? ( '0' + lo ) : ( 'A' + lo - 10 ) );
+    U1TI = 0;
+    SBUF1 = c;
+    while ( U1TI == 0 );
+    U1TI = 0;
+}
+
+static void Debug_Hex8( UINT8 v )
+{
+    UINT8 hi = (UINT8)( v >> 4 );
+    UINT8 lo = (UINT8)( v & 0x0F );
+    Debug_PutChar( hi < 10 ? (UINT8)( '0' + hi ) : (UINT8)( 'A' + hi - 10 ) );
+    Debug_PutChar( lo < 10 ? (UINT8)( '0' + lo ) : (UINT8)( 'A' + lo - 10 ) );
 }
 #endif
 
@@ -283,11 +304,11 @@ void main( void )
     CfgFsys( );                                 /* 系统时钟 24 MHz（内部） */
     mDelaymS( 50 );
 
-#if ( GAMEPAD_DEBUG_UART0 )
-    Uart0_Init( );
+#if ( GAMEPAD_DEBUG_UART1 )
+    Debug_Uart_Init( );
 #endif
 
-    Uart1_Init( );                              /* 先把手柄数据口准备好 */
+    DataUart_Init( );                           /* 先把手柄数据口准备好（UART0 P3.1/P3.0）*/
     Timer0_Init( );
 
     InitUSB_Host( );
@@ -325,7 +346,7 @@ void main( void )
             if ( (UINT8)( g_tick_ms - g_last_send_ms ) >= GAMEPAD_SEND_MS )
             {
                 g_last_send_ms = g_tick_ms;
-                Uart1_SendBytes( g_last_report, GAMEPAD_REPORT_SIZE );
+                DataUart_SendBytes( g_last_report, GAMEPAD_REPORT_SIZE );
                 g_sent_frames++;
             }
         }
