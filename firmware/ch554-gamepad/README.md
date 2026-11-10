@@ -65,9 +65,9 @@ Get-Content build.log | Select-Object -Last 6
 当前版本的产物：
 
 - **0 Error(s), 0 Warning(s)**
-- `Program Size: data=16.3 xdata=802 code=9420`
-- `CH554Gamepad.hex` 27537 B，MD5 `EB1E62B03A92381BDC1C05F1B6B8B9C4`
-- 镜像 9420 B（0x0000~0x24CB），MD5 `5508986DE696C16C1702EF2C92602243`
+- `Program Size: data=16.3 xdata=802 code=9456`
+- `CH554Gamepad.hex` 27661 B，MD5 `8CAD83A5D83EC507C5E85F26A5B8D362`
+- 镜像 9456 B（0x0000~0x24EF），MD5 `A9964B7520FA88E7C88C5E82F969777B`
 
 工程里只有 3 个源文件：`Public\Debug.C`（时钟/延时）、`USB\USB_LIB\USBHOST.C`（WCH USB Host 协议栈）、
 `App\GamepadHost.C`（本应用）。`Public\` 与 `USB\USB_LIB\` 是 WCH 官方 CH554 EVT 例程原文件，
@@ -157,7 +157,12 @@ CH55x 的 ISP 有 **两条路：USB 下载 或 串口下载**，没有 SPI 下�
    重新解析出"中断 + IN"端点。
 2. **空闲心跳**：还没有报告时每 200 ms 发 15 个 `0x55`。STM32 侧会把它当坏帧
    （`s_bad` 涨、RC 仍离线）——**这正好用来区分"没插设备/没枚举到"和"线断了/波特率不对"**。
-3. **UART1 调试日志**（P1.7=TXD1=板上 `SCK`，和数据口分开，也正好是 ISP 下载口）：
+3. **上电标记**：`main()` 里配好数据口后**第一件事**就是发一整包 `0xAA`（15 个字节），
+   不依赖 USB、不依赖调试口、不依赖定时器。**只要 STM32 侧 `s_bad` 每次上电涨 1，
+   就说明"CH554 起来了 + 时钟对了 + P3.1→PB11 通了"**，把问题二分得很干净。
+4. **调试口不会卡死主循环**：`Log_PutChar()` 的等待加了超时计数，
+   即使 UART1 因为接线/配置不出 `U1TI`，也不会卡在建日志那一步（之前这是个隐患）。
+5. **UART1 调试日志**（P1.7=TXD1=板上 `SCK`，和数据口分开，也正好是 ISP 下载口）：
 
    ```
    [ch554] gamepad host v2 (uart0 p3.1/p3.0 115200)

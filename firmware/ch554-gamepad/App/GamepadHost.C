@@ -182,6 +182,18 @@ static void DataUart_SendIdle( void )
     }
 }
 
+/* 上电标记：一整包都是 0xAA，STM32 侧必然判坏帧。
+   放在 main 最前面发，用来证明"芯片起来了 + 时钟对了 + 数据线通了"，
+   即使后面的 USB 初始化/UART1 调试口出问题也不影响这一包。 */
+static void DataUart_SendBootMark( void )
+{
+    UINT8 i;
+    for ( i = 0; i < GAMEPAD_REPORT_SIZE; i++ )
+    {
+        DataUart_SendByte( 0xAA );
+    }
+}
+
 #if ( GAMEPAD_DEBUG_UART1 )
 /*---------------------------------------------------------------------------
  * 调试口：UART1，P1.7(TXD1/SCK)/P1.6(RXD1/MISO)，和数据口 P3.0/P3.1 分开
@@ -202,9 +214,13 @@ static void Debug_Uart_Init( void )
 
 static void Log_PutChar( UINT8 c )
 {
+    UINT16 guard = 3000;                        /* 带超时：UART1 万一不出 TI 也绝不能卡死主循环 */
     U1TI = 0;
     SBUF1 = c;
-    while ( U1TI == 0 );
+    while ( U1TI == 0 && guard )
+    {
+        guard--;
+    }
     U1TI = 0;
 }
 
@@ -486,6 +502,11 @@ void main( void )
 #endif
 
     DataUart_Init( );                           /* 先把手柄数据口准备好（UART0 P3.1/P3.0）*/
+
+    /* 第一件事：往 STM32 发一包 0xAA，证明"芯片起来了、时钟对了、数据线通了"。
+       这一包不依赖 USB、不依赖调试口、也不依赖 Timer0。 */
+    DataUart_SendBootMark( );
+
     Timer0_Init( );
 
     LOG( "\r\n[ch554] gamepad host v2 (uart0 p3.1/p3.0 115200)\r\n" );
@@ -545,13 +566,13 @@ void main( void )
                 g_sent_frames++;
             }
         }
-#if ( GAMEPAD_DEBUG_UART1 )
         else if ( (UINT8)( g_tick_ms - g_last_idle_ms ) >= GAMEPAD_IDLE_MS )
         {
             g_last_idle_ms = g_tick_ms;
             DataUart_SendIdle( );
         }
 
+#if ( GAMEPAD_DEBUG_UART1 )
         /* 5. 周期性状态行 */
         if ( (UINT8)( g_tick_ms - g_last_log_ms ) >= GAMEPAD_LOG_PERIOD_MS )
         {
