@@ -349,11 +349,16 @@ TB01-CAN-USART/
     │   ├── hardware/                YbImu 等外设驱动
     │   ├── sys/  lib/  start/  RTE/  ST 标准外设库 / CMSIS
     │   └── Objects/<车型>/          各 target 独立输出目录
-    └── stm32-chassis-v2/            ★ 新底盘主控 V2（新板 STM32F103C8T6，2026-11 起）
-        ├── stm32-chassis-v2.uvprojx 单 target：chassis-v2
-        ├── user/                    main.c（点灯 bring-up）/ board.c,h（板级初始化+串口）
-        ├── hardware/                ws2812.c,h（PB5 RGB 灯）/ ssd1306.c,h（软件 I2C PB8/PB9 屏）
-        └── README.md                新板引脚表、编译烧录、bring-up 自检清单、硬件风险
+    ├── stm32-chassis-v2/            ★ 新底盘主控 V2（新板 STM32F103C8T6，2026-11 起）
+    │   ├── stm32-chassis-v2.uvprojx 单 target：chassis-v2
+    │   ├── user/                    main.c（点灯 bring-up）/ board.c,h（板级初始化+串口）
+    │   ├── hardware/                ws2812.c,h（PB5 RGB 灯）/ ssd1306.c,h（软件 I2C PB8/PB9 屏）
+    │   └── README.md                新板引脚表、编译烧录、bring-up 自检清单、硬件风险
+    └── ch554-gamepad/              CH554G 固件（Keil C51）：USB Host 读手柄 15 字节 → UART 转发给 STM32
+        ├── App/GamepadHost.C        应用（WCH USB Host 协议栈 + 固定 125 Hz 转发）
+        ├── CH554Gamepad.uvproj      Keil C51 工程（0 Error / 0 Warning）
+        ├── CH554Gamepad.hex         现成固件
+        └── README.md                15 字节协议、连线、WCHISPStudio 烧录步骤、排错
 ```
 
 ---

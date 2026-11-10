@@ -1,0 +1,15 @@
+# Keil C51 编译中间产物（保留 CH554Gamepad.hex 作为现成固件）
+*.obj
+*.lst
+*.M51
+*.lnp
+*.plg
+*.__i
+*.build_log.htm
+build.log
+CH554Gamepad
+*.uvgui.*
+*.uvopt
+
+# 根 .gitignore 忽略了 *.hex，这里把现成固件放回来
+!CH554Gamepad.hex
