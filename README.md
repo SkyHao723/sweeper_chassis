@@ -338,12 +338,17 @@ TB01-CAN-USART/
 │   ├── start_chassis_7.sh           192.168.5.7 上启动底盘节点
 │   └── decode_diag.py               解码 44 B 诊断帧
 └── firmware/
-    └── stm32-chassis/               Keil MDK 工程（唯一的固件）
-        ├── stm32-chassis.uvprojx    两个 target：sweeper / scrubber
-        ├── user/                    main.c（全部固件逻辑）
-        ├── hardware/                YbImu 等外设驱动
-        ├── sys/  lib/  start/  RTE/  ST 标准外设库 / CMSIS
-        └── Objects/<车型>/          各 target 独立输出目录
+    ├── stm32-chassis/               旧底盘固件（Keil MDK 工程，现役：洗地车/扫地车，稳定版 fw-v8.0）
+    │   ├── stm32-chassis.uvprojx    两个 target：sweeper / scrubber
+    │   ├── user/                    main.c（全部固件逻辑）
+    │   ├── hardware/                YbImu 等外设驱动
+    │   ├── sys/  lib/  start/  RTE/  ST 标准外设库 / CMSIS
+    │   └── Objects/<车型>/          各 target 独立输出目录
+    └── stm32-chassis-v2/            ★ 新底盘主控 V2（新板 STM32F103C8T6，2026-11 起）
+        ├── stm32-chassis-v2.uvprojx 单 target：chassis-v2
+        ├── user/                    main.c（点灯 bring-up）/ board.c,h（板级初始化+串口）
+        ├── hardware/                ws2812.c,h（PB5 RGB 灯）/ ssd1306.c,h（软件 I2C PB8/PB9 屏）
+        └── README.md                新板引脚表、编译烧录、bring-up 自检清单、硬件风险
 ```
 
 ---
