@@ -243,7 +243,7 @@ small{color:var(--dim)}
     <div class="row"><span class="k">wz</span><span class="v" id="wz">--</span></div>
     <div class="row"><span class="k">上位机命令数</span><span class="v" id="rx">--</span></div>
     <div class="row"><span class="k">被拒（模式不对）</span><span class="v" id="rj">--</span></div>
-    <div class="row"><span class="k">运行时间</span><span class="v" id="tick">--</span></div>
+    <div class="row"><span class="k">固件计时</span><span class="v" id="tick">--</span></div>
   </div>
 
   <div class="card">
@@ -264,7 +264,7 @@ small{color:var(--dim)}
     <div class="row"><span class="k">遥测帧率</span><span class="v" id="lhz">--</span></div>
     <div class="row"><span class="k">遥测帧数</span><span class="v" id="lcount">--</span></div>
     <div class="row"><span class="k">遥控帧数</span><span class="v" id="lrc">--</span></div>
-    <div class="row"><span class="k">丢弃字节</span><span class="v" id="lbad">--</span></div>
+    <div class="row"><span class="k">重同步字节</span><span class="v" id="lbad">--</span></div>
     <div class="row"><span class="k">程序版本</span><span class="v" id="lver">--</span></div>
     <div class="row"><span class="k">错误</span><span class="v" id="lerr">--</span></div>
   </div>
