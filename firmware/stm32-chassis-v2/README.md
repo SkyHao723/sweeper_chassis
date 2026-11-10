@@ -62,9 +62,20 @@ $p = Start-Process -FilePath $uv -ArgumentList @('-b','-r',$proj,'-t','chassis-v
 # 要求: exit=0 且 "0 Error(s), 0 Warning(s)"
 ```
 
-产物：`Objects/chassis-v2/chassis-v2.hex`（当前 13895 B，MD5 `ACE726C987402B0890C202414011AB4B`）。
+产物：`Objects/chassis-v2/chassis-v2.hex`
+（hex 13895 B MD5 `ACE726C987402B0890C202414011AB4B`；镜像 4920 B MD5 `B837235577331E31DF3EACCBE381337E`）。
 
-烧录（DAPLink / ST-Link 都行；openocd 里 hex 路径必须用**正斜杠**）：
+**推荐用脚本烧（会自己回读校验，并处理 NRST 没接的问题）**：
+
+```powershell
+python tools/flash_hex.py firmware/stm32-chassis-v2/Objects/chassis-v2/chassis-v2.hex
+```
+
+它会做三件事：`program ... verify` → 独立 `dump_image` 回读比 MD5 → 写 AIRCR 软复位启动。
+注意 openocd 的 `program {x.bin}` **不认 bin 里的地址**（会从 0x00000000 开始写，报
+`no flash bank found for address 0x00000000`），所以只能喂 hex 让它自己解析地址。
+
+手动烧（等价命令）：
 
 ```powershell
 D:\program\xpack-openocd-0.12.0-7\bin\openocd.exe `

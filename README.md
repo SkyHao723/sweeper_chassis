@@ -330,6 +330,7 @@ TB01-CAN-USART/
 ├── tools/
 │   ├── car_web/                     网页遥控器（:8000，直连串口，供前期调试）
 │   ├── rsh.py                       远程执行主机命令（paramiko）
+│   ├── flash_hex.py                 DAPLink+openocd 烧录 hex 并独立回读校验（两个固件工程通用）
 │   ├── ramp_test.py                 直连串口做缓起缓停阶跃测试（发 11 B/收 44 B+24 B，存 JSON）
 │   ├── analyze_ramp.py              斜坡阶梯/到顶时间分析
 │   ├── imu_probe.py                 静态探测 IMU 状态位与六轴原始值（不动车）
