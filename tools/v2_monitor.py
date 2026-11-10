@@ -113,6 +113,52 @@ def format_line(info):
     )
 
 
+# ----------------------------- 遥控上行帧 (0x79, 19 字节) -----------------------------
+
+RC_HEAD = 0x79
+RC_SIZE = 19
+RC_BUTTONS = [(0x01, "A"), (0x02, "B"), (0x04, "X"), (0x08, "Y"),
+              (0x10, "LB"), (0x20, "RB"), (0x40, "Back"), (0x80, "Start")]
+RC_HATS = ["-", "U", "UR", "R", "DR", "D", "DL", "L", "UL"]
+
+
+def decode_rc(frame):
+    """19 字节: 79 | flags | 15 字节 HID 原始数据 | BCC | 7D"""
+    if len(frame) != RC_SIZE:
+        return None
+    if frame[0] != RC_HEAD or frame[18] != TAIL:
+        return None
+    if xor_bcc(frame[:17]) != frame[17]:
+        return None
+    flags = frame[1]
+    hid = frame[2:17]
+    buttons = hid[11]
+    names = [n for bit, n in RC_BUTTONS if buttons & bit]
+    hat = (hid[12] >> 2) & 0x0F
+    return {
+        "flags": flags,
+        "online": bool(flags & 0x01),
+        "changed": bool(flags & 0x02),
+        "x": hid[1] | (hid[2] << 8),
+        "y": hid[3] | (hid[4] << 8),
+        "rx": hid[5] | (hid[6] << 8),
+        "ry": hid[7] | (hid[8] << 8),
+        "z": hid[9] | (hid[10] << 8),
+        "buttons": buttons,
+        "button_names": names,
+        "hat": hat,
+        "hat_name": RC_HATS[hat] if hat < len(RC_HATS) else "?",
+        "raw": bytes(hid).hex(),
+    }
+
+
+def format_rc(info):
+    return ("[rc ] online=%d changed=%d X=%5d Y=%5d Rx=%5d Ry=%5d Z=%5d hat=%s btn=%s"
+            % (info["online"], info["changed"], info["x"], info["y"],
+               info["rx"], info["ry"], info["z"],
+               info["hat_name"], "+".join(info["button_names"]) or "-"))
+
+
 # ----------------------------- 串口实时 -----------------------------
 
 
@@ -125,7 +171,9 @@ def run_serial(port, baud, seconds):
     deadline = None if seconds <= 0 else time.time() + seconds
     buffer = bytearray()
     frames = 0
+    rc_frames = 0
     bad = 0
+    last_rc = None
 
     with serial.Serial(port, baud, timeout=0.2) as link:
         print("串口 %s @%d, 按 Ctrl-C 结束" % (port, baud))
@@ -136,28 +184,42 @@ def run_serial(port, baud, seconds):
             if chunk:
                 buffer.extend(chunk)
 
-            # 找帧头 -> 够 32 字节 -> 校验
+            # 两种帧都要认: 0x7E 遥测(32B) / 0x79 遥控(19B)
             while True:
-                start = buffer.find(bytes([HEAD]))
-                if start < 0:
-                    buffer.clear()
+                if not buffer:
                     break
-                if start > 0:
-                    del buffer[:start]
-                if len(buffer) < FRAME_SIZE:
+                head = buffer[0]
+                if head == HEAD:
+                    need = FRAME_SIZE
+                    decoder = decode
+                elif head == RC_HEAD:
+                    need = RC_SIZE
+                    decoder = decode_rc
+                else:
+                    bad += 1
+                    del buffer[:1]
+                    continue
+                if len(buffer) < need:
                     break
-                candidate = buffer[:FRAME_SIZE]
-                info = decode(candidate)
+                candidate = buffer[:need]
+                info = decoder(candidate)
                 if info is None:
                     bad += 1
                     del buffer[:1]
                     continue
-                frames += 1
-                print("[%6.2fs] %s" % (time.time() % 1000, format_line(info)))
-                del buffer[:FRAME_SIZE]
+                del buffer[:need]
+                if head == HEAD:
+                    frames += 1
+                    print("[%6.2fs] %s" % (time.time() % 1000, format_line(info)))
+                else:
+                    rc_frames += 1
+                    line = format_rc(info)
+                    if line != last_rc:
+                        last_rc = line
+                        print("[%6.2fs] %s" % (time.time() % 1000, line))
 
     print("")
-    print("共 %d 帧, 丢弃 %d 字节组" % (frames, bad))
+    print("共 %d 帧遥测, %d 帧遥控, 丢弃 %d 字节组" % (frames, rc_frames, bad))
     return 0
 
 
