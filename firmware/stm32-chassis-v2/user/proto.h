@@ -27,7 +27,13 @@
   *      遥控        7A 02 01 00 00 00 79 7D
   *      推行        7A 02 02 00 00 00 7A 7D
   *
-  * 串口只做"收", 不做应答/回包; 状态从屏幕和调试打印上看(以后再加回包)。
+  * 3) 调试注入帧 (18 字节, 只给调试用)
+ *      [0]=0x78  [1..15]=15 字节手柄原始 HID 报告  [16]=BCC=XOR([0..15])  [17]=0x7D
+ *    ★ 正常的手柄数据是从 USART3 (CH554G) 进来的; 这一帧让上位机在没有接收器/
+ *      没有 CH554G 时也能把 15 字节塞进同一条解析+映射路径, 用来验证遥控模式
+ *      和上行遥控帧(0x79)。见 tools/v2_gamepad.py。
+ *
+ * 串口只做"收", 不做应答/回包; 状态从屏幕和调试打印上看(以后再加回包)。
   ******************************************************************************
   */
 
@@ -37,6 +43,8 @@
 #define PROTO_CMD_SIZE 11u
 #define PROTO_FUNC_HEAD 0x7Au
 #define PROTO_FUNC_SIZE 8u
+#define PROTO_PAD_HEAD 0x78u
+#define PROTO_PAD_SIZE 18u
 #define PROTO_TAIL 0x7Du
 
 #define PROTO_FUNC_ID_AUX_BTN 0x01u

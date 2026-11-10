@@ -1,6 +1,7 @@
 #include "proto.h"
 #include "board.h"
 #include "mode.h"
+#include "rc.h"
 
 /**
   ******************************************************************************
@@ -14,7 +15,7 @@
   ******************************************************************************
   */
 
-static uint8_t s_buf[PROTO_CMD_SIZE];
+static uint8_t s_buf[PROTO_PAD_SIZE]; /* 最长的一帧: 调试注入帧 18 字节 */
 static uint8_t s_len;
 
 static int16_t s_host_vx_mm_s;
@@ -82,6 +83,13 @@ static void Proto_Dispatch(const uint8_t *frame)
         return;
     }
 
+    /* ---------- 调试注入帧: 15 字节手柄原始数据 ---------- */
+    if (frame[0] == PROTO_PAD_HEAD)
+    {
+        (void)Rc_InjectFrame(&frame[1]);
+        return;
+    }
+
     /* ---------- 功能帧 ---------- */
     s_func_frames++;
 
@@ -125,6 +133,10 @@ static uint8_t Proto_FrameNeed(void)
     if (s_buf[0] == PROTO_FUNC_HEAD)
     {
         return (uint8_t)PROTO_FUNC_SIZE;
+    }
+    if (s_buf[0] == PROTO_PAD_HEAD)
+    {
+        return (uint8_t)PROTO_PAD_SIZE;
     }
     return 1u;
 }
@@ -172,7 +184,7 @@ void Proto_FeedByte(uint8_t byte)
     uint8_t need;
 
     /* 缓冲满了先丢掉最老的, 保证永远有新字节的位置 */
-    if (s_len >= (uint8_t)PROTO_CMD_SIZE)
+    if (s_len >= (uint8_t)PROTO_PAD_SIZE)
     {
         Proto_DropFirst();
     }

@@ -8,25 +8,26 @@
 #include "icm42670.h"
 #include "aht20.h"
 #include "telemetry.h"
+#include "rc.h"
 
 /**
   ******************************************************************************
   * @file    main.c
-  * @brief   底盘主控 V2 (STM32F103C8T6) —— 点灯 + 模式 + IMU + 温湿度 + 上行遥测
+  * @brief   底盘主控 V2 (STM32F103C8T6) —— 点灯 + 模式 + IMU + 温湿度 + 遥控输入 + 上行遥测
   *
   * 屏幕 8 行:
   *   0  TB01 CHASSIS V2
   *   1  CLK 72 MODE HOST    ← CLK 不是 72 说明 8MHz 晶振没起振
   *   2  IMU 0x67 AHT OK     ← IMU 探测到的地址(0=没找到) / AHT20 状态
-  *   3  a 0.01 -0.02 1.00   ← 加速度, 单位 g
-  *   4  g 0.1 -0.2 0.3      ← 角速度, 单位 °/s
-  *   5  T 25.3C H 45.2%     ← AHT20 温度(°C) / 湿度(%RH)
-  *   6  RX 12 RJ 0          ← 接受的速度帧数 / 因模式不对被丢的帧数
-  *   7  RUN 000123
+  *   3  RC OK X310 Y-120 h5 ← 手柄在线? 左摇杆千分制 + 十字键
+  *   4  a 0.01 -0.02 1.00   ← 加速度, 单位 g
+  *   5  g 0.1 -0.2 0.3      ← 角速度, 单位 °/s
+  *   6  T 25.3C H 45.2%     ← AHT20 温度(°C) / 湿度(%RH)
+  *   7  RX 12 RJ 0 RUN 5    ← 上位机速度帧数 / 被丢帧数 / 运行秒数
   *
   * 三种模式 (见 mode.h):
   *   HOST 上位机控制  灯=蓝   接受上位机速度命令
-  *   RC   遥控        灯=绿   忽略上位机速度命令
+  *   RC   遥控        灯=绿   用左摇杆开车(指令进遥测的 vx/wz), 忽略上位机速度命令
   *   PUSH 推行        灯=橙   电机释放, 忽略上位机速度命令
   *
   * 切换方式:
@@ -36,8 +37,13 @@
   *      遥控       7A 02 01 00 00 00 79 7D
   *      推行       7A 02 02 00 00 00 7A 7D
   *
-  * 上行: 每 50ms 发一帧 32 字节遥测 (0x7E 头, 含模式/速度指令/加速度/角速度/
-  *       IMU 温度/湿度/AHT20 温度/统计), 格式见 telemetry.h。
+  * 手柄链路 (见 rc.h):
+  *   接收器(USB, 15B HID @500Hz) -> CH554G -> USART3(PB10/PB11) 115200 -> 本固件解析
+  *   没接 CH554G 时, 可以用 tools/v2_gamepad.py 从调试串口发 0x78 注入帧验证同一套逻辑。
+  *
+  * 上行 (20Hz 两种帧, 都走 USART1):
+  *   0x7E 32 字节遥测: 模式/速度指令/加速度/角速度/IMU 温度/湿度/AHT20 温度/统计 (telemetry.h)
+  *   0x79 19 字节遥控: 手柄 15 字节原始数据 + 在线标志 (rc.h)
   *
   * 传感器:
   *   ICM-42670-P  硬件 I2C1 (PB6=SCL, PB7=SDA)  加速度 ±4g / 陀螺 ±1000dps @200Hz
@@ -202,8 +208,8 @@ static void Show_Mode(uint8_t oled_ok, uint8_t mode)
     Ssd1306_ShowLine(1, line);
 }
 
-/* 第 6 行: 命令统计 */
-static void Show_Counters(uint8_t oled_ok)
+/* 第 7 行: 命令统计 + 运行秒数 */
+static void Show_Counters(uint8_t oled_ok, uint32_t run_seconds)
 {
     char line[22];
     uint8_t pos;
@@ -218,7 +224,43 @@ static void Show_Counters(uint8_t oled_ok)
     Line_AppendU32(line, &pos, Proto_HostCmdCount());
     Line_AppendText(line, &pos, " RJ ");
     Line_AppendU32(line, &pos, Proto_HostRejectCount());
-    Ssd1306_ShowLine(6, line);
+    Line_AppendText(line, &pos, " RUN ");
+    Line_AppendU32(line, &pos, run_seconds);
+    Ssd1306_ShowLine(7, line);
+}
+
+/* 第 3 行: 手柄状态 + 左摇杆千分制 + 十字键 + 按钮 */
+static void Show_Rc(uint8_t oled_ok, uint8_t online, int16_t x_permille,
+                    int16_t y_permille, uint8_t hat, uint8_t buttons)
+{
+    char line[22];
+    uint8_t pos;
+
+    if (oled_ok == 0u)
+    {
+        return;
+    }
+
+    Line_Reset(line, &pos);
+    if (online == 0u)
+    {
+        Line_AppendText(line, &pos, "RC -- (no pad)");
+        Ssd1306_ShowLine(3, line);
+        return;
+    }
+
+    Line_AppendText(line, &pos, "RC X");
+    Line_AppendFixed(line, &pos, (int32_t)x_permille, 0u);
+    Line_AppendText(line, &pos, " Y");
+    Line_AppendFixed(line, &pos, (int32_t)y_permille, 0u);
+    Line_AppendText(line, &pos, " h");
+    Line_AppendU32(line, &pos, hat);
+    if (buttons != 0u)
+    {
+        Line_AppendText(line, &pos, " b");
+        Line_AppendHex8(line, &pos, buttons);
+    }
+    Ssd1306_ShowLine(3, line);
 }
 
 /* 第 2/3/4/5 行: 传感器状态与数值 */
@@ -244,12 +286,12 @@ static void Show_Sensors(uint8_t oled_ok, uint8_t imu_ok, uint8_t aht_ok,
 
     if (imu_ok == 0u)
     {
-        Ssd1306_ShowLine(3, "a -- no imu --");
-        Ssd1306_ShowLine(4, "g -- no imu --");
+        Ssd1306_ShowLine(4, "a -- no imu --");
+        Ssd1306_ShowLine(5, "g -- no imu --");
     }
     else
     {
-        /* 第 3 行: 加速度, 单位 g, 两位小数 (mg -> 0.01g 是 /10) */
+        /* 第 4 行: 加速度, 单位 g, 两位小数 (mg -> 0.01g 是 /10) */
         Line_Reset(line, &pos);
         Line_AppendText(line, &pos, "a ");
         Line_AppendFixed(line, &pos, (int32_t)(imu->acc_mg[0] / 10), 2u);
@@ -257,9 +299,9 @@ static void Show_Sensors(uint8_t oled_ok, uint8_t imu_ok, uint8_t aht_ok,
         Line_AppendFixed(line, &pos, (int32_t)(imu->acc_mg[1] / 10), 2u);
         Line_AppendText(line, &pos, " ");
         Line_AppendFixed(line, &pos, (int32_t)(imu->acc_mg[2] / 10), 2u);
-        Ssd1306_ShowLine(3, line);
+        Ssd1306_ShowLine(4, line);
 
-        /* 第 4 行: 角速度, 单位 °/s, 一位小数 (0.1dps -> /1) */
+        /* 第 5 行: 角速度, 单位 °/s, 一位小数 (0.1dps -> /1) */
         Line_Reset(line, &pos);
         Line_AppendText(line, &pos, "g ");
         Line_AppendFixed(line, &pos, (int32_t)imu->gyro_0d1dps[0], 1u);
@@ -267,10 +309,10 @@ static void Show_Sensors(uint8_t oled_ok, uint8_t imu_ok, uint8_t aht_ok,
         Line_AppendFixed(line, &pos, (int32_t)imu->gyro_0d1dps[1], 1u);
         Line_AppendText(line, &pos, " ");
         Line_AppendFixed(line, &pos, (int32_t)imu->gyro_0d1dps[2], 1u);
-        Ssd1306_ShowLine(4, line);
+        Ssd1306_ShowLine(5, line);
     }
 
-    /* 第 5 行: T 25.3C H 45.2% */
+    /* 第 6 行: T 25.3C H 45.2% */
     Line_Reset(line, &pos);
     if (aht_ok != 0u)
     {
@@ -284,7 +326,7 @@ static void Show_Sensors(uint8_t oled_ok, uint8_t imu_ok, uint8_t aht_ok,
     {
         Line_AppendText(line, &pos, "T -- H -- (no aht20)");
     }
-    Ssd1306_ShowLine(5, line);
+    Ssd1306_ShowLine(6, line);
 }
 
 static void Show_BoardInfo(uint8_t oled_ok)
@@ -311,9 +353,10 @@ static void Show_BoardInfo(uint8_t oled_ok)
     Board_UartSend(" %\r\n");
     Board_UartSend("KEY    = PA15: press to switch mode\r\n");
     Board_UartSend("UART   = mode cmd: 7A 02 <mode> 00 00 00 <bcc> 7D\r\n");
-    Board_UartSend("UPLINK = telemetry 32B @20Hz (see telemetry.h)\r\n");
+    Board_UartSend("UPLINK = telemetry 32B @20Hz + rc 19B @20Hz\r\n");
     Board_UartSend("IMU    = ICM-42670-P on hardware I2C1 (PB6/PB7)\r\n");
     Board_UartSend("AHT20  = on soft I2C (PB8/PB9), 500ms sample\r\n");
+    Board_UartSend("RC     = USART3 PB11 RX, 115200, 15B HID @500Hz\r\n");
     Board_UartSend("\r\n");
 
     if (oled_ok == 0u)
@@ -364,12 +407,15 @@ int main(void)
     Telemetry_Data telemetry;
     uint16_t rx_count;
     uint16_t rj_count;
+    int16_t rc_x_permille = 0;
+    int16_t rc_y_permille = 0;
 
     Board_DwtInit();
     Board_SwdOnly();       /* 先关 JTAG, PA15 才能当普通 IO */
     Board_KeyInit();
     Board_ParkUnusedPins();
     Board_UartInit(115200);
+    Rc_Init();             /* USART3: 遥控手柄数据 (CH554G 转发) */
 
     Ws2812_Init();
     /* 屏幕初始化内部会做 SoftI2c_Init + BusReset, AHT20 与它共总线, 必须之后初始化 */
@@ -406,7 +452,9 @@ int main(void)
     /* 上电默认模式: 灯色 + 屏幕 + 一行日志 */
     old_mode = Mode_Get();
     Show_Mode(oled_ok, old_mode);
+    Show_Rc(oled_ok, 0u, 0, 0, 0u, 0u);
     Show_Sensors(oled_ok, imu_last_ok, aht_last_ok, &imu_last, aht_temp_c100, rh_100);
+    Show_Counters(oled_ok, 0u);
     Board_UartSend("[mode] power on = ");
     Board_UartSend(Mode_Name(old_mode));
     Board_UartSend("\r\n");
@@ -426,6 +474,9 @@ int main(void)
             }
             Proto_FeedByte(value);
         }
+
+        /* ---- 遥控手柄: 解析 USART3 收到的字节 (CH554G 转发的 15B 原始帧) ---- */
+        Rc_Poll();
 
         /* ---- 按键: 连续 3 次采样(30ms)一致才认边沿, 按下时切模式 ---- */
         if (Board_KeyDown() != 0u)
@@ -513,7 +564,22 @@ int main(void)
             telemetry.mode = Mode_Get();
             telemetry.imu_ok = imu_last_ok;
             telemetry.aht_ok = Aht20_HasSample();
-            Proto_GetHostCmd(&telemetry.vx_mm_s, &telemetry.wz_mrad_s);
+
+            /* 速度指令: HOST = 上位机命令, RC = 左摇杆映射, PUSH = 0 */
+            if (Mode_Get() == MODE_RC)
+            {
+                Rc_GetCmd(&telemetry.vx_mm_s, &telemetry.wz_mrad_s);
+            }
+            else if (Mode_Get() == MODE_HOST)
+            {
+                Proto_GetHostCmd(&telemetry.vx_mm_s, &telemetry.wz_mrad_s);
+            }
+            else
+            {
+                telemetry.vx_mm_s = 0;
+                telemetry.wz_mrad_s = 0;
+            }
+
             for (byte = 0; byte < 3u; byte++)
             {
                 telemetry.acc_mg[byte] = imu_last.acc_mg[byte];
@@ -527,11 +593,15 @@ int main(void)
             telemetry.rj_count = (uint8_t)((rj_count > 255u) ? 255u : rj_count);
 
             (void)Telemetry_Send(&telemetry);
+            (void)Rc_SendFrame(); /* 手柄 15B 原始数据也 20Hz 带给上位机 */
         }
 
         /* ---- 屏幕: 200ms 刷一次传感器数值 ---- */
         if ((tick % SCREEN_TICKS) == 0u)
         {
+            Rc_GetStickPermille(&rc_x_permille, &rc_y_permille);
+            Show_Rc(oled_ok, Rc_Online(), rc_x_permille, rc_y_permille,
+                    Rc_Get()->hat, Rc_Get()->buttons);
             Show_Sensors(oled_ok, imu_last_ok, aht_last_ok, &imu_last, aht_temp_c100, rh_100);
         }
 
@@ -539,11 +609,7 @@ int main(void)
         if ((tick % 100u) == 0u)
         {
             run_count++;
-            Show_Counters(oled_ok);
-            if (oled_ok != 0u)
-            {
-                Ssd1306_ShowLineU32(7, "RUN ", run_count);
-            }
+            Show_Counters(oled_ok, run_count);
         }
     }
 }

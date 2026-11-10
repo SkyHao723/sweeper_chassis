@@ -465,6 +465,16 @@
               <FilePath>.\user\telemetry.h</FilePath>
             </File>
             <File>
+              <FileName>rc.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>.\user\rc.c</FilePath>
+            </File>
+            <File>
+              <FileName>rc.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>.\user\rc.h</FilePath>
+            </File>
+            <File>
               <FileName>stm32f10x_conf.h</FileName>
               <FileType>5</FileType>
               <FilePath>.\user\stm32f10x_conf.h</FilePath>

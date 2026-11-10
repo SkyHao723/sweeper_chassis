@@ -67,6 +67,8 @@ USER_GROUP = group("user", [
     ("proto.h", 5, ".\\user\\proto.h"),
     ("telemetry.c", 1, ".\\user\\telemetry.c"),
     ("telemetry.h", 5, ".\\user\\telemetry.h"),
+    ("rc.c", 1, ".\\user\\rc.c"),
+    ("rc.h", 5, ".\\user\\rc.h"),
     ("stm32f10x_conf.h", 5, ".\\user\\stm32f10x_conf.h"),
     ("stm32f10x_it.c", 1, ".\\user\\stm32f10x_it.c"),
     ("stm32f10x_it.h", 5, ".\\user\\stm32f10x_it.h"),
