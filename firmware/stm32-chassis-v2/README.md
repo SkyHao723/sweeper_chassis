@@ -13,8 +13,8 @@
 | 外设 | 引脚 | 实现 | 现象 |
 |------|------|------|------|
 | OLED（SSD1306 128×64） | PB8=SCL, PB9=SDA | **软件 I2C**（开漏，见 §3.1） | 屏上 8 行字 + 每 100 ms 自增的运行计数 |
-| RGB 灯（XL-5050） | PB5 | WS2812 单线时序，DWT 周期计数器打拍 | 红→绿→蓝→白→灭 循环，每 1 s 换色 |
-| 板载按键 SW1 | PA15 | 上拉输入（需先关 JTAG，见 §3.2） | 屏上 `KEY UP` / `KEY DOWN`，串口打印边沿 |
+| RGB 灯（XL-5050） | PB5 | WS2812 单线时序，DWT 周期计数器打拍，**软件调光 50 %** | 上电红色，**按一下按键换下一个颜色**：红→绿→蓝→白→灭→红… |
+| 板载按键 SW1 | PA15 | 上拉输入（需先关 JTAG，见 §3.2） | **切换 RGB 颜色**；屏上 `KEY DOWN`/`KEY UP`，串口打印边沿 |
 | 调试串口 | PA9=TX, PA10=RX | USART1 115200 8N1 → CH343P → USB | 上电横幅 + 按键/换色日志 |
 
 上电后屏幕应该是：
@@ -26,7 +26,7 @@ CLK 72 MHZ
 OLED OK
 LED PB5 WS2812
 KEY UP
-(空)
+COLOR RED
 RUN 000123
 ```
 
@@ -38,9 +38,15 @@ RUN 000123
 ======================================
 SYSCLK = 72 MHz
 OLED   = OK (SSD1306 @0x3C, soft I2C PB8/PB9)
-LED    = WS2812 on PB5
-KEY    = PA15 (pull-up, active low)
+LED    = WS2812 on PB5, brightness 50 %
+KEY    = PA15 (pull-up, active low), press to change color
 ```
+
+按一下 PA15，屏幕第 6 行会变成 `KEY DOWN`、第 7 行 `COLOR GREEN`（再红→蓝→白→灭），
+松开变回 `KEY UP`；串口对应打印 `[key] SW1 pressed` / `[key] SW1 released` / `[led] color = GREEN`。
+
+**亮度**：`hardware/ws2812.h` 里的 `WS2812_BRIGHTNESS_PERCENT`（默认 **50**，0~100），
+直接等比缩小 RGB 数值。觉得还亮就改 30、觉得暗就改 70，改完重新编译烧录即可。
 
 **看这两行就知道板子基本是好的**：
 
@@ -63,7 +69,7 @@ $p = Start-Process -FilePath $uv -ArgumentList @('-b','-r',$proj,'-t','chassis-v
 ```
 
 产物：`Objects/chassis-v2/chassis-v2.hex`
-（hex 13895 B MD5 `ACE726C987402B0890C202414011AB4B`；镜像 4920 B MD5 `B837235577331E31DF3EACCBE381337E`）。
+（hex 14517 B MD5 `0FC8FACD1821F1CFC26DD6D5C2D1C57B`；镜像 5140 B MD5 `DDB4B3A6816F0882D25D798A4B6E7467`；Code 4572 B / RO 524 B / RW 44 B / ZI 1636 B）。
 
 **推荐用脚本烧（会自己回读校验，并处理 NRST 没接的问题）**：
 
@@ -154,7 +160,8 @@ PB2 引到了 CN6 排针。复位瞬间 PB2 被拉高会从**内置 SRAM** 启�
 | 屏亮但全黑/花屏 | 初始化序列（对比度 `0x81 0x7F`、复用率 `0xA8 0x3F`、最后必须 `0xAF` 开显示） |
 | 灯不亮 | §3.3 电平问题（最常见）；PB5 是否接到灯珠 DIN；灯珠方向（DIN/DOUT 反了不亮） |
 | 灯亮但颜色错 | WS2812 是 **G→R→B** 顺序，不是 RGB；`Ws2812_SetPixel(i, r, g, b)` 内部已换成 G,R,B |
-| 按键没反应 | 是否调了 `Board_SwdOnly()`；PA15 是否被调试器占用；按下是否真把脚拉到 GND（万用表量） |
+| 灯**太亮/太暗** | 调 `hardware/ws2812.h` 的 `WS2812_BRIGHTNESS_PERCENT`（默认 50，0~100），这是软件调光、等比缩小 RGB 数值 |
+| 按键没反应 / 不换色 | 是否调了 `Board_SwdOnly()`；PA15 是否被调试器占用；按下是否真把脚拉到 GND（万用表量）；消抖是 30 ms（3×10 ms 采样），按太短会漏 |
 
 用 DAPLink 直接读寄存器也很好使（GPIOB 基址 `0x40010C00`）：
 
@@ -172,7 +179,7 @@ GPIOB_IDR  = 0x0000fc10   # 实际电平
 stm32-chassis-v2/
 ├── stm32-chassis-v2.uvprojx   单 target: chassis-v2（宏: USE_STDPERIPH_DRIVER）
 ├── user/
-│   ├── main.c                 bring-up 主程序（屏幕 8 行 + RGB 循环 + 按键 + 串口）
+│   ├── main.c                 bring-up 主程序（屏幕 8 行 + 按键换色 + 串口）
 │   ├── board.c / board.h      板级：DWT 延时、关 JTAG、未用脚驻留、USART1、按键
 │   ├── stm32f10x_conf.h       标准外设库裁剪
 │   └── stm32f10x_it.c/h       中断向量

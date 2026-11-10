@@ -53,10 +53,11 @@ void Ws2812_SetPixel(uint16_t index, uint8_t red, uint8_t green, uint8_t blue)
         return;
     }
 
+    /* 软件调光: 按 WS2812_BRIGHTNESS_PERCENT 等比缩小, 灯的"颜色比例"不变 */
     base = (uint16_t)(index * 3);
-    ws_buf[base + 0] = green;
-    ws_buf[base + 1] = red;
-    ws_buf[base + 2] = blue;
+    ws_buf[base + 0] = (uint8_t)(((uint16_t)green * WS2812_BRIGHTNESS_PERCENT) / 100);
+    ws_buf[base + 1] = (uint8_t)(((uint16_t)red * WS2812_BRIGHTNESS_PERCENT) / 100);
+    ws_buf[base + 2] = (uint8_t)(((uint16_t)blue * WS2812_BRIGHTNESS_PERCENT) / 100);
 }
 
 void Ws2812_SetAll(uint8_t red, uint8_t green, uint8_t blue)
