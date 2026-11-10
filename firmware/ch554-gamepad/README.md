@@ -65,9 +65,9 @@ Get-Content build.log | Select-Object -Last 6
 当前版本的产物：
 
 - **0 Error(s), 0 Warning(s)**
-- `Program Size: data=16.3 xdata=794 code=8206`
-- `CH554Gamepad.hex` 23965 B，MD5 `C2283A8DF7CD88BBFBDCB41C65EC2C42`
-- 镜像 8206 B（0x0000~0x200D），MD5 `3526A79605E005E66F2994D411FD3031`
+- `Program Size: data=16.3 xdata=802 code=9420`
+- `CH554Gamepad.hex` 27537 B，MD5 `EB1E62B03A92381BDC1C05F1B6B8B9C4`
+- 镜像 9420 B（0x0000~0x24CB），MD5 `5508986DE696C16C1702EF2C92602243`
 
 工程里只有 3 个源文件：`Public\Debug.C`（时钟/延时）、`USB\USB_LIB\USBHOST.C`（WCH USB Host 协议栈）、
 `App\GamepadHost.C`（本应用）。`Public\` 与 `USB\USB_LIB\` 是 WCH 官方 CH554 EVT 例程原文件，
@@ -120,8 +120,16 @@ CH55x 的 ISP 有 **两条路：USB 下载 或 串口下载**，没有 SPI 下�
 
 1. 烧完断电，**插上手柄接收器**，再上电（接收器要在上电前/上电后插都可以，固件支持热插拔）
 2. 手柄按 Xbox 键开机；接收器指示灯常亮表示已对码
-3. 用示波器/逻辑分析仪看 `P3.1`：空闲高电平，有数据时是 115200 的脉冲（每 8 ms 一帧 15 字节）
-4. 接 STM32 后看现象：
+3. **看 CH554 自己的日志**（最直接）：USB-TTL 接 `P1.7(SCK)` 到 TTL 的 RXD，然后
+
+   ```powershell
+   python tools/v2_ch554_log.py --port COM19
+   ```
+
+   正常应该是：横幅 → `[usb] connect` → `[usb] enum=00` → `[usb] status=3 type=.. vid=045E pid=028E`
+   → `[pad] found, loc=0 endp=81` → `[pad] first report` → 每 500 ms 一行 `[stat]`
+4. 用示波器/逻辑分析仪看 `P3.1`：空闲高电平，有数据时是 115200 的脉冲（每 8 ms 一帧 15 字节）
+5. 接 STM32 后看现象：
    - 新板 OLED 第 3 行：`RC X<n> Y<n> h<n>`（离线时是 `RC -- (no pad)`）
    - 上位机：`python tools/v2_monitor.py --port COMx --seconds 5` 看 `rc` 行
    - 把模式切到 RC（按键或 `python tools/v2_mode.py COMx rc`），推左摇杆，看遥测 `v_cmd`
@@ -132,8 +140,36 @@ CH55x 的 ISP 有 **两条路：USB 下载 或 串口下载**，没有 SPI 下�
 |----|------|------|
 | `GAMEPAD_REPORT_SIZE` | `15` | 输入报告长度，必须与 STM32 侧一致 |
 | `GAMEPAD_SEND_MS` | `8` | 转发节奏（8 ms = 125 Hz）。STM32 侧 300 ms 判离线，别改大到 >300 |
+| `GAMEPAD_IDLE_MS` | `200` | 还没收到任何报告时，每 200 ms 发一包 15×`0x55` 心跳（仅用于排查） |
+| `GAMEPAD_IDLE_BYTE` | `0x55` | 心跳用的字节，整包都是它（STM32 一定判坏帧 → 只证明"CH554 活着"） |
+| `GAMEPAD_LOG_PERIOD_MS` | `500` | 调试状态行打印周期 |
 | `GAMEPAD_UART0_ALTER` | `0` | `0`=TXD0/RXD0 在 **P3.1/P3.0**；`1`=改到 **P1.3/P1.2**（`bUART0_PIN_X`） |
-| `GAMEPAD_DEBUG_UART1` | `0` | 改 `1` 用 UART1（P1.7/P1.6，115200）打调试信息，和数据口分开 |
+| `GAMEPAD_DEBUG_UART1` | `1` | 用 UART1（P1.7/P1.6，115200）打调试日志。**量产时改 `0`**（心跳也随之关闭） |
+
+## 6.1 v2 的行为变化（2026-11-10，为排查"接上手柄却收不到数据"）
+
+1. **不再依赖 `SearchTypeDevice(USB_DEV_CLASS_HID)`**。WCH 的 USB Host 库只在
+   "设备类 0x00 + 接口类 HID(0x03) + 接口子类 ≤ 1" 时才把中断 IN 端点号填进
+   `GpVar[]`；Xbox360 无线接收器有个 vendor-specific(0xFF) 的接口，这样
+   `SearchTypeDevice(HID)` 永远返回 `0xFFFF` → 旧固件**静默不发任何字节**。
+   现在改成自己扫"根端口 + 外部 HUB 端口"：只要 `DeviceStatus >= 3`（枚举成功）
+   就尝试取端点，`GpVar[0]` 为空时调 `AnalyzeHidIntEndp()` 从配置描述符里
+   重新解析出"中断 + IN"端点。
+2. **空闲心跳**：还没有报告时每 200 ms 发 15 个 `0x55`。STM32 侧会把它当坏帧
+   （`s_bad` 涨、RC 仍离线）——**这正好用来区分"没插设备/没枚举到"和"线断了/波特率不对"**。
+3. **UART1 调试日志**（P1.7=TXD1=板上 `SCK`，和数据口分开，也正好是 ISP 下载口）：
+
+   ```
+   [ch554] gamepad host v2 (uart0 p3.1/p3.0 115200)
+   [usb] connect
+   [usb] enum=00
+   [usb] status=3 type=FF vid=045E pid=028E endp0=81
+   [pad] found, loc=0 endp=81
+   [pad] first report
+   [stat] pad=1 pkt=7 sent=6 len=0
+   ```
+
+   用 `python tools/v2_ch554_log.py --port COM19` 直接看（烧完不用拔线）。
 
 ## 7. 为什么这样设计（容易踩的两点）
 
@@ -148,11 +184,15 @@ CH55x 的 ISP 有 **两条路：USB 下载 或 串口下载**，没有 SPI 下�
 
 | 现象 | 排查 |
 |------|------|
-| 手柄没反应、STM32 一直 `RC -- (no pad)` | 接收器有没有对码（手柄 Xbox 键 + 接收器对码键）；换一个 USB 口试 |
-| CH554 完全不发数据 | 量 `P3.1` 有没有波形；没波形说明 USB 没枚举到 HID 设备 → 把 `GAMEPAD_DEBUG_UART1` 改 1，从 UART1(P1.7) 看枚举日志 |
+| 手柄没反应、STM32 一直 `RC -- (no pad)` | **先看 UART1 日志**：`python tools/v2_ch554_log.py --port COM19` |
+| 日志里只有横幅、没有 `[usb] connect` | USB 侧没检测到设备：接收器没插好 / 没对码 / 没供电（USB-A 的 VBUS 只有插上 USB、或板子 5V 有效时才有） |
+| 日志里 `[usb] status=2`（枚举失败） | 设备枚举失败：供电不足（5V 不稳）、线太长、或设备是全速以下低速需要换口；`[usb] enum=` 的值非 0 也是同类问题 |
+| 日志里 `[pad] len=<n>` 反复出现、`len` 不是 15 | 枚举到的是别的 HID（键鼠/厂商自定义），报告长度不一样；把手柄接收器单独插，别插其它 USB 设备 |
+| 日志里 `[stat] pad=1 pkt=0` | 端点找到了但一直 NAK/读不到包：接收器还没和手柄对码（按接收器对码键 + 手柄 Xbox 键），或该端点是"需要先发命令才出数据"的 |
+| 日志里 `[stat] pkt>0 sent>0` 但 STM32 仍离线 | 数据口/线的问题：`P3.1` 是否接到 STM32 `PB11`、是否共地、STM32 侧 USART3 波特率是否 115200（`BRR=0x138`） |
+| 日志完全没有输出（连横幅都没有） | CH554 没在跑本固件 / 波特率不对 / USB-TTL 的 RXD 没接到 `P1.7`；先用 WCHISPStudio"校验"确认芯片里有程序 |
 | 发数据但 STM32 不认 | `P3.1` 是否接到 STM32 `PB11`；是否共地；STM32 侧 USART3 是否 115200 |
-| 只有 15 字节以外的长度被忽略 | 代码只转发 `len == 15` 的报告；其它 HID 设备（键鼠）会被 WCH 库归成 `DEV_TYPE_KEYBOARD/MOUSE`，本固件根本不去取 |
-| 手柄拔掉后 STM32 还显示在线 | 已处理：`SearchTypeDevice` 找不到设备时会清 `g_have_report`，STM32 300 ms 后判离线 |
+| 手柄拔掉后 STM32 还显示在线 | 已处理：读包出错时会清 `g_have_report` 并停发，STM32 300 ms 后判离线 |
 | 波特率不准 | `FREQ_SYS=24 MHz`（内部 RC）来自 `Public/Debug.H`；UART0 用 Timer1 做波特率（`TH1=0xF3`，且 `T2MOD` 里 `bT1_CLK` 让 T1 按 Fsys 计数）→ 115384，误差 0.16%，可接受 |
 
 ## 9. 目录结构
